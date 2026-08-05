@@ -80,11 +80,28 @@ def test_payload_artifacts_are_flagged_by_name(tmp_path: Path) -> None:
     assert status.payload_files
 
 
-def test_campaign_attribution_reads_the_advisory_text() -> None:
-    """Offline, so this exercises the matching rather than the network."""
-    assert "Mini Shai-Hulud" in (ls.campaign_of.__doc__ or "") or True
-    for pattern, label in ls.CAMPAIGN_PATTERNS:
-        assert pattern and label
+def test_campaign_attribution_names_the_campaign_in_the_advisory_text() -> None:
+    """Offline, so this exercises the matching rather than the network.
+
+    lookup=False keeps campaign_of off the network and makes it read the built-in
+    advisory note instead, which is the same matching path a fetched advisory
+    takes."""
+    label = ls.campaign_of("MAL-2026-11524", lookup=False)
+    assert label is not None
+    assert "Shai-Hulud" in label
+
+    # An advisory with no campaign in its text must return None rather than
+    # guessing, because the caller falls back to the advisory summary and a wrong
+    # attribution is worse than none.
+    assert ls.campaign_of("MAL-0000-00000", lookup=False) is None
+
+    # The more specific patterns have to precede the generic Shai-Hulud one, or
+    # every generation collapses into it and the remediation advice goes with it.
+    order = [label for _, label in ls.CAMPAIGN_PATTERNS]
+    generic = next(i for i, text in enumerate(order)
+                   if text.startswith("Shai-Hulud, the self-propagating"))
+    assert any("Mini Shai-Hulud" in text for text in order[:generic])
+    assert any("SHA1-Hulud" in text for text in order[:generic])
 
 
 def test_overlay_merges_into_the_builtin_table_and_rebuilds_patterns() -> None:

@@ -290,10 +290,11 @@ def gate(target: Path, what: str, skip: bool) -> bool:
     it clean, and a scanner that passes what it never read is worse than none.
     So the size decides: the daemon when everything fits, standalone clamscan
     with the caps lifted when it does not. clamscan in turn cannot read a file
-    above 2 GiB and says so only in a warning, so such a file is reported here
-    as unscanned rather than counted as clean.
+    above 2 GiB and says so only in a warning while still exiting 0, so a file
+    that size is refused outright rather than passed on a clean exit code.
 
-    Fail closed: anything other than a confirmed clean result returns False."""
+    Fail closed: anything other than a confirmed clean result returns False, and
+    a file nothing could read is not a clean result."""
     if skip:
         log(f"ClamAV gate skipped by request: {what}")
         return True
@@ -303,10 +304,19 @@ def gate(target: Path, what: str, skip: bool) -> bool:
 
     files = [p for p in target.rglob("*") if p.is_file()] if target.is_dir() else [target]
     largest = max((p.stat().st_size for p in files), default=0)
-    for path in files:
-        if path.stat().st_size > CLAMSCAN_FILE_CEILING:
-            log(f"WARNING: {path} is {path.stat().st_size / 1024 / 1024:.0f} MB, above the 2 GiB "
-                "scanner ceiling; it was NOT scanned and must not be read as clean")
+
+    # A file above the ceiling is refused rather than warned about. Neither
+    # scanner reads it, and both still exit 0, so warning and continuing meant
+    # returning a clean verdict for bytes nothing had looked at. That is the one
+    # outcome a gate must never produce, and the docstring above claimed it was
+    # already refused when it was not.
+    oversized = [p for p in files if p.stat().st_size > CLAMSCAN_FILE_CEILING]
+    if oversized:
+        for path in oversized:
+            log(f"FAIL: {path} is {path.stat().st_size / 1024 / 1024:.0f} MB, above the 2 GiB "
+                "libclamav ceiling, so no scanner here can read it")
+        log(f"refusing to trust {what}: {len(oversized)} file(s) could not be scanned at all")
+        return False
 
     cap = clamd_max_file_size()
     clamdscan = resolve_clam("clamdscan")

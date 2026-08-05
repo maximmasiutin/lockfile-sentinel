@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import shlex
 import subprocess  # nosec B404
 import sys
 import tempfile
@@ -322,14 +323,20 @@ def cron_line(job: dict, delay: int, user: str) -> str:
 
     The redirect target is created by the line itself. A redirect into a missing
     directory fails in the shell before the payload runs, which would leave the
-    job doing nothing and writing no output to say why."""
+    job doing nothing and writing no output to say why.
+
+    Every path is shell-quoted. The interpreter path, this repository's location
+    and the cache root are all attacker-free but not space-free: a home
+    directory or a checkout with a space in its name silently truncates the
+    command, and the failure looks identical to the missing-directory one."""
     hour, minute = (int(part) for part in str(job["time"]).split(":"))
-    payload = " ".join([sys.executable, str(UPDATER), *[str(a) for a in job["args"]]])
+    payload = " ".join(shlex.quote(a) for a in
+                       [sys.executable, str(UPDATER), *[str(a) for a in job["args"]]])
     spread = f"sleep $((RANDOM % {delay * 60})); " if delay > 0 else ""
     log_dir = cache_dir() / "logs"
     log_file = log_dir / f"{job['log']}.log"
-    return (f"{minute} {hour} * * * {user} mkdir -p {log_dir} && {spread}"
-            f"{payload} >> {log_file} 2>&1")
+    return (f"{minute} {hour} * * * {user} mkdir -p {shlex.quote(str(log_dir))} && {spread}"
+            f"{payload} >> {shlex.quote(str(log_file))} 2>&1")
 
 
 def cron_body(selected: list[str], delay: int, user: str) -> str:
