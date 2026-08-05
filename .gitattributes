@@ -1,0 +1,77 @@
+# Every path in this repository declares its own type and line endings here,
+# rather than leaving either to git's guesswork. The CI matrix runs on Linux,
+# Windows and macOS against the same commit, so a file that arrives with
+# different bytes on one of them is a test failure nobody can reproduce
+# anywhere else.
+#
+# Two rules follow from that. Type is stated as "text" or "binary" outright
+# instead of "text=auto", so no file's handling depends on what git infers
+# from its first 8000 bytes. Line endings are LF in the repository and LF in
+# every checkout, with the batch and PowerShell exception noted below.
+
+# The fallback, for a file whose extension is not listed. It still guesses the
+# type, which is the whole reason every extension actually used is named below.
+*                   text=auto eol=lf
+
+# Sources and executable text. LF on Windows too: Python, Node, and every
+# tool this repository drives read LF natively there.
+*.py                text eol=lf diff=python
+*.pyi               text eol=lf diff=python
+*.sh                text eol=lf
+*.bash              text eol=lf
+
+# Documentation and configuration.
+*.md                text eol=lf
+*.txt               text eol=lf
+*.rst               text eol=lf
+*.json              text eol=lf
+*.jsonc             text eol=lf
+*.yml               text eol=lf
+*.yaml              text eol=lf
+*.toml              text eol=lf
+*.cfg               text eol=lf
+*.ini               text eol=lf
+*.csv               text eol=lf
+*.lock              text eol=lf
+
+# Text files with no extension, which the patterns above cannot reach.
+LICENSE             text eol=lf
+NOTICE              text eol=lf
+AUTHORS             text eol=lf
+CODEOWNERS          text eol=lf
+.gitattributes      text eol=lf
+.gitignore          text eol=lf
+.editorconfig       text eol=lf
+
+# The deliberate CRLF exception. cmd.exe parses a batch file byte by byte and
+# mishandles an LF-only one, and an Authenticode signature block on a
+# PowerShell script is computed over CRLF, so an LF checkout invalidates it.
+*.bat               text eol=crlf
+*.cmd               text eol=crlf
+*.ps1               text eol=crlf
+*.psm1              text eol=crlf
+*.psd1              text eol=crlf
+
+# Binaries, named so git never normalizes them and never tries to diff them.
+# "binary" is the built-in shorthand for "-text -diff".
+*.png               binary
+*.jpg               binary
+*.jpeg              binary
+*.gif               binary
+*.ico               binary
+*.svgz              binary
+*.pdf               binary
+*.zip               binary
+*.gz                binary
+*.tgz               binary
+*.xz                binary
+*.7z                binary
+*.exe               binary
+*.dll               binary
+*.so                binary
+*.dylib             binary
+*.whl               binary
+*.pyc               binary
+*.pyd               binary
+*.woff              binary
+*.woff2             binary
