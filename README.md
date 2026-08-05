@@ -4,7 +4,9 @@ A fast, zero-dependency npm supply-chain scanner. Originally built to detect the
 
 Inputs are lockfiles, `package.json` ranges and repository trees by filename, so a poisoning that has already been installed and one that the next install would pull are both reported, and known worm payload artifacts are found by name wherever they sit.
 
-One file, the standard library only, Python 3.12 or newer. Download it and run it.
+The scanner is one file, the standard library only, Python 3.12 or newer. Download it and run it.
+
+Two optional companions keep its inputs current and are not needed to scan: `update_scanners.py` builds or updates osv-scanner, refreshes the campaign overlay and the OSV offline database, and refreshes the Trivy databases; `schedule_tasks.py` installs those four jobs on a daily schedule through Windows Task Scheduler or cron, idempotently. Each is standalone too.
 
 ## Quick Start
 

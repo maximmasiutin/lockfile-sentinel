@@ -1219,7 +1219,7 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
     unknown = False
 
     # 1. The engine itself, and when its version was last checked.
-    state = _read_json(SCRIPT_DIR / "logs" / "update-osv-scanner.state.json")
+    state = _read_json(cache_dir() / "logs" / "update-osv-scanner.state.json")
     version = "not found"
     if osv_bin:
         try:
@@ -1260,7 +1260,7 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
         lines.append(f"  {'overlay file':<28} absent or unreadable at {overlay_file}")
         unknown = True
 
-    refresh = _read_json(SCRIPT_DIR / "logs" / "update-malicious-packages.state.json")
+    refresh = _read_json(cache_dir() / "logs" / "update-malicious-packages.state.json")
     line, is_stale = _age_line("overlay last refreshed", refresh.get("lastRefreshUnix"), 24)
     lines.append(line)
     stale = stale or is_stale
@@ -1670,7 +1670,7 @@ def run_osv_scanner(
     # than another full walk. Re-running against this list reproduces the
     # failure over a handful of files instead of a few hundred repositories.
     if failures:
-        listing = SCRIPT_DIR / "logs" / "osv-extraction-failures.txt"
+        listing = cache_dir() / "logs" / "osv-extraction-failures.txt"
         try:
             listing.parent.mkdir(parents=True, exist_ok=True)
             listing.write_text("\n".join(failures) + "\n", encoding="utf-8")
