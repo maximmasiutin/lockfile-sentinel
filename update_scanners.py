@@ -1,12 +1,13 @@
 """Keep every input lockfile_sentinel.py depends on current.
 
-One job with four targets, which is why it is one program. Three separate
-updaters preceded it, one per input, and each carried its own copy of the log
-rotation, the timestamped writer, the state file, the throttle and the ClamAV
-gate. Duplication there is a correctness problem rather than untidiness: the
-size-aware choice between clamdscan and clamscan existed in one of the three
-only, so the other two paid about a hundred seconds for a standalone scan the
-daemon does in two. One gate here fixes that for every target at once.
+One job with four targets, which is why it is one program rather than four. The
+log rotation, the timestamped writer, the state file, the throttle and the
+ClamAV gate are written once and shared, because a per-target copy of the gate
+lets the size-aware choice between clamdscan and clamscan drift. That choice is
+worth getting right in one place: the resident daemon answers in milliseconds
+where a standalone clamscan of a database of this size takes minutes, and the
+daemon silently skips anything above its own MaxFileSize, so which of the two to
+use is a decision that has to be made from the file size every time.
 
 Targets:
 
@@ -148,7 +149,8 @@ CLAMSCAN_FILE_CEILING = 2 * 1024 * 1024 * 1024 - 1
 # --------------------------------------------------------------------------
 
 def rotate_log() -> None:
-    """Rotate at 1 MB with one .1 generation, as every script here does."""
+    """Rotate at 1 MB with one .1 generation, so a long-running installation
+    cannot grow the log without bound and the previous run stays readable."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     try:
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:

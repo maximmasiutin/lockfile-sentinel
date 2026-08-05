@@ -22,4 +22,5 @@ First public release.
 - `update_scanners.py`, one program with four targets: build or update osv-scanner, refresh the campaign overlay from the consolidated indicator feed, refresh the OSV offline database, and refresh the Trivy vulnerability and Java databases. Each target self-throttles, every download is scanned with ClamAV where ClamAV is installed, and `status` reports the age of all four without changing any.
 - `schedule_tasks.py`, which installs those four as daily jobs through Windows Task Scheduler or cron, idempotently, with staggered start times and a random spread.
 - Nothing is written beside the scripts. Logs, state and downloaded databases live under the cache directory, which is `LOCKFILE_SENTINEL_CACHE` when set.
+- `--show-cron` on the scheduler, which renders the crontab block that would be installed, on any platform, so a system-wide schedule can be reviewed before it is written.
 - Released under GPL-3.0-or-later.

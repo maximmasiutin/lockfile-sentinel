@@ -149,9 +149,9 @@ def relaunch_elevated(argv: list[str]) -> int:
 
 
 def resolve_pwsh() -> str | None:
-    """PowerShell 7, resolved as lib/resolve-pwsh.ps1 does: the machine-wide MSI
-    first, then the WinGet Links shim, which is a stable symlink across
-    upgrades. Never powershell.exe, which is 5.1."""
+    """PowerShell 7: the machine-wide MSI install first, then the WinGet Links
+    shim, which is a stable symlink across upgrades where the versioned path is
+    not. Never powershell.exe, which is 5.1."""
     for candidate in (
         Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "PowerShell" / "7" / "pwsh.exe",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "pwsh.exe",
@@ -298,16 +298,39 @@ MARK_BEGIN = "# BEGIN update_scanners (managed by schedule_tasks.py)"
 MARK_END = "# END update_scanners (managed by schedule_tasks.py)"
 
 
+def cache_dir() -> Path:
+    """The cache root, resolved exactly as update_scanners.py resolves it.
+
+    Duplicated rather than imported because each file has to stand alone when
+    copied; change the two together. The cron lines log under this root, so a
+    scheduled run writes nowhere near the checkout, which matters when
+    /etc/cron.d runs the job as a user with no write access to it."""
+    explicit = os.environ.get("LOCKFILE_SENTINEL_CACHE")
+    if explicit:
+        return Path(explicit)
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "lockfile-sentinel"
+
+
 def cron_line(job: dict, delay: int, user: str) -> str:
     """One crontab line for a job, with the random spread reproduced by a sleep.
 
     $RANDOM is a bash builtin rather than POSIX, which is why the file sets
-    SHELL. Without it cron runs /bin/sh and the spread silently becomes zero."""
+    SHELL. Without it cron runs /bin/sh and the spread silently becomes zero.
+
+    The redirect target is created by the line itself. A redirect into a missing
+    directory fails in the shell before the payload runs, which would leave the
+    job doing nothing and writing no output to say why."""
     hour, minute = (int(part) for part in str(job["time"]).split(":"))
     payload = " ".join([sys.executable, str(UPDATER), *[str(a) for a in job["args"]]])
     spread = f"sleep $((RANDOM % {delay * 60})); " if delay > 0 else ""
-    log_file = SCRIPT_DIR / "logs" / f"{job['log']}.log"
-    return f"{minute} {hour} * * * {user} {spread}{payload} >> {log_file} 2>&1"
+    log_dir = cache_dir() / "logs"
+    log_file = log_dir / f"{job['log']}.log"
+    return (f"{minute} {hour} * * * {user} mkdir -p {log_dir} && {spread}"
+            f"{payload} >> {log_file} 2>&1")
 
 
 def cron_body(selected: list[str], delay: int, user: str) -> str:
@@ -397,6 +420,10 @@ def main() -> int:
                         help="Windows: relaunch through the UAC prompt.")
     parser.add_argument("--dry-run", action="store_true", help="Report without changing anything.")
     parser.add_argument("--list", action="store_true", help="Print the job table and exit.")
+    parser.add_argument("--show-cron", action="store_true",
+                        help="Print the crontab block that would be installed and exit, on any "
+                             "platform. The Linux install is easier to review before it is "
+                             "written than after, and this renders exactly what gets written.")
     parser.add_argument("--prefix", default=DEFAULT_PREFIX,
                         help="Windows: prefix for the task names "
                              f"(default: {DEFAULT_PREFIX!r}). An existing installation must "
@@ -420,6 +447,11 @@ def main() -> int:
             job = JOBS[name]
             print(f"{name:<20} {job['time']}  {task_name(job, args.prefix)}  "
                   f"update_scanners.py {' '.join(str(a) for a in job['args'])}")
+        return 0
+
+    if args.show_cron:
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
+        print(cron_body(selected, args.random_delay, user), end="")
         return 0
 
     if not UPDATER.exists():

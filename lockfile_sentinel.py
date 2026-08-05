@@ -29,8 +29,11 @@ Two independent detection layers feed tier 3:
   live malicious-package (MAL-*) database. This is the authoritative
   layer: it covers the full campaign, not just the packages hardcoded
   below, and resolves the whole dependency tree (direct and transitive)
-  from each lockfile. OSV-Scanner is looked up purely via PATH so this
-  runs unchanged on Windows, Linux, and macOS. It is invoked only with
+  from each lockfile. It is looked up in this order: --osv-scanner-bin,
+  OSV_SCANNER_BIN, a Go build under GOBIN or GOPATH/bin, PATH, then
+  ~/go/bin, which resolves on Windows, Linux and macOS alike. The Go
+  location is preferred over PATH so a build made by
+  update_scanners.py wins over an older packaged copy. It is invoked only with
   the exact lockfile paths this script already found relevant, never
   pointed at a directory to walk on its own.
 
@@ -122,11 +125,7 @@ POISONED_VERSIONS: dict[str, list[str]] = {
     "@cacheable/utils": ["2.5.1"],
 }
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 OVERLAY_NAME = "compromised-npm-packages.json"
-
-
-ProgressTracker = None
 
 
 def format_elapsed(seconds: float) -> str:
@@ -387,7 +386,7 @@ _SCOPE_PATTERNS: dict[str, tuple[re.Pattern[str], re.Pattern[str]]] = {
 
 def load_overlay(path: Path) -> dict[str, list[str]]:
     """Load compromised-npm-packages.json (as written by
-    update-malicious-packages.py) into {name: [versions]}. Returns {} if the file
+    update_scanners.py malicious-packages) into {name: [versions]}. Returns {} if the file
     is absent or malformed, so the scanner silently falls back to its built-in
     table rather than failing when the overlay has never been generated."""
     try:
@@ -666,18 +665,14 @@ class WalkProgress:
     The walk had no progress reporting at all: it printed one line per
     repository as it discovered them, which on a clone tree of a few hundred
     repositories is a wall of names that says nothing about how far along it is
-    or how long is left. The OSV pass had a tracker, but that runs after the
-    walk finishes, so the phase a person actually waits on was the one with
-    nothing to watch.
+    or how long is left. The OSV pass reports through this same class, but it
+    runs after the walk finishes, so the phase a person actually waits on was
+    the one with nothing to watch.
 
     A walk cannot know its size from inside, so the total is taken first from
     the top-level entries of each root, which for a clone tree is one unit per
     repository. Counting units of roughly equal cost is what makes the estimate
-    mean anything.
-
-    The shared ProgressTracker does the work when the reports repository is
-    present; otherwise the same line is produced here, so the output does not
-    depend on which machine this runs on."""
+    mean anything."""
 
     def __init__(self, total: int, desc: str = "walking") -> None:
         self.total = total
@@ -685,10 +680,6 @@ class WalkProgress:
         self.current = 0
         self.started = time.monotonic()
         self.last_print = 0.0
-        self.tracker = None
-        if ProgressTracker is not None and total > 0:
-            self.tracker = ProgressTracker(total=total, desc=desc, update_interval=5.0)
-            self.tracker.start()
 
     def advance(self, label: str, count: int = 1, units_left: int = 0) -> None:
         """Report the unit about to be processed, and count the one before it.
@@ -699,7 +690,6 @@ class WalkProgress:
         explain has already happened. Naming the unit as it starts makes a long
         silence attributable to a specific repository. The count is therefore
         units started, which shifts the estimate by one unit out of hundreds."""
-        first = self.current == 0
         self.current += count
         # The estimate is heuristic and it under-counts a tree whose repositories
         # nest deeper than the counting pass looks. Clamping alone was wrong: a
@@ -709,14 +699,9 @@ class WalkProgress:
         # final unit with nothing left to do gets clamped.
         if self.total and self.current >= self.total:
             self.total = self.current + units_left if units_left > 0 else self.current
-        if self.tracker is not None:
-            # The tracker prints nothing until its interval has elapsed, so the
-            # first unit would be silent for however long it takes, which is
-            # exactly the case that needs a line. Announce that one directly.
-            if first:
-                _progress(f"  [{self.desc}] {self.current}/{self.total} | {label}")
-            self.tracker.update(self.current, extra=label)
-            return
+        # The first unit prints immediately, because last_print starts at zero:
+        # a silent interval at the start is exactly the case that needs a line,
+        # since one repository can take minutes and the wait is unexplained.
         now = time.monotonic()
         if now - self.last_print < 5.0 and self.current < self.total:
             return
@@ -731,9 +716,6 @@ class WalkProgress:
 
     def finish(self) -> None:
         """Report the totals once the phase is over."""
-        if self.tracker is not None:
-            self.tracker.finish()
-            return
         elapsed = time.monotonic() - self.started
         _progress(f"  [{self.desc}] Complete: {self.current} items in {format_elapsed(elapsed)}")
 
@@ -927,7 +909,7 @@ def find_osv_scanner(explicit_bin: str | None) -> str | None:
     Order: an explicit path, then OSV_SCANNER_BIN, then the binary this stack
     builds under GOBIN or GOPATH/bin, then PATH, then a last look under
     ~/go/bin. The local build is preferred over PATH so a package-manager copy
-    cannot shadow the build update-osv-scanner.py produced and gated. Works
+    cannot shadow the build update_scanners.py produced and gated. Works
     unchanged on Windows, Linux and macOS."""
     for candidate in (explicit_bin, os.environ.get("OSV_SCANNER_BIN")):
         if candidate and shutil.which(candidate):
@@ -1260,10 +1242,22 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
         lines.append(f"  {'overlay file':<28} absent or unreadable at {overlay_file}")
         unknown = True
 
+    # The refresh age comes from update_scanners.py's state file when that is what
+    # keeps the overlay current, and from the overlay's own mtime otherwise.
+    # refresh_overlay in this file throttles on the mtime and writes no state
+    # file, so reading the state file alone reported a permanent unknown, and a
+    # permanent exit 1, on any host where the scanner does its own refreshing.
     refresh = _read_json(cache_dir() / "logs" / "update-malicious-packages.state.json")
-    line, is_stale = _age_line("overlay last refreshed", refresh.get("lastRefreshUnix"), 24)
+    last_refresh = refresh.get("lastRefreshUnix")
+    if last_refresh is None:
+        try:
+            last_refresh = overlay_file.stat().st_mtime
+        except OSError:
+            last_refresh = None
+    line, is_stale = _age_line("overlay last refreshed", last_refresh, 24)
     lines.append(line)
     stale = stale or is_stale
+    unknown = unknown or last_refresh is None
 
     # 3. The built-in floor, which has no timestamp because it ships in the code.
     builtin = sum(len(v) for v in POISONED_VERSIONS.values())
@@ -1272,17 +1266,21 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
     # 4. The live database, which is the layer with no local copy to age.
     lines.append(f"  {'OSV live database':<28} queried per scan at api.osv.dev, no local copy")
 
-    # 5. The offline database, when osv-scanner has been pointed at one.
+    # 5. The offline database. This must resolve exactly as
+    # update_scanners.offline_db_dir() does: osv-scanner's own variable first,
+    # then the cache root. Reading only the variable reported "not present"
+    # immediately after a 206 MB refresh had landed in the cache, because the
+    # updater sets that variable for its child process alone.
     offline = os.environ.get("OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY")
-    offline_dir = Path(offline) if offline else None
-    if offline_dir and offline_dir.is_dir():
+    offline_dir = Path(offline) if offline else cache_dir() / "osv-offline-db"
+    if offline_dir.is_dir():
         newest = max((p.stat().st_mtime for p in offline_dir.rglob("*") if p.is_file()),
                      default=None)
         line, _ = _age_line("OSV offline database", newest, 24 * 7)
         lines.append(line)
     else:
-        lines.append(f"  {'OSV offline database':<28} not present "
-                     f"({offline_dir or 'no cache path resolved'})")
+        lines.append(f"  {'OSV offline database':<28} not present ({offline_dir}); "
+                     f"online mode is always current")
 
     for line in lines:
         print(line)
@@ -1350,7 +1348,8 @@ def run_passthrough(osv_bin: str | None, args: list[str]) -> int:
     1 vulnerabilities found, which is a finding rather than a tool failure, and
     anything else a real error. 2 here means the scanner could not be located."""
     if not osv_bin:
-        _progress("FAIL: osv-scanner not found (build it with update-osv-scanner.py --force)")
+        _progress("FAIL: osv-scanner not found. Install it and put it on PATH, or build it "
+                  "with: python update_scanners.py osv-scanner --force")
         return 2
     _progress(f"running {osv_bin} scan {' '.join(args)}")
     try:
@@ -1638,14 +1637,8 @@ def run_osv_scanner(
     # size is known in advance, so it is the phase worth tracking. Counting
     # lockfiles rather than batches makes the rate and the estimate meaningful
     # when a batch is split by the isolation retry.
-    tracker = None
-    if ProgressTracker is not None and lockfile_paths:
-        tracker = ProgressTracker(
-            total=len(lockfile_paths), desc="osv-scanner", update_interval=5.0
-        )
-        tracker.start()
+    tracker = WalkProgress(len(lockfile_paths), desc="osv-scanner") if lockfile_paths else None
 
-    started = time.monotonic()
     done = 0
     for batch_num, batch in enumerate(batches, start=1):
         _progress(f"osv-scanner batch {batch_num}/{len(batches)}: {len(batch)} lockfile(s)...")
@@ -1656,15 +1649,12 @@ def run_osv_scanner(
         processed.update(batch_ok)
         done += len(batch)
         if tracker is not None:
-            tracker.update(done, extra=f"{len(combined)} lockfile(s) with findings")
+            tracker.advance(f"{len(combined)} lockfile(s) with findings", count=len(batch))
         if on_batch_done is not None:
             on_batch_done(combined, processed)
 
     if tracker is not None:
         tracker.finish()
-    else:
-        _progress(f"osv-scanner pass complete: {done} lockfile(s) in "
-                  f"{format_elapsed(time.monotonic() - started)}")
 
     # Write the offending files out so the next investigation is seconds rather
     # than another full walk. Re-running against this list reproduces the
@@ -2125,7 +2115,7 @@ def main() -> int:
     parser.add_argument(
         "--overlay-file",
         default=str(OVERLAY_PATH),
-        help="Path to the campaign overlay written by update-malicious-packages.py "
+        help="Path to the campaign overlay written by update_scanners.py malicious-packages "
         "(default: the cache directory, see LOCKFILE_SENTINEL_CACHE).",
     )
     parser.add_argument(
@@ -2164,7 +2154,8 @@ def main() -> int:
     parser.add_argument(
         "--lockfiles-from",
         help="Diagnose the lockfiles listed one per line in this file, skipping the walk. "
-        "A failing run writes exactly such a list to logs\\osv-extraction-failures.txt.",
+        "A failing run writes exactly such a list to logs/osv-extraction-failures.txt "
+        "under the cache directory (LOCKFILE_SENTINEL_CACHE, else the platform cache).",
     )
     parser.add_argument(
         "--osv-debug",
@@ -2259,7 +2250,7 @@ def main() -> int:
         else:
             _progress(
                 f"overlay: none loaded ({args.overlay_file} absent or empty); "
-                "using built-in table. Run update-malicious-packages.py to refresh it."
+                "using built-in table. Run: python update_scanners.py malicious-packages"
             )
 
     # Default to the current directory rather than to anything guessed: a
