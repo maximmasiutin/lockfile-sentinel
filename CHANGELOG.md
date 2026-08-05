@@ -23,4 +23,4 @@ First public release.
 - `schedule_tasks.py`, which installs those four as daily jobs through Windows Task Scheduler or cron, idempotently, with staggered start times and a random spread.
 - Nothing is written beside the scripts. Logs, state and downloaded databases live under the cache directory, which is `LOCKFILE_SENTINEL_CACHE` when set.
 - `--show-cron` on the scheduler, which renders the crontab block that would be installed, on any platform, so a system-wide schedule can be reviewed before it is written.
-- Released under GPL-3.0-or-later.
+- Released under GPL-3.0-only.

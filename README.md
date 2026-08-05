@@ -61,7 +61,7 @@ The campaign overlay and fetched advisories live in the platform cache directory
 
 ## Licence
 
-GPL-3.0-or-later. See [LICENSE.txt](LICENSE.txt).
+GPL-3.0-only. See [LICENSE.txt](LICENSE.txt).
 
 Running the scanner puts you under no obligation, and its output is yours. Copyleft attaches to passing the program on, so scanning a proprietary repository with it creates no obligation for that repository whatsoever. If you redistribute the file on its own, section 4 asks that the licence text go with it.
 
