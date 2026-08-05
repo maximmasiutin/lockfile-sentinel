@@ -2257,6 +2257,19 @@ def main() -> int:
     # whose report cannot be trusted to describe what they meant.
     roots = [Path(r) for r in (args.roots or ["."])]
 
+    # A root that does not resolve is fatal, not skippable. Skipping it left
+    # all_statuses empty, printed "Repositories scanned: 0" and exited 0, so a
+    # mistyped path in an automation produced a clean bill of health for a tree
+    # nothing had looked at. Exit 2 is the documented code for a check that
+    # could not be performed.
+    unusable = [r for r in roots if not r.is_dir()]
+    if unusable:
+        for root in unusable:
+            reason = "does not exist" if not root.exists() else "is not a directory"
+            _progress(f"FAIL: root {root} {reason}")
+        _progress("refusing to report on a scan that could not cover every root given")
+        return 2
+
     # Size the walk before starting it, so the percentage and the estimate have
     # a denominator. Counting repositories rather than top-level directories is
     # what makes the number mean something on a tree where one directory holds

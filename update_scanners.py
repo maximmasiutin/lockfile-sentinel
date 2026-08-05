@@ -788,9 +788,15 @@ def target_offline_db(args) -> int:
     if code not in (0, 1):
         log(f"FAIL: the offline refresh exited {code}")
         return 1
+    # The control not firing is a failure, not a warning. A database that cannot
+    # detect a package with a published advisory is unusable, and reporting the
+    # refresh as successful would hand the scheduler exactly the outcome the
+    # positive control exists to catch: a detector that reports nothing being
+    # mistaken for a tree that is clean.
     if "keyv" not in out:
-        log("WARNING: the database refreshed but the control did not flag keyv; "
-            "verify the database rather than trusting this run")
+        log("FAIL: the database refreshed but the control package keyv was not flagged, "
+            "so the downloaded database cannot be trusted to detect anything")
+        return 1
     if not gate(cache, "the OSV offline database", args.skip_scan):
         return 1
     log("offline database refresh complete")
@@ -877,9 +883,7 @@ def target_trivy_db(args) -> int:
     if not trivy:
         log("FAIL: trivy not found on PATH")
         return 2
-    cache = trivy_cache_dir()
     log(f"trivy: {trivy}")
-    log(f"cache: {cache if cache else 'unresolved'}")
 
     before = trivy_freshness(trivy)
     report_trivy(before, "before")
@@ -898,7 +902,17 @@ def target_trivy_db(args) -> int:
     after = trivy_freshness(trivy)
     report_trivy(after, "after")
 
-    if cache and cache.is_dir() and not gate(cache, "the Trivy databases", args.skip_scan):
+    # Resolve the cache after the download, not before. On a first refresh the
+    # directory does not exist yet, so resolving it up front returned None and
+    # the gate was then skipped for the very databases that had just arrived,
+    # which is the one run where scanning them matters most.
+    cache = trivy_cache_dir()
+    log(f"cache: {cache if cache else 'unresolved'}")
+    if cache is None or not cache.is_dir():
+        log("FAIL: cannot locate the Trivy cache after the download, so the databases "
+            "cannot be scanned; set TRIVY_CACHE_DIR and run this again")
+        return 1
+    if not gate(cache, "the Trivy databases", args.skip_scan):
         return 1
 
     # A database still past its own NextUpdate after a download that reported

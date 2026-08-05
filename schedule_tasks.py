@@ -328,19 +328,29 @@ def cron_line(job: dict, delay: int, user: str) -> str:
     Every path is shell-quoted. The interpreter path, this repository's location
     and the cache root are all attacker-free but not space-free: a home
     directory or a checkout with a space in its name silently truncates the
-    command, and the failure looks identical to the missing-directory one."""
+    command, and the failure looks identical to the missing-directory one.
+
+    An empty user renders a user-crontab line. crontab(5) puts a user field
+    between the schedule and the command in a system crontab such as one under
+    /etc/cron.d, and no such field in a user crontab, where the command starts
+    immediately after the schedule. Emitting the system form into a user crontab
+    makes cron try to execute the username, so every job fails."""
     hour, minute = (int(part) for part in str(job["time"]).split(":"))
     payload = " ".join(shlex.quote(a) for a in
                        [sys.executable, str(UPDATER), *[str(a) for a in job["args"]]])
     spread = f"sleep $((RANDOM % {delay * 60})); " if delay > 0 else ""
     log_dir = cache_dir() / "logs"
     log_file = log_dir / f"{job['log']}.log"
-    return (f"{minute} {hour} * * * {user} mkdir -p {shlex.quote(str(log_dir))} && {spread}"
+    who = f"{user} " if user else ""
+    return (f"{minute} {hour} * * * {who}mkdir -p {shlex.quote(str(log_dir))} && {spread}"
             f"{payload} >> {shlex.quote(str(log_file))} 2>&1")
 
 
 def cron_body(selected: list[str], delay: int, user: str) -> str:
-    """The whole managed block, rendered so it can be compared byte for byte."""
+    """The whole managed block, rendered so it can be compared byte for byte.
+
+    Pass an empty user for a user crontab; see cron_line for why the field is
+    not merely cosmetic there."""
     lines = [MARK_BEGIN, "SHELL=/bin/bash",
              f"PATH={os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"]
     lines.extend(cron_line(JOBS[name], delay, user) for name in selected)
@@ -391,7 +401,8 @@ def linux_install(selected: list[str], delay: int, dry_run: bool, remove: bool) 
             continue
         if not inside:
             kept.append(line)
-    block = "" if remove else cron_body(selected, delay, user)
+    # No user field here: this block goes into the user's own crontab.
+    block = "" if remove else cron_body(selected, delay, "")
     desired = ("\n".join(kept).rstrip() + "\n\n" + block).lstrip() if block else \
         "\n".join(kept).rstrip() + "\n"
     if desired == existing:
@@ -456,8 +467,13 @@ def main() -> int:
         return 0
 
     if args.show_cron:
+        # Both forms, because they are not interchangeable: the system one
+        # carries a user field and the user one must not.
         user = os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
+        print(f"# {CRON_DIR}/update-scanners, used when that directory is writable")
         print(cron_body(selected, args.random_delay, user), end="")
+        print("\n# the user crontab, used otherwise")
+        print(cron_body(selected, args.random_delay, ""), end="")
         return 0
 
     if not UPDATER.exists():
