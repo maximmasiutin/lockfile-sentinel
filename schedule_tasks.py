@@ -26,6 +26,7 @@ Usage:
     python schedule_tasks.py --all --elevate
     python schedule_tasks.py --all --elevate --remove
     python schedule_tasks.py --all --elevate --prefix Acme- --runner run-task.ps1
+    python schedule_tasks.py --all --elevate --path-var MY_REPOS_DIR
 """
 
 # SPDX-License-Identifier: GPL-3.0-only
@@ -101,6 +102,33 @@ JOBS: dict[str, dict[str, object]] = {
 def task_name(job: dict[str, object], prefix: str) -> str:
     """The Task Scheduler name for a job, which is the prefix plus its suffix."""
     return f"{prefix}{job['task']}"
+
+
+def envify(path: str, var: str) -> str:
+    """Rewrite a path's leading directory as %VAR% when that variable covers it.
+
+    Task Scheduler expands environment variables in the command, the arguments
+    and the working directory before it launches anything, so a definition
+    written this way keeps working when the checkout moves: the variable is
+    updated once instead of four task definitions being re-registered. The
+    substitution is skipped when the variable is unset or does not prefix the
+    path, so the absolute path is always the fallback rather than a broken
+    reference to a variable that resolves to nothing.
+
+    Windows paths are compared case-insensitively, because a variable holding
+    G:\\q and a path spelled g:\\q\\... name the same directory."""
+    if not var:
+        return path
+    value = os.environ.get(var, "").rstrip("\\/")
+    if not value:
+        return path
+    if IS_WINDOWS:
+        matches = path.lower().startswith(value.lower())
+    else:
+        matches = path.startswith(value)
+    if not matches:
+        return path
+    return f"%{var}%{path[len(value):]}"
 
 
 def is_admin() -> bool:
@@ -186,7 +214,8 @@ def boundary(hour: int, minute: int) -> str:
 # Windows.
 # --------------------------------------------------------------------------
 
-def windows_xml(job: dict, start: str, delay: int, user_id: str, runner: str = "") -> str:
+def windows_xml(job: dict, start: str, delay: int, user_id: str, runner: str = "",
+                path_var: str = "") -> str:
     """Render the Task Scheduler definition for one job.
 
     RandomDelay is a child of CalendarTrigger and must precede the schedule
@@ -194,13 +223,17 @@ def windows_xml(job: dict, start: str, delay: int, user_id: str, runner: str = "
     # Quote by hand rather than with repr: repr escapes a backslash, and a
     # PowerShell single-quoted string is literal, so a Windows path would arrive
     # with the doubled separators intact and resolve nowhere.
-    argument_list = ",".join(f"'{a}'" for a in [str(UPDATER)] + [str(a) for a in job["args"]])
+    updater = envify(str(UPDATER), path_var)
+    workdir = envify(str(SCRIPT_DIR), path_var)
+    interpreter = envify(sys.executable, path_var)
+    argument_list = ",".join(f"'{a}'" for a in [updater] + [str(a) for a in job["args"]])
     if runner:
-        inner = (f"& '{runner}' -Name '{job['log']}' -FilePath '{sys.executable}' "
+        inner = (f"& '{envify(runner, path_var)}' -Name '{job['log']}' "
+                 f"-FilePath '{interpreter}' "
                  f"-ArgumentList {argument_list} "
-                 f"-WorkingDirectory '{SCRIPT_DIR}'; exit $LASTEXITCODE")
+                 f"-WorkingDirectory '{workdir}'; exit $LASTEXITCODE")
     else:
-        inner = (f"& '{sys.executable}' {argument_list.replace(',', ' ')}; "
+        inner = (f"& '{interpreter}' {argument_list.replace(',', ' ')}; "
                  f"exit $LASTEXITCODE")
     arguments = f'-NoProfile -ExecutionPolicy Bypass -Command "{inner}"'
     random_delay = f"\n      <RandomDelay>PT{delay}M</RandomDelay>" if delay > 0 else ""
@@ -240,7 +273,7 @@ def windows_xml(job: dict, start: str, delay: int, user_id: str, runner: str = "
     <Exec>
       <Command>{escape(resolve_pwsh() or 'pwsh.exe')}</Command>
       <Arguments>{escape(arguments)}</Arguments>
-      <WorkingDirectory>{escape(str(SCRIPT_DIR))}</WorkingDirectory>
+      <WorkingDirectory>{escape(workdir)}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
@@ -445,6 +478,12 @@ def main() -> int:
                         help="Windows: prefix for the task names "
                              f"(default: {DEFAULT_PREFIX!r}). An existing installation must "
                              "pass the prefix it already uses, or it gains a second set.")
+    parser.add_argument("--path-var", default="", metavar="NAME",
+                        help="Windows: write paths under the directory this environment "
+                             "variable names as %%NAME%% instead of absolutely, so moving the "
+                             "checkout means updating the variable rather than re-registering "
+                             "every task. Ignored where the variable is unset or does not "
+                             "cover the path.")
     parser.add_argument("--runner", default="",
                         help="Windows: a PowerShell wrapper to invoke in front of the updater, "
                              "for a site that logs its own scheduled runs. Default: none, so "
@@ -498,7 +537,8 @@ def main() -> int:
             worst = max(worst, windows_remove(name_in_scheduler, args.dry_run))
             continue
         hour, minute = (int(part) for part in str(job["time"]).split(":"))
-        xml = windows_xml(job, boundary(hour, minute), args.random_delay, user_id, args.runner)
+        xml = windows_xml(job, boundary(hour, minute), args.random_delay, user_id,
+                          args.runner, args.path_var)
         worst = max(worst, windows_install(name_in_scheduler, xml, args.dry_run))
     return worst
 
