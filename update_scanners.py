@@ -619,24 +619,44 @@ def target_osv_scanner(args) -> int:
 
     target = f"{MODULE_PATH}@v{latest}"
     log(f"building {target} with go install ...")
-    code, out = run([go, "install", target])
-    echo(out, "go")
-    if code != 0:
-        log(f"FAIL: go install exited {code}; existing osv-scanner left in place")
-        return 1
-    exe = go_bin(go)
-    if not exe or not exe.exists():
-        log("FAIL: osv-scanner not found after go install")
-        return 2
-    if not gate(exe, "the built osv-scanner", args.skip_scan):
-        return 1
-    after = osv_version(exe)
+
+    # Build into a staging directory, gate it there, and only then replace the
+    # binary the scanner actually runs. Installing straight into the Go bin
+    # directory meant a build that failed the ClamAV gate or the version check
+    # was already the copy on disk, and the scanner prefers the Go bin copy, so
+    # a rejected executable stayed installed and got used on the next scan.
+    with tempfile.TemporaryDirectory(prefix="lockfile-sentinel-gobin-") as staging:
+        code, out = run([go, "install", target], env=dict(os.environ, GOBIN=staging))
+        echo(out, "go")
+        if code != 0:
+            log(f"FAIL: go install exited {code}; existing osv-scanner left in place")
+            return 1
+        staged = Path(staging) / OSV_EXE
+        if not staged.exists():
+            log(f"FAIL: go install produced no {OSV_EXE} in the staging directory")
+            return 2
+        if not gate(staged, "the built osv-scanner", args.skip_scan):
+            log("the rejected build was discarded; the existing osv-scanner is untouched")
+            return 1
+        after = osv_version(staged)
+        if after != latest:
+            log(f"FAIL: built {latest} but --version reports '{after}'; discarding the build "
+                "rather than installing a binary that cannot identify itself")
+            return 1
+        destination = go_bin(go)
+        if destination is None:
+            log("FAIL: cannot determine the Go bin directory to install into")
+            return 2
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged), str(destination))
+        except OSError as exc:
+            log(f"FAIL: could not install the gated binary to {destination} ({exc})")
+            return 1
+
     write_state(OSV_STATE, {"lastVersion": after})
-    if after == latest:
-        log(f"osv-scanner updated: {installed or 'not installed'} -> {after}")
-        return 0
-    log(f"WARNING: built {latest} but --version now reports '{after}'")
-    return 1
+    log(f"osv-scanner updated: {installed or 'not installed'} -> {after}")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -714,8 +734,19 @@ def target_malicious_packages(args) -> int:
             sources.append(args.source_url)
         finally:
             staged.unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001 - degrade to the floor rather than fail
-        log(f"WARNING: could not refresh from the feed ({exc}); writing the built-in floor only")
+    except Exception as exc:  # noqa: BLE001 - keep what we have rather than fail open
+        # An unreachable or malformed feed must not overwrite a good overlay.
+        # Writing the built-in floor here replaced every campaign indicator that
+        # existed only in the feed, stamped the result as freshly refreshed, and
+        # returned success, so the next scan silently lost coverage it used to
+        # have and nothing said so.
+        log(f"FAIL: could not refresh from the feed ({exc})")
+        if output.exists():
+            log(f"keeping the existing overlay at {output} rather than replacing it with "
+                "the built-in floor; its age is unchanged and --status will report it stale")
+        else:
+            log("no existing overlay to keep; the scanner falls back to its built-in table")
+        return 1
 
     for name, versions in KNOWN_FLOOR.items():
         packages.setdefault(name, set()).update(versions)

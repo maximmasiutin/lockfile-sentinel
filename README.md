@@ -43,6 +43,25 @@ python lockfile_sentinel.py --osv source -r ./app         # pass through to osv-
 
 Exit codes are 0 when nothing was found, 1 when something was, and 2 when the scan could not be performed. A check that could not run never reports health.
 
+## A Repository With No Lockfile
+
+This is the question worth answering before you rely on a clean result, because the answer is not the reassuring one.
+
+The scanner does not resolve dependencies. It installs nothing, contacts no registry, and expands no dependency tree. Where a repository commits only `package.json` and no lockfile, the live OSV.dev cross-check does not run at all, and the report says so on that repository's coverage line rather than leaving it to be assumed.
+
+What still happens without a lockfile is narrower than it sounds. Declared ranges in `package.json` are compared against the offline table of package versions already known to be malicious, so a direct dependency whose range could resolve to one of those is reported, which is the only way to warn about a poisoning the next install would pull. Payload artifacts are still found by filename anywhere in the tree.
+
+What does not happen is everything else. Transitive dependencies are invisible, because nothing resolves them. A malicious package the offline table does not already name is invisible, because the layer that would have caught it needs a lockfile. So a repository with no lockfile reported as not vulnerable means only that nothing known was declared in its manifest.
+
+If you need a verdict for such a repository, generate a lockfile first and scan that:
+
+```bash
+npm install --package-lock-only --ignore-scripts
+python lockfile_sentinel.py --root .
+```
+
+`--ignore-scripts` matters here: resolving a tree that may pin a compromised package should not run that package's install hooks.
+
 ## Limits
 
 These are properties of the current code, stated because a scanner's blind spots matter more than its features. All of them under-report rather than over-report.
