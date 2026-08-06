@@ -74,6 +74,17 @@ def escape(text: str) -> str:
                 .replace("'", "&apos;"))
 
 
+def ps_quote(text: str) -> str:
+    """Wrap a value as a PowerShell single-quoted string, escaping apostrophes.
+
+    A single-quoted string in PowerShell is literal, which is what makes it right
+    for a Windows path, and doubling an embedded apostrophe is the only escape it
+    recognises. Without that, a path containing one closes the string early: the
+    generated task XML is malformed, and whatever follows the apostrophe is read
+    as PowerShell to run rather than as part of a filename."""
+    return "'" + text.replace("'", "''") + "'"
+
+
 def resolve_system_tool(name: str) -> str:
     """Absolute path to a system executable, or the bare name if PATH has none.
 
@@ -266,18 +277,21 @@ def windows_xml(job: Job, start: str, delay: int, user_id: str, runner: str = ""
     element; placed wrongly it is dropped silently rather than rejected."""
     # Quote by hand rather than with repr: repr escapes a backslash, and a
     # PowerShell single-quoted string is literal, so a Windows path would arrive
-    # with the doubled separators intact and resolve nowhere.
+    # with the doubled separators intact and resolve nowhere. Every token goes
+    # through ps_quote, because a single apostrophe in a path such as
+    # C:\Users\O'Brien would otherwise close the string early, break the XML and
+    # leave the rest of the path being read as PowerShell to execute.
     updater = envify(str(UPDATER), path_var)
     workdir = envify(str(SCRIPT_DIR), path_var)
     interpreter = envify(sys.executable, path_var)
-    argument_list = ",".join(f"'{a}'" for a in [updater, *job["args"]])
+    argument_list = ",".join(ps_quote(a) for a in [updater, *job["args"]])
     if runner:
-        inner = (f"& '{envify(runner, path_var)}' -Name '{job['log']}' "
-                 f"-FilePath '{interpreter}' "
+        inner = (f"& {ps_quote(envify(runner, path_var))} -Name {ps_quote(job['log'])} "
+                 f"-FilePath {ps_quote(interpreter)} "
                  f"-ArgumentList {argument_list} "
-                 f"-WorkingDirectory '{workdir}'; exit $LASTEXITCODE")
+                 f"-WorkingDirectory {ps_quote(workdir)}; exit $LASTEXITCODE")
     else:
-        inner = (f"& '{interpreter}' {argument_list.replace(',', ' ')}; "
+        inner = (f"& {ps_quote(interpreter)} {argument_list.replace(',', ' ')}; "
                  f"exit $LASTEXITCODE")
     arguments = f'-NoProfile -ExecutionPolicy Bypass -Command "{inner}"'
     random_delay = f"\n      <RandomDelay>PT{delay}M</RandomDelay>" if delay > 0 else ""

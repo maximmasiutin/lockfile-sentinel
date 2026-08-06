@@ -162,6 +162,16 @@ def test_a_symlink_directly_under_the_root_does_not_escape_either(tmp_path: Path
     assert not any("outside" in key for key in index), index
 
 
+def test_an_apostrophe_in_a_path_cannot_close_the_powershell_string() -> None:
+    """A path such as C:\\Users\\O'Brien closed the single-quoted string early.
+
+    The generated task XML was then malformed, and whatever followed the
+    apostrophe was read as PowerShell to execute rather than as a filename."""
+    assert st.ps_quote("C:\\Users\\O'Brien\\tool.py") == "'C:\\Users\\O''Brien\\tool.py'"
+    # A value with no apostrophe must be left exactly as it was, quoted.
+    assert st.ps_quote("C:\\plain\\tool.py") == "'C:\\plain\\tool.py'"
+
+
 def test_a_variable_prefix_must_end_on_a_separator() -> None:
     """C:\\repo must not claim C:\\repository and rewrite it to %VAR%sitory.
 
