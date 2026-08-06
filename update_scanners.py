@@ -422,6 +422,22 @@ def offline_db_dir() -> Path:
     return cache_dir() / "osv-offline-db"
 
 
+def trivy_cache_dir_default() -> Path:
+    """Where Trivy reads its databases, whether or not that exists yet.
+
+    trivy_cache_dir() answers None for a cache that has never been created,
+    which is right for reporting and wrong for deciding where to install a
+    download, so the refresh uses this and the status report uses that."""
+    explicit = os.environ.get("TRIVY_CACHE_DIR")
+    if explicit:
+        return Path(explicit)
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "trivy"
+
+
 def trivy_cache_dir() -> Path | None:
     """The cache Trivy will actually use, or None when it cannot be determined.
 
@@ -859,12 +875,16 @@ def parse_stamp(text: str | None) -> datetime | None:
         return None
 
 
-def trivy_freshness(trivy: str) -> dict[str, dict[str, datetime | None]]:
-    """Return {database: {updated, next_update}} as Trivy reports it."""
+def trivy_freshness(trivy: str, env: dict[str, str] | None = None
+                    ) -> dict[str, dict[str, datetime | None]]:
+    """Return {database: {updated, next_update}} as Trivy reports it.
+
+    An empty result means the state could not be determined, not that the
+    databases are fine; every caller has to treat it that way."""
     # The exit code is deliberately ignored: Trivy reports a non-zero code for
     # conditions that still print usable version JSON, and an unparseable body
     # is handled below, so the output is the only thing worth testing.
-    _code, out = run([trivy, "version", "--format", "json"], timeout=120)
+    _code, out = run([trivy, "version", "--format", "json"], timeout=120, env=env)
     try:
         data = json.loads(out or "{}")
     except json.JSONDecodeError:
@@ -933,40 +953,59 @@ def target_trivy_db(args) -> int:
     before = trivy_freshness(trivy)
     report_trivy(before, "before")
 
-    for flag, label in (("--download-db-only", "vulnerability"),
-                        ("--download-java-db-only", "Java index")):
-        if flag == "--download-java-db-only" and args.skip_java_db:
-            continue
-        log(f"downloading the {label} database ...")
-        code, out = run([trivy, "image", flag])
-        echo(out, "trivy")
-        if code != 0:
-            log(f"FAIL: {label} database download exited {code}")
+    live = trivy_cache_dir_default()
+    log(f"cache: {live}")
+
+    # Download into a staging cache, gate it there, and only then put it where
+    # Trivy reads from. Downloading straight into the live cache overwrote the
+    # databases before anything scanned them, so a rejected download was already
+    # the copy every later Trivy run consumed, including this scanner's own
+    # corroboration pass. Refusing to trust it after the fact changed nothing.
+    with tempfile.TemporaryDirectory(prefix="lockfile-sentinel-trivy-") as staging:
+        staged = Path(staging) / "cache"
+        staged.mkdir(parents=True, exist_ok=True)
+        child_env = dict(os.environ, TRIVY_CACHE_DIR=str(staged))
+        for flag, label in (("--download-db-only", "vulnerability"),
+                            ("--download-java-db-only", "Java index")):
+            if flag == "--download-java-db-only" and args.skip_java_db:
+                continue
+            log(f"downloading the {label} database into the staging cache ...")
+            code, out = run([trivy, "image", flag], env=child_env)
+            echo(out, "trivy")
+            if code != 0:
+                log(f"FAIL: {label} database download exited {code}; "
+                    "the live cache is untouched")
+                return 1
+
+        if not gate(staged, "the downloaded Trivy databases", args.skip_scan):
+            log("the rejected download was discarded; the live cache is untouched")
             return 1
 
-    after = trivy_freshness(trivy)
-    report_trivy(after, "after")
+        staged_freshness = trivy_freshness(trivy, env=child_env)
+        report_trivy(staged_freshness, "downloaded")
+        if not staged_freshness:
+            log("FAIL: could not read database metadata from the download, so its state "
+                "is unknown and it will not be promoted")
+            return 2
+        still = overdue(staged_freshness)
+        if still:
+            log(f"FAIL: still overdue after the download: {', '.join(still)}; not promoting")
+            return 1
 
-    # Resolve the cache after the download, not before. On a first refresh the
-    # directory does not exist yet, so resolving it up front returned None and
-    # the gate was then skipped for the very databases that had just arrived,
-    # which is the one run where scanning them matters most.
-    cache = trivy_cache_dir()
-    log(f"cache: {cache if cache else 'unresolved'}")
-    if cache is None or not cache.is_dir():
-        log("FAIL: cannot locate the Trivy cache after the download, so the databases "
-            "cannot be scanned; set TRIVY_CACHE_DIR and run this again")
-        return 1
-    if not gate(cache, "the Trivy databases", args.skip_scan):
-        return 1
+        try:
+            live.parent.mkdir(parents=True, exist_ok=True)
+            previous = live.with_name(live.name + ".previous")
+            if previous.exists():
+                shutil.rmtree(previous, ignore_errors=True)
+            if live.exists():
+                os.replace(live, previous)
+            shutil.move(str(staged), str(live))
+            shutil.rmtree(previous, ignore_errors=True)
+        except OSError as exc:
+            log(f"FAIL: could not promote the gated databases into {live} ({exc})")
+            return 1
 
-    # A database still past its own NextUpdate after a download that reported
-    # success means the download did not achieve what it claimed.
-    still = overdue(after)
-    if still:
-        log(f"FAIL: still overdue after the refresh: {', '.join(still)}")
-        return 1
-    log("Trivy databases current")
+    log(f"Trivy databases current, promoted into {live}")
     return 0
 
 
@@ -1026,6 +1065,11 @@ def target_status(_args) -> int:
     if trivy:
         freshness = trivy_freshness(trivy)
         report_trivy(freshness, "trivy")
+        # No metadata means the state could not be determined, which is exit 2
+        # rather than a pass. Reading it as "nothing overdue" let a status run
+        # report health for a check that never produced an answer.
+        if not freshness:
+            unknown = True
         stale = stale or bool(overdue(freshness))
     else:
         log("trivy: not found")

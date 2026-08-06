@@ -284,14 +284,17 @@ def windows_xml(job: Job, start: str, delay: int, user_id: str, runner: str = ""
     updater = envify(str(UPDATER), path_var)
     workdir = envify(str(SCRIPT_DIR), path_var)
     interpreter = envify(sys.executable, path_var)
-    argument_list = ",".join(ps_quote(a) for a in [updater, *job["args"]])
+    quoted = [ps_quote(a) for a in [updater, *job["args"]]]
     if runner:
         inner = (f"& {ps_quote(envify(runner, path_var))} -Name {ps_quote(job['log'])} "
                  f"-FilePath {ps_quote(interpreter)} "
-                 f"-ArgumentList {argument_list} "
+                 f"-ArgumentList {','.join(quoted)} "
                  f"-WorkingDirectory {ps_quote(workdir)}; exit $LASTEXITCODE")
     else:
-        inner = (f"& {ps_quote(interpreter)} {argument_list.replace(',', ' ')}; "
+        # Joined with spaces from the same quoted tokens rather than by rewriting
+        # the comma-separated form, which also replaced commas inside the tokens
+        # and silently corrupted any path containing one.
+        inner = (f"& {ps_quote(interpreter)} {' '.join(quoted)}; "
                  f"exit $LASTEXITCODE")
     arguments = f'-NoProfile -ExecutionPolicy Bypass -Command "{inner}"'
     random_delay = f"\n      <RandomDelay>PT{delay}M</RandomDelay>" if delay > 0 else ""

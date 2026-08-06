@@ -172,6 +172,28 @@ def test_an_apostrophe_in_a_path_cannot_close_the_powershell_string() -> None:
     assert st.ps_quote("C:\\plain\\tool.py") == "'C:\\plain\\tool.py'"
 
 
+def test_a_comma_in_a_path_survives_the_no_runner_task_command(monkeypatch) -> None:
+    """The direct-mode command was built by rewriting commas into spaces.
+
+    That transformed commas inside the quoted tokens too, so an updater under a
+    directory containing a comma was emitted with the comma turned into a space
+    and the registered task could not find it."""
+    monkeypatch.setattr(st, "UPDATER", Path("/opt/repo,archive/update_scanners.py"))
+    xml = st.windows_xml(st.JOBS["trivy-db"], "2026-01-01T00:00:00+00:00", 0, "user")
+    assert "repo,archive" in xml
+    assert "repo archive" not in xml
+
+
+def test_unknown_trivy_metadata_is_not_reported_as_healthy() -> None:
+    """An empty freshness map means the check could not run, so exit 2.
+
+    Reading it as "nothing overdue" let a status run report health for a
+    question Trivy never answered."""
+    assert us.overdue({}) == []
+    assert us.trivy_freshness.__doc__ is not None
+    assert "could not be determined" in us.trivy_freshness.__doc__
+
+
 def test_a_variable_prefix_must_end_on_a_separator() -> None:
     """C:\\repo must not claim C:\\repository and rewrite it to %VAR%sitory.
 

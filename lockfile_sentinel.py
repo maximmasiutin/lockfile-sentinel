@@ -837,7 +837,11 @@ def count_repositories(unit: Path, include_node_modules: bool, max_depth: int = 
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
-                        if not entry.is_dir():
+                        # follow_symlinks=False for the same reason the walk uses
+                        # it: this pass descends too, so a nested symlink would
+                        # take the counting outside the root even once the walk
+                        # itself stopped doing so.
+                        if not entry.is_dir(follow_symlinks=False):
                             continue
                     except OSError:
                         continue
@@ -2362,10 +2366,24 @@ def main() -> int:
     # mistyped path in an automation produced a clean bill of health for a tree
     # nothing had looked at. Exit 2 is the documented code for a check that
     # could not be performed.
-    unusable = [r for r in roots if not r.is_dir()]
+    # is_dir() is not enough: a directory whose permissions deny enumeration
+    # passes it, and the walk then swallows the scandir error and reports an
+    # empty tree with exit 0. So each root is opened here, which is the only
+    # test that distinguishes "empty" from "unreadable".
+    unusable: list[tuple[Path, str]] = []
+    for root in roots:
+        if not root.exists():
+            unusable.append((root, "does not exist"))
+        elif not root.is_dir():
+            unusable.append((root, "is not a directory"))
+        else:
+            try:
+                with os.scandir(root) as probe:
+                    next(iter(probe), None)
+            except OSError as exc:
+                unusable.append((root, f"cannot be read ({exc.strerror or exc})"))
     if unusable:
-        for root in unusable:
-            reason = "does not exist" if not root.exists() else "is not a directory"
+        for root, reason in unusable:
             _progress(f"FAIL: root {root} {reason}")
         _progress("refusing to report on a scan that could not cover every root given")
         return 2
