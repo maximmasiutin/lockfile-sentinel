@@ -51,12 +51,37 @@ import argparse
 import ctypes
 import os
 import shlex
+import shutil
 import subprocess  # nosec B404
 import sys
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from xml.sax.saxutils import escape
+from typing import TypedDict
+
+
+def escape(text: str) -> str:
+    """Escape text for inclusion in XML element content.
+
+    Written out rather than imported from xml.sax.saxutils, which pulls a
+    stdlib XML parser into a security tool that only ever writes XML and never
+    reads it. Static analysis flags that import on sight, and it is easier to
+    justify five replacements than an exception for an import nothing needs."""
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("'", "&apos;"))
+
+
+def resolve_system_tool(name: str) -> str:
+    """Absolute path to a system executable, or the bare name if PATH has none.
+
+    Passing a bare name to subprocess leaves the resolution to PATH at run time,
+    which is a hijacking surface for a program that is often run elevated. The
+    bare name is kept as the fallback so a host with an unusual layout still
+    works and fails with the tool's own message rather than ours."""
+    return shutil.which(name) or name
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UPDATER = SCRIPT_DIR / "update_scanners.py"
@@ -68,10 +93,23 @@ IS_WINDOWS = os.name == "nt"
 # keeps the names it already has instead of gaining four duplicates.
 DEFAULT_PREFIX = "lockfile-sentinel-"
 
+class Job(TypedDict):
+    """One scheduled job.
+
+    A TypedDict rather than dict[str, object], so that job["args"] is known to be
+    a list of strings. With the looser type every use needed a cast, and a type
+    checker could not tell a genuine mistake from the casts hiding it."""
+
+    task: str
+    log: str
+    args: list[str]
+    time: str
+
+
 # One entry per scheduled job. The times are staggered rather than shared
 # because the jobs compete for the same disk and the same network, and because
 # a failure is easier to attribute when only one of them was running.
-JOBS: dict[str, dict[str, object]] = {
+JOBS: dict[str, Job] = {
     "osv-scanner": {
         "task": "Update-OSV-Scanner",
         "log": "osv-scanner-daily",
@@ -99,7 +137,7 @@ JOBS: dict[str, dict[str, object]] = {
 }
 
 
-def task_name(job: dict[str, object], prefix: str) -> str:
+def task_name(job: Job, prefix: str) -> str:
     """The Task Scheduler name for a job, which is the prefix plus its suffix."""
     return f"{prefix}{job['task']}"
 
@@ -134,7 +172,7 @@ def envify(path: str, var: str) -> str:
 def is_admin() -> bool:
     """True when the current process can write a system-wide schedule."""
     if not IS_WINDOWS:
-        return os.geteuid() == 0  # type: ignore[attr-defined]
+        return os.geteuid() == 0  # type: ignore[attr-defined]  # pylint: disable=no-member
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 - any failure means "assume not"
@@ -148,6 +186,8 @@ def relaunch_elevated(argv: list[str]) -> int:
     see_mask_nocloseprocess = 0x00000040
 
     class SHELLEXECUTEINFOW(ctypes.Structure):
+        """The Win32 SHELLEXECUTEINFOW struct, field names as the API defines them."""
+
         _fields_ = [
             ("cbSize", ctypes.c_ulong), ("fMask", ctypes.c_ulong),
             ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
@@ -186,8 +226,6 @@ def resolve_pwsh() -> str | None:
     ):
         if candidate.exists():
             return str(candidate)
-    import shutil  # noqa: PLC0415 - only needed on the fallback path
-
     return shutil.which("pwsh")
 
 
@@ -214,7 +252,7 @@ def boundary(hour: int, minute: int) -> str:
 # Windows.
 # --------------------------------------------------------------------------
 
-def windows_xml(job: dict, start: str, delay: int, user_id: str, runner: str = "",
+def windows_xml(job: Job, start: str, delay: int, user_id: str, runner: str = "",
                 path_var: str = "") -> str:
     """Render the Task Scheduler definition for one job.
 
@@ -226,7 +264,7 @@ def windows_xml(job: dict, start: str, delay: int, user_id: str, runner: str = "
     updater = envify(str(UPDATER), path_var)
     workdir = envify(str(SCRIPT_DIR), path_var)
     interpreter = envify(sys.executable, path_var)
-    argument_list = ",".join(f"'{a}'" for a in [updater] + [str(a) for a in job["args"]])
+    argument_list = ",".join(f"'{a}'" for a in [updater, *job["args"]])
     if runner:
         inner = (f"& '{envify(runner, path_var)}' -Name '{job['log']}' "
                  f"-FilePath '{interpreter}' "
@@ -285,16 +323,18 @@ def windows_install(name: str, xml: str, dry_run: bool) -> int:
     if dry_run:
         print(f"would register {name}")
         return 0
-    handle = tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False, encoding="utf-16")
-    try:
-        handle.write(xml)
-        handle.close()
+    # A directory rather than a bare temporary file: schtasks has to open the
+    # path itself, so the file must be closed before it runs and deleted after,
+    # and TemporaryDirectory expresses that lifetime in one construct instead of
+    # a manual close paired with an unlink in a finally.
+    with tempfile.TemporaryDirectory(prefix="lockfile-sentinel-task-") as staging:
+        definition = Path(staging) / "task.xml"
+        definition.write_text(xml, encoding="utf-16")
         proc = subprocess.run(  # nosec B603
-            ["schtasks.exe", "/Create", "/TN", name, "/XML", handle.name, "/F"],
+            [resolve_system_tool("schtasks.exe"), "/Create", "/TN", name,
+             "/XML", str(definition), "/F"],
             capture_output=True, text=True, check=False,
         )
-    finally:
-        Path(handle.name).unlink(missing_ok=True)
     if proc.returncode != 0:
         print(f"FAIL: could not register {name}: {(proc.stdout + proc.stderr).strip()}")
         return 1
@@ -308,7 +348,7 @@ def windows_remove(name: str, dry_run: bool) -> int:
         print(f"would remove {name}")
         return 0
     proc = subprocess.run(  # nosec B603
-        ["schtasks.exe", "/Delete", "/TN", name, "/F"],
+        [resolve_system_tool("schtasks.exe"), "/Delete", "/TN", name, "/F"],
         capture_output=True, text=True, check=False,
     )
     if proc.returncode != 0:
@@ -348,7 +388,7 @@ def cache_dir() -> Path:
     return Path(base) / "lockfile-sentinel"
 
 
-def cron_line(job: dict, delay: int, user: str) -> str:
+def cron_line(job: Job, delay: int, user: str) -> str:
     """One crontab line for a job, with the random spread reproduced by a sleep.
 
     $RANDOM is a bash builtin rather than POSIX, which is why the file sets
@@ -368,9 +408,9 @@ def cron_line(job: dict, delay: int, user: str) -> str:
     /etc/cron.d, and no such field in a user crontab, where the command starts
     immediately after the schedule. Emitting the system form into a user crontab
     makes cron try to execute the username, so every job fails."""
-    hour, minute = (int(part) for part in str(job["time"]).split(":"))
+    hour, minute = (int(part) for part in job["time"].split(":"))
     payload = " ".join(shlex.quote(a) for a in
-                       [sys.executable, str(UPDATER), *[str(a) for a in job["args"]]])
+                       [sys.executable, str(UPDATER), *job["args"]])
     spread = f"sleep $((RANDOM % {delay * 60})); " if delay > 0 else ""
     log_dir = cache_dir() / "logs"
     log_file = log_dir / f"{job['log']}.log"
@@ -421,7 +461,8 @@ def linux_install(selected: list[str], delay: int, dry_run: bool, remove: bool) 
     # No write access to /etc/cron.d, so manage a marked block in the user
     # crontab instead. Replacing the block as a unit is what keeps this
     # idempotent without disturbing anything else the user has scheduled.
-    proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)  # nosec B603 B607
+    crontab = resolve_system_tool("crontab")
+    proc = subprocess.run([crontab, "-l"], capture_output=True, text=True, check=False)  # nosec B603
     existing = proc.stdout if proc.returncode == 0 else ""
     kept = []
     inside = False
@@ -444,7 +485,7 @@ def linux_install(selected: list[str], delay: int, dry_run: bool, remove: bool) 
     if dry_run:
         print("would rewrite the managed block in the user crontab")
         return 0
-    write = subprocess.run(["crontab", "-"], input=desired, text=True,  # nosec B603 B607
+    write = subprocess.run([crontab, "-"], input=desired, text=True,  # nosec B603
                            capture_output=True, check=False)
     if write.returncode != 0:
         print(f"FAIL: crontab rejected the block: {(write.stdout + write.stderr).strip()}")
@@ -502,7 +543,7 @@ def main() -> int:
         for name in selected:
             job = JOBS[name]
             print(f"{name:<20} {job['time']}  {task_name(job, args.prefix)}  "
-                  f"update_scanners.py {' '.join(str(a) for a in job['args'])}")
+                  f"update_scanners.py {' '.join(job['args'])}")
         return 0
 
     if args.show_cron:
@@ -536,7 +577,7 @@ def main() -> int:
         if args.remove:
             worst = max(worst, windows_remove(name_in_scheduler, args.dry_run))
             continue
-        hour, minute = (int(part) for part in str(job["time"]).split(":"))
+        hour, minute = (int(part) for part in job["time"].split(":"))
         xml = windows_xml(job, boundary(hour, minute), args.random_delay, user_id,
                           args.runner, args.path_var)
         worst = max(worst, windows_install(name_in_scheduler, xml, args.dry_run))

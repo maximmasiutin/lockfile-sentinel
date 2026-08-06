@@ -72,6 +72,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -663,7 +664,7 @@ def target_osv_scanner(args) -> int:
 # Target: malicious-packages, the campaign overlay.
 # --------------------------------------------------------------------------
 
-def _pick_column(fieldnames: list[str] | None, candidates: tuple[str, ...]) -> str | None:
+def _pick_column(fieldnames: Sequence[str] | None, candidates: tuple[str, ...]) -> str | None:
     """Return the first candidate column present in the header, case-insensitively."""
     if not fieldnames:
         return None
@@ -850,7 +851,10 @@ def parse_stamp(text: str | None) -> datetime | None:
 
 def trivy_freshness(trivy: str) -> dict[str, dict[str, datetime | None]]:
     """Return {database: {updated, next_update}} as Trivy reports it."""
-    code, out = run([trivy, "version", "--format", "json"], timeout=120)
+    # The exit code is deliberately ignored: Trivy reports a non-zero code for
+    # conditions that still print usable version JSON, and an unparseable body
+    # is handled below, so the output is the only thing worth testing.
+    _code, out = run([trivy, "version", "--format", "json"], timeout=120)
     try:
         data = json.loads(out or "{}")
     except json.JSONDecodeError:
@@ -960,7 +964,7 @@ def target_trivy_db(args) -> int:
 # Target: status.
 # --------------------------------------------------------------------------
 
-def target_status(args) -> int:
+def target_status(_args) -> int:
     """Report the freshness of everything this program maintains.
 
     Exit 0 when all fresh, 1 when something is stale, 2 when something could not

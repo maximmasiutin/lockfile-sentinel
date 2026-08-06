@@ -126,6 +126,14 @@ POISONED_VERSIONS: dict[str, list[str]] = {
 
 OVERLAY_NAME = "compromised-npm-packages.json"
 
+# PEP 695 aliases, which is one of the reasons this file requires 3.12. The walk
+# passes the same two shapes everywhere, and naming them once makes the
+# signatures below say what they carry instead of restating a nested generic.
+type WalkTriples = list[tuple[Path, list[str], list[str]]]
+type StatusesByOwner = dict[Path, "RepoStatus"]
+type LockfileIndex = dict[str, "RepoStatus"]
+
+
 
 def format_elapsed(seconds: float) -> str:
     """Render a duration as mm:ss, or h:mm:ss once it passes an hour."""
@@ -596,14 +604,14 @@ def scan_payload_filename(path: Path, status: RepoStatus) -> None:
 
 def _walk(
     root: Path, include_node_modules: bool
-) -> list[tuple[Path, list[str], list[str]]]:
+) -> WalkTriples:
     """Walk a directory tree, returning (dirpath, dirnames, filenames) triples.
 
     dirnames as returned includes ignored directory names (.git, and
     node_modules when excluded) so callers can still detect them; only the
     traversal itself skips descending into them.
     """
-    results: list[tuple[Path, list[str], list[str]]] = []
+    results: WalkTriples = []
     stack = [root]
     while stack:
         current = stack.pop()
@@ -644,7 +652,7 @@ def _walk(
     return results
 
 
-def _find_repo_roots(triples: list[tuple[Path, list[str], list[str]]]) -> list[Path]:
+def _find_repo_roots(triples: WalkTriples) -> list[Path]:
     """Identify every directory that is a git repository root, deepest first."""
     repo_roots = [dirpath for dirpath, dirnames, _ in triples if ".git" in dirnames]
     return sorted(repo_roots, key=lambda p: len(p.parts), reverse=True)
@@ -750,7 +758,7 @@ class WalkProgress:
 
 
 def _attribute(
-    triples: list[tuple[Path, list[str], list[str]]],
+    triples: WalkTriples,
     root: Path,
     extra_roots: list[Path],
     statuses: dict[Path, RepoStatus],
@@ -847,7 +855,7 @@ def count_repositories(unit: Path, include_node_modules: bool, max_depth: int = 
 def scan_root(
     root: Path, include_node_modules: bool, progress: WalkProgress | None = None,
     jobs: int = 1,
-) -> tuple[dict[Path, RepoStatus], dict[str, RepoStatus]]:
+) -> tuple[StatusesByOwner, LockfileIndex]:
     """Walk one root directory tree, building a per-repo exposure status map
     and an index of every lockfile path relevant for a later OSV-Scanner pass.
 
@@ -922,7 +930,7 @@ def scan_root(
     return statuses, lockfile_index
 
 
-def _merge_statuses(into: dict[Path, RepoStatus], other: dict[Path, RepoStatus]) -> None:
+def _merge_statuses(into: StatusesByOwner, other: StatusesByOwner) -> None:
     """Fold one unit's results into the accumulated map, merging shared owners.
 
     A plain dict update is wrong whenever two units charge files to the same
@@ -952,7 +960,7 @@ def _merge_statuses(into: dict[Path, RepoStatus], other: dict[Path, RepoStatus])
 
 def _scan_unit(
     unit: Path, root: Path, include_node_modules: bool, extra_roots: list[Path]
-) -> tuple[dict[Path, RepoStatus], dict[str, RepoStatus]]:
+) -> tuple[StatusesByOwner, LockfileIndex]:
     """Walk and attribute one top-level unit into maps of its own."""
     statuses: dict[Path, RepoStatus] = {}
     lockfile_index: dict[str, RepoStatus] = {}
@@ -1006,16 +1014,18 @@ def _parse_ioc_csv(text: str) -> dict[str, set[str]]:
     reader = csv.DictReader(io.StringIO(text))
     fields = {f.lower().strip(): f for f in (reader.fieldnames or [])}
     name_key = next((fields[c] for c in ("package_name", "name", "package") if c in fields), None)
-    version_key = next(
+    # Not "version_key": that is a module-level function here, and shadowing it
+    # inside a parser that also compares versions is a trap waiting for an edit.
+    versions_column = next(
         (fields[c] for c in ("package_versions", "versions", "version") if c in fields), None
     )
-    if not name_key or not version_key:
+    if not name_key or not versions_column:
         raise ValueError(f"unexpected columns in the feed: {reader.fieldnames}")
     for row in reader:
         name = (row.get(name_key) or "").strip()
         if not name:
             continue
-        raw = (row.get(version_key) or "").replace(";", ",").replace(" ", ",")
+        raw = (row.get(versions_column) or "").replace(";", ",").replace(" ", ",")
         for token in raw.split(","):
             version = token.strip().strip('"')
             if version and not version.startswith("99."):
@@ -1746,14 +1756,15 @@ def apply_osv_results(
     dependency. Partial coverage is reported as no coverage, because the whole
     point of the coverage line is to stop a repository nothing checked from
     reading as a repository that came back clean."""
-    for owner in {id(s): s for s in lockfile_index.values()}.values():
-        owned = [_normalize_path(p) for p in owner.lockfiles]
-        owner.osv_resolved_count = sum(1 for p in owned if p in processed_paths)
-        owner.osv_checked = bool(owned) and owner.osv_resolved_count == len(owned)
+    for status in {id(s): s for s in lockfile_index.values()}.values():
+        owned = [_normalize_path(p) for p in status.lockfiles]
+        status.osv_resolved_count = sum(1 for p in owned if p in processed_paths)
+        status.osv_checked = bool(owned) and status.osv_resolved_count == len(owned)
     for normalized_path, hits in osv_findings.items():
-        owner = lockfile_index.get(normalized_path)
-        if owner is None:
+        found = lockfile_index.get(normalized_path)
+        if found is None:
             continue
+        owner = found
         # Record which lockfile carried the hit, in its original spelling, so a
         # re-check submits that file rather than the whole repository.
         for candidate in owner.lockfiles:

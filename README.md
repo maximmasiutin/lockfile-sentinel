@@ -6,6 +6,21 @@ Inputs are lockfiles, `package.json` ranges and repository trees by filename, so
 
 The scanner is one file, the standard library only, Python 3.12 or newer. Download it and run it.
 
+## Python 3.12 Is a Requirement, Not a Preference
+
+The code uses syntax that older interpreters reject at parse time, so a 3.11 run fails immediately with a syntax error rather than misbehaving later. That is deliberate: a security tool that half-runs on an unsupported interpreter is worse than one that refuses to start.
+
+What it relies on: PEP 604 unions written as `X | None` rather than `Optional[X]`, PEP 695 `type` aliases for the shapes the walk passes around, `TypedDict` for the scheduled-job table so a mistyped key is caught before it reaches Task Scheduler, and `tempfile`, `pathlib` and `concurrent.futures` behaviour as of 3.12. There are no third-party dependencies at all, so nothing else constrains the version.
+
+Static analysis is part of the contract rather than an afterthought. The three files pass `mypy` with no issues, `pylint` at 10.00/10 against the committed `.pylintrc`, and `bandit` with no findings; the `.pylintrc` records why each disabled check is a property of the design instead of a warning being hidden.
+
+```bash
+python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py
+python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py
+python -m bandit -r . -x ./tests
+python -m pytest -q
+```
+
 Two optional companions keep its inputs current and are not needed to scan: `update_scanners.py` builds or updates osv-scanner, refreshes the campaign overlay and the OSV offline database, and refreshes the Trivy databases; `schedule_tasks.py` installs those four jobs on a daily schedule through Windows Task Scheduler or cron, idempotently. Each is standalone too.
 
 ## Quick Start
