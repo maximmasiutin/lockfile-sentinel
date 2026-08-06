@@ -648,11 +648,21 @@ def target_osv_scanner(args) -> int:
         if destination is None:
             log("FAIL: cannot determine the Go bin directory to install into")
             return 2
+        # Copy beside the destination first, then os.replace, which is atomic
+        # within one filesystem. shutil.move across filesystems degrades to a
+        # copy over the live file, so an interrupted update could leave the
+        # binary every later scan prefers truncated or half-written.
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(staged), str(destination))
+            beside = destination.with_name(destination.name + ".incoming")
+            shutil.copy2(str(staged), str(beside))
+            os.replace(str(beside), str(destination))
         except OSError as exc:
             log(f"FAIL: could not install the gated binary to {destination} ({exc})")
+            try:
+                beside.unlink(missing_ok=True)
+            except OSError:
+                pass
             return 1
 
     write_state(OSV_STATE, {"lastVersion": after})

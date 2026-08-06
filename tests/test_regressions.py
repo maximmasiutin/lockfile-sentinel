@@ -135,6 +135,45 @@ def test_the_walk_does_not_follow_symlinks_out_of_the_tree(tmp_path: Path) -> No
     assert not any(str(outside) in path for path in reached)
 
 
+def test_a_symlink_directly_under_the_root_does_not_escape_either(tmp_path: Path) -> None:
+    """The first symlink fix covered the walk but not the units fed into it.
+
+    Path.is_dir() follows symlinks, so a directory symlink that is a direct
+    child of the scanned root was handed to the walk as its starting point and
+    scandir enumerated the target, however carefully symlinks below it were
+    treated. That left the boundary intact everywhere except the one level an
+    attacker controls most cheaply."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "package-lock.json").write_text("{}", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "real").mkdir()
+    try:
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+
+    units = [u.name for u in ls.top_level_units(root, include_node_modules=False)]
+    assert "real" in units
+    assert "escape" not in units
+
+    _statuses, index = ls.scan_root(root, include_node_modules=False)
+    assert not any("outside" in key for key in index), index
+
+
+def test_a_variable_prefix_must_end_on_a_separator() -> None:
+    """C:\\repo must not claim C:\\repository and rewrite it to %VAR%sitory.
+
+    That registers without complaint and points the scheduled command at a
+    directory that does not exist."""
+    os.environ["LS_BOUNDARY_TEST"] = str(Path("/opt/repo"))
+    inside = str(Path("/opt/repo") / "tool.py")
+    sibling = str(Path("/opt/repository") / "tool.py")
+    assert st.envify(inside, "LS_BOUNDARY_TEST").startswith("%LS_BOUNDARY_TEST%")
+    assert st.envify(sibling, "LS_BOUNDARY_TEST") == sibling
+
+
 # --------------------------------------------------------------------------
 # Reports poisoned when clean.
 # --------------------------------------------------------------------------

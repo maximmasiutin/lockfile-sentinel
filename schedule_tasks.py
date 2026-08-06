@@ -160,13 +160,19 @@ def envify(path: str, var: str) -> str:
     value = os.environ.get(var, "").rstrip("\\/")
     if not value:
         return path
+    # The prefix has to end on a path separator, not merely on a character
+    # boundary. A variable holding C:\repo would otherwise claim
+    # C:\repository\tool.py and rewrite it as %VAR%sitory\tool.py, which
+    # registers without complaint and points the scheduled command at a
+    # directory that does not exist.
+    remainder = path[len(value):]
     if IS_WINDOWS:
         matches = path.lower().startswith(value.lower())
     else:
         matches = path.startswith(value)
-    if not matches:
+    if not matches or (remainder and remainder[0] not in ("\\", "/")):
         return path
-    return f"%{var}%{path[len(value):]}"
+    return f"%{var}%{remainder}"
 
 
 def is_admin() -> bool:

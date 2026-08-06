@@ -787,7 +787,14 @@ def _attribute(
 
 
 def top_level_units(root: Path, include_node_modules: bool) -> list[Path]:
-    """The directories under a root that the walk treats as units of work."""
+    """The directories under a root that the walk treats as units of work.
+
+    A symlinked child is skipped here, not only inside the walk. Path.is_dir()
+    follows symlinks, so a directory symlink directly under the root was handed
+    to the walk as its starting point, and scandir then enumerated the target
+    however carefully the walk treated symlinks below it. That left the tree
+    boundary intact everywhere except at the one level an attacker controls
+    most cheaply."""
     if not root.is_dir():
         return []
     try:
@@ -796,7 +803,7 @@ def top_level_units(root: Path, include_node_modules: bool) -> list[Path]:
         return []
     units = []
     for entry in entries:
-        if not entry.is_dir():
+        if entry.is_symlink() or not entry.is_dir():
             continue
         if entry.name in ALWAYS_SKIP_DIRS:
             continue
@@ -876,7 +883,10 @@ def scan_root(
     # The root's own files first, without descending, so they are charged before
     # any subtree claims them.
     try:
-        root_files = [e.name for e in root.iterdir() if e.is_file()]
+        # Symlinks skipped for the same reason as in top_level_units: a
+        # symlinked file directly under the root would otherwise be read from
+        # wherever it points.
+        root_files = [e.name for e in root.iterdir() if not e.is_symlink() and e.is_file()]
     except OSError:
         root_files = []
     if root_files:
