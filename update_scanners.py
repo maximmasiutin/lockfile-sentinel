@@ -72,6 +72,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -290,10 +291,11 @@ def gate(target: Path, what: str, skip: bool) -> bool:
     it clean, and a scanner that passes what it never read is worse than none.
     So the size decides: the daemon when everything fits, standalone clamscan
     with the caps lifted when it does not. clamscan in turn cannot read a file
-    above 2 GiB and says so only in a warning, so such a file is reported here
-    as unscanned rather than counted as clean.
+    above 2 GiB and says so only in a warning while still exiting 0, so a file
+    that size is refused outright rather than passed on a clean exit code.
 
-    Fail closed: anything other than a confirmed clean result returns False."""
+    Fail closed: anything other than a confirmed clean result returns False, and
+    a file nothing could read is not a clean result."""
     if skip:
         log(f"ClamAV gate skipped by request: {what}")
         return True
@@ -303,10 +305,19 @@ def gate(target: Path, what: str, skip: bool) -> bool:
 
     files = [p for p in target.rglob("*") if p.is_file()] if target.is_dir() else [target]
     largest = max((p.stat().st_size for p in files), default=0)
-    for path in files:
-        if path.stat().st_size > CLAMSCAN_FILE_CEILING:
-            log(f"WARNING: {path} is {path.stat().st_size / 1024 / 1024:.0f} MB, above the 2 GiB "
-                "scanner ceiling; it was NOT scanned and must not be read as clean")
+
+    # A file above the ceiling is refused rather than warned about. Neither
+    # scanner reads it, and both still exit 0, so warning and continuing meant
+    # returning a clean verdict for bytes nothing had looked at. That is the one
+    # outcome a gate must never produce, and the docstring above claimed it was
+    # already refused when it was not.
+    oversized = [p for p in files if p.stat().st_size > CLAMSCAN_FILE_CEILING]
+    if oversized:
+        for path in oversized:
+            log(f"FAIL: {path} is {path.stat().st_size / 1024 / 1024:.0f} MB, above the 2 GiB "
+                "libclamav ceiling, so no scanner here can read it")
+        log(f"refusing to trust {what}: {len(oversized)} file(s) could not be scanned at all")
+        return False
 
     cap = clamd_max_file_size()
     clamdscan = resolve_clam("clamdscan")
@@ -609,31 +620,51 @@ def target_osv_scanner(args) -> int:
 
     target = f"{MODULE_PATH}@v{latest}"
     log(f"building {target} with go install ...")
-    code, out = run([go, "install", target])
-    echo(out, "go")
-    if code != 0:
-        log(f"FAIL: go install exited {code}; existing osv-scanner left in place")
-        return 1
-    exe = go_bin(go)
-    if not exe or not exe.exists():
-        log("FAIL: osv-scanner not found after go install")
-        return 2
-    if not gate(exe, "the built osv-scanner", args.skip_scan):
-        return 1
-    after = osv_version(exe)
+
+    # Build into a staging directory, gate it there, and only then replace the
+    # binary the scanner actually runs. Installing straight into the Go bin
+    # directory meant a build that failed the ClamAV gate or the version check
+    # was already the copy on disk, and the scanner prefers the Go bin copy, so
+    # a rejected executable stayed installed and got used on the next scan.
+    with tempfile.TemporaryDirectory(prefix="lockfile-sentinel-gobin-") as staging:
+        code, out = run([go, "install", target], env=dict(os.environ, GOBIN=staging))
+        echo(out, "go")
+        if code != 0:
+            log(f"FAIL: go install exited {code}; existing osv-scanner left in place")
+            return 1
+        staged = Path(staging) / OSV_EXE
+        if not staged.exists():
+            log(f"FAIL: go install produced no {OSV_EXE} in the staging directory")
+            return 2
+        if not gate(staged, "the built osv-scanner", args.skip_scan):
+            log("the rejected build was discarded; the existing osv-scanner is untouched")
+            return 1
+        after = osv_version(staged)
+        if after != latest:
+            log(f"FAIL: built {latest} but --version reports '{after}'; discarding the build "
+                "rather than installing a binary that cannot identify itself")
+            return 1
+        destination = go_bin(go)
+        if destination is None:
+            log("FAIL: cannot determine the Go bin directory to install into")
+            return 2
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged), str(destination))
+        except OSError as exc:
+            log(f"FAIL: could not install the gated binary to {destination} ({exc})")
+            return 1
+
     write_state(OSV_STATE, {"lastVersion": after})
-    if after == latest:
-        log(f"osv-scanner updated: {installed or 'not installed'} -> {after}")
-        return 0
-    log(f"WARNING: built {latest} but --version now reports '{after}'")
-    return 1
+    log(f"osv-scanner updated: {installed or 'not installed'} -> {after}")
+    return 0
 
 
 # --------------------------------------------------------------------------
 # Target: malicious-packages, the campaign overlay.
 # --------------------------------------------------------------------------
 
-def _pick_column(fieldnames: list[str] | None, candidates: tuple[str, ...]) -> str | None:
+def _pick_column(fieldnames: Sequence[str] | None, candidates: tuple[str, ...]) -> str | None:
     """Return the first candidate column present in the header, case-insensitively."""
     if not fieldnames:
         return None
@@ -704,8 +735,19 @@ def target_malicious_packages(args) -> int:
             sources.append(args.source_url)
         finally:
             staged.unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001 - degrade to the floor rather than fail
-        log(f"WARNING: could not refresh from the feed ({exc}); writing the built-in floor only")
+    except Exception as exc:  # noqa: BLE001 - keep what we have rather than fail open
+        # An unreachable or malformed feed must not overwrite a good overlay.
+        # Writing the built-in floor here replaced every campaign indicator that
+        # existed only in the feed, stamped the result as freshly refreshed, and
+        # returned success, so the next scan silently lost coverage it used to
+        # have and nothing said so.
+        log(f"FAIL: could not refresh from the feed ({exc})")
+        if output.exists():
+            log(f"keeping the existing overlay at {output} rather than replacing it with "
+                "the built-in floor; its age is unchanged and --status will report it stale")
+        else:
+            log("no existing overlay to keep; the scanner falls back to its built-in table")
+        return 1
 
     for name, versions in KNOWN_FLOOR.items():
         packages.setdefault(name, set()).update(versions)
@@ -778,9 +820,15 @@ def target_offline_db(args) -> int:
     if code not in (0, 1):
         log(f"FAIL: the offline refresh exited {code}")
         return 1
+    # The control not firing is a failure, not a warning. A database that cannot
+    # detect a package with a published advisory is unusable, and reporting the
+    # refresh as successful would hand the scheduler exactly the outcome the
+    # positive control exists to catch: a detector that reports nothing being
+    # mistaken for a tree that is clean.
     if "keyv" not in out:
-        log("WARNING: the database refreshed but the control did not flag keyv; "
-            "verify the database rather than trusting this run")
+        log("FAIL: the database refreshed but the control package keyv was not flagged, "
+            "so the downloaded database cannot be trusted to detect anything")
+        return 1
     if not gate(cache, "the OSV offline database", args.skip_scan):
         return 1
     log("offline database refresh complete")
@@ -803,7 +851,10 @@ def parse_stamp(text: str | None) -> datetime | None:
 
 def trivy_freshness(trivy: str) -> dict[str, dict[str, datetime | None]]:
     """Return {database: {updated, next_update}} as Trivy reports it."""
-    code, out = run([trivy, "version", "--format", "json"], timeout=120)
+    # The exit code is deliberately ignored: Trivy reports a non-zero code for
+    # conditions that still print usable version JSON, and an unparseable body
+    # is handled below, so the output is the only thing worth testing.
+    _code, out = run([trivy, "version", "--format", "json"], timeout=120)
     try:
         data = json.loads(out or "{}")
     except json.JSONDecodeError:
@@ -867,9 +918,7 @@ def target_trivy_db(args) -> int:
     if not trivy:
         log("FAIL: trivy not found on PATH")
         return 2
-    cache = trivy_cache_dir()
     log(f"trivy: {trivy}")
-    log(f"cache: {cache if cache else 'unresolved'}")
 
     before = trivy_freshness(trivy)
     report_trivy(before, "before")
@@ -888,7 +937,17 @@ def target_trivy_db(args) -> int:
     after = trivy_freshness(trivy)
     report_trivy(after, "after")
 
-    if cache and cache.is_dir() and not gate(cache, "the Trivy databases", args.skip_scan):
+    # Resolve the cache after the download, not before. On a first refresh the
+    # directory does not exist yet, so resolving it up front returned None and
+    # the gate was then skipped for the very databases that had just arrived,
+    # which is the one run where scanning them matters most.
+    cache = trivy_cache_dir()
+    log(f"cache: {cache if cache else 'unresolved'}")
+    if cache is None or not cache.is_dir():
+        log("FAIL: cannot locate the Trivy cache after the download, so the databases "
+            "cannot be scanned; set TRIVY_CACHE_DIR and run this again")
+        return 1
+    if not gate(cache, "the Trivy databases", args.skip_scan):
         return 1
 
     # A database still past its own NextUpdate after a download that reported
@@ -905,7 +964,7 @@ def target_trivy_db(args) -> int:
 # Target: status.
 # --------------------------------------------------------------------------
 
-def target_status(args) -> int:
+def target_status(_args) -> int:
     """Report the freshness of everything this program maintains.
 
     Exit 0 when all fresh, 1 when something is stale, 2 when something could not

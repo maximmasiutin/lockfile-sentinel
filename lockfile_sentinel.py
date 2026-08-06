@@ -126,6 +126,14 @@ POISONED_VERSIONS: dict[str, list[str]] = {
 
 OVERLAY_NAME = "compromised-npm-packages.json"
 
+# PEP 695 aliases, which is one of the reasons this file requires 3.12. The walk
+# passes the same two shapes everywhere, and naming them once makes the
+# signatures below say what they carry instead of restating a nested generic.
+type WalkTriples = list[tuple[Path, list[str], list[str]]]
+type StatusesByOwner = dict[Path, "RepoStatus"]
+type LockfileIndex = dict[str, "RepoStatus"]
+
+
 
 def format_elapsed(seconds: float) -> str:
     """Render a duration as mm:ss, or h:mm:ss once it passes an hour."""
@@ -274,6 +282,11 @@ class RepoStatus:
     poisoned_ranges: dict[str, set[str]] = field(default_factory=dict)
     payload_files: list[str] = field(default_factory=list)
     osv_checked: bool = False
+    # How many of this repository's lockfiles the live database actually
+    # resolved. osv_checked is true only when that equals all of them, and this
+    # count is what lets the coverage line say "3 of 4" rather than implying
+    # none succeeded when one merely failed.
+    osv_resolved_count: int = 0
     osv_malicious: dict[str, set[str]] = field(default_factory=dict)
     osv_advisory_ids: dict[str, set[str]] = field(default_factory=dict)
     trivy_checked: bool = False
@@ -325,6 +338,15 @@ def range_may_resolve_to(range_spec: str, poisoned_version: str) -> bool:
         return True
     if spec.startswith(("workspace:", "file:", "git:", "git+", "http:", "https:", "link:")):
         return False
+
+    # Anything with more than one comparator is rejected before the prefix tests
+    # below, because those read only the first one. ">=5.0.0 <6.0.0" would
+    # otherwise match its lower bound and report 6.0.0 as reachable when the
+    # upper bound excludes it, which is a false positive rather than the
+    # documented under-report.
+    if "||" in spec or any(ch.isspace() for ch in spec):
+        return False
+
     target = version_key(poisoned_version)
     if spec.startswith("^"):
         base = version_key(spec[1:])
@@ -346,6 +368,15 @@ def _escape_package_name(name: str) -> str:
     return re.escape(name).replace(r"\/", "(?:/|%2[fF])")
 
 
+# Yarn 2 and later write "keyv@npm:6.0.0" rather than "keyv@6.0.0", both in a
+# descriptor and in the resolution line, and such a lockfile often carries no
+# tarball URL at all. Without this the offline layer sees nothing in a Berry
+# lockfile that pins a poisoned version outright, and with the live database
+# disabled or unavailable the scan exits clean. The protocol is optional so the
+# classic form still matches, and %3A covers the URL-encoded spelling.
+_PROTOCOL = r"(?:npm(?::|%3[aA]))?"
+
+
 def _version_patterns(name: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
     """Build the tarball-URL and bare-token regexes that capture any version
     of one watched package from raw lockfile text."""
@@ -355,7 +386,7 @@ def _version_patterns(name: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
         rf"{escaped_name}/-/{re.escape(basename)}-([0-9][\w.\-+]*)\.tgz"
     )
     token = re.compile(
-        rf"(?<![\w@./-]){escaped_name}@([0-9][\w.\-+]*)(?![\w.-])"
+        rf"(?<![\w@./-]){escaped_name}@{_PROTOCOL}([0-9][\w.\-+]*)(?![\w.-])"
     )
     return tarball, token
 
@@ -373,7 +404,7 @@ def _scope_patterns(prefix: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
         rf"({escaped_prefix}[a-z0-9._-]+)/-/[a-z0-9._-]+-([0-9][\w.\-+]*)\.tgz"
     )
     token = re.compile(
-        rf"(?<![\w@./-])({escaped_prefix}[a-z0-9._-]+)@([0-9][\w.\-+]*)(?![\w.-])"
+        rf"(?<![\w@./-])({escaped_prefix}[a-z0-9._-]+)@{_PROTOCOL}([0-9][\w.\-+]*)(?![\w.-])"
     )
     return tarball, token
 
@@ -573,14 +604,14 @@ def scan_payload_filename(path: Path, status: RepoStatus) -> None:
 
 def _walk(
     root: Path, include_node_modules: bool
-) -> list[tuple[Path, list[str], list[str]]]:
+) -> WalkTriples:
     """Walk a directory tree, returning (dirpath, dirnames, filenames) triples.
 
     dirnames as returned includes ignored directory names (.git, and
     node_modules when excluded) so callers can still detect them; only the
     traversal itself skips descending into them.
     """
-    results: list[tuple[Path, list[str], list[str]]] = []
+    results: WalkTriples = []
     stack = [root]
     while stack:
         current = stack.pop()
@@ -592,13 +623,20 @@ def _walk(
         # per question. Over a clone tree of a few hundred repositories that is
         # the difference between minutes and tens of minutes, and the walk is
         # the phase a person waits on.
+        # follow_symlinks=False on both tests, which classifies a symlink as
+        # neither a directory nor a file and so skips it. Following them would
+        # let a directory symlink inside a scanned tree walk and read files
+        # outside the root the caller named, which is the boundary SECURITY.md
+        # promises for an untrusted tree, and a symlink cycle would make the
+        # walk unbounded. The cost is that a lockfile reached only through a
+        # symlink is not scanned, which under-reports rather than escaping.
         try:
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
-                        if entry.is_dir():
+                        if entry.is_dir(follow_symlinks=False):
                             dirnames.append(entry.name)
-                        elif entry.is_file():
+                        elif entry.is_file(follow_symlinks=False):
                             filenames.append(entry.name)
                     except OSError:
                         continue
@@ -614,7 +652,7 @@ def _walk(
     return results
 
 
-def _find_repo_roots(triples: list[tuple[Path, list[str], list[str]]]) -> list[Path]:
+def _find_repo_roots(triples: WalkTriples) -> list[Path]:
     """Identify every directory that is a git repository root, deepest first."""
     repo_roots = [dirpath for dirpath, dirnames, _ in triples if ".git" in dirnames]
     return sorted(repo_roots, key=lambda p: len(p.parts), reverse=True)
@@ -720,7 +758,7 @@ class WalkProgress:
 
 
 def _attribute(
-    triples: list[tuple[Path, list[str], list[str]]],
+    triples: WalkTriples,
     root: Path,
     extra_roots: list[Path],
     statuses: dict[Path, RepoStatus],
@@ -817,7 +855,7 @@ def count_repositories(unit: Path, include_node_modules: bool, max_depth: int = 
 def scan_root(
     root: Path, include_node_modules: bool, progress: WalkProgress | None = None,
     jobs: int = 1,
-) -> tuple[dict[Path, RepoStatus], dict[str, RepoStatus]]:
+) -> tuple[StatusesByOwner, LockfileIndex]:
     """Walk one root directory tree, building a per-repo exposure status map
     and an index of every lockfile path relevant for a later OSV-Scanner pass.
 
@@ -881,8 +919,9 @@ def scan_root(
             except OSError as exc:
                 _progress(f"  could not read {unit}: {exc}")
                 continue
-            statuses.update(unit_statuses)
-            lockfile_index.update(unit_lockfiles)
+            _merge_statuses(statuses, unit_statuses)
+            for key, owner in unit_lockfiles.items():
+                lockfile_index[key] = statuses.get(Path(owner.path), owner)
             if progress is not None:
                 # Count the repositories this unit actually produced, so the bar
                 # measures repositories rather than top-level directories and a
@@ -891,9 +930,37 @@ def scan_root(
     return statuses, lockfile_index
 
 
+def _merge_statuses(into: StatusesByOwner, other: StatusesByOwner) -> None:
+    """Fold one unit's results into the accumulated map, merging shared owners.
+
+    A plain dict update is wrong whenever two units charge files to the same
+    owner, which happens exactly when the scanned root is itself a git
+    repository: every unit without its own .git attributes to that outer root,
+    so each worker returns a separate status for the same key and the last one
+    written silently replaced all the findings before it. Scanning a single
+    repository with more than one job is the common case for that, so the loss
+    was quiet and easy to miss."""
+    for key, src in other.items():
+        dst = into.get(key)
+        if dst is None:
+            into[key] = src
+            continue
+        dst.has_npm = dst.has_npm or src.has_npm
+        dst.npm_files.extend(src.npm_files)
+        dst.lockfiles.extend(src.lockfiles)
+        dst.payload_files.extend(src.payload_files)
+        dst.flagged_lockfiles |= src.flagged_lockfiles
+        for attribute in ("present_versions", "range_only", "poisoned_versions",
+                          "poisoned_ranges", "osv_malicious", "osv_advisory_ids",
+                          "trivy_confirmed"):
+            target = getattr(dst, attribute)
+            for name, values in getattr(src, attribute).items():
+                target.setdefault(name, set()).update(values)
+
+
 def _scan_unit(
     unit: Path, root: Path, include_node_modules: bool, extra_roots: list[Path]
-) -> tuple[dict[Path, RepoStatus], dict[str, RepoStatus]]:
+) -> tuple[StatusesByOwner, LockfileIndex]:
     """Walk and attribute one top-level unit into maps of its own."""
     statuses: dict[Path, RepoStatus] = {}
     lockfile_index: dict[str, RepoStatus] = {}
@@ -947,16 +1014,18 @@ def _parse_ioc_csv(text: str) -> dict[str, set[str]]:
     reader = csv.DictReader(io.StringIO(text))
     fields = {f.lower().strip(): f for f in (reader.fieldnames or [])}
     name_key = next((fields[c] for c in ("package_name", "name", "package") if c in fields), None)
-    version_key = next(
+    # Not "version_key": that is a module-level function here, and shadowing it
+    # inside a parser that also compares versions is a trap waiting for an edit.
+    versions_column = next(
         (fields[c] for c in ("package_versions", "versions", "version") if c in fields), None
     )
-    if not name_key or not version_key:
+    if not name_key or not versions_column:
         raise ValueError(f"unexpected columns in the feed: {reader.fieldnames}")
     for row in reader:
         name = (row.get(name_key) or "").strip()
         if not name:
             continue
-        raw = (row.get(version_key) or "").replace(";", ",").replace(" ", ",")
+        raw = (row.get(versions_column) or "").replace(";", ",").replace(" ", ",")
         for token in raw.split(","):
             version = token.strip().strip('"')
             if version and not version.startswith("99."):
@@ -1677,16 +1746,25 @@ def apply_osv_results(
     processed_paths: set[str],
 ) -> None:
     """Attach OSV-Scanner malicious-package hits back onto their owning repo,
-    and mark osv_checked only for repos whose lockfile was actually,
-    successfully submitted (not merely discovered)."""
-    for normalized_path in processed_paths:
-        owner = lockfile_index.get(normalized_path)
-        if owner is not None:
-            owner.osv_checked = True
+    and mark osv_checked only for repos whose lockfiles were all actually,
+    successfully submitted (not merely discovered).
+
+    Every lockfile has to succeed, not just one. A repository with several
+    lockfiles where only one extracted was being reported as fully covered, so
+    the coverage line claimed all of them had been submitted and resolved while
+    the one that failed might be the one carrying the malicious transitive
+    dependency. Partial coverage is reported as no coverage, because the whole
+    point of the coverage line is to stop a repository nothing checked from
+    reading as a repository that came back clean."""
+    for status in {id(s): s for s in lockfile_index.values()}.values():
+        owned = [_normalize_path(p) for p in status.lockfiles]
+        status.osv_resolved_count = sum(1 for p in owned if p in processed_paths)
+        status.osv_checked = bool(owned) and status.osv_resolved_count == len(owned)
     for normalized_path, hits in osv_findings.items():
-        owner = lockfile_index.get(normalized_path)
-        if owner is None:
+        found = lockfile_index.get(normalized_path)
+        if found is None:
             continue
+        owner = found
         # Record which lockfile carried the hit, in its original spelling, so a
         # re-check submits that file rather than the whole repository.
         for candidate in owner.lockfiles:
@@ -1819,6 +1897,12 @@ def _coverage_line(status: RepoStatus, osv_bin: str | None) -> str:
         return (
             "  osv-scanner: not run (no lockfile in this repository), so nothing was resolved "
             "and transitive dependencies were never seen"
+        )
+    if status.osv_resolved_count:
+        return (
+            f"  osv-scanner: only {status.osv_resolved_count} of {len(status.lockfiles)} "
+            "lockfile(s) resolved, so treat this repository as unchecked by the live "
+            "database: the one that failed may be the one that mattered"
         )
     return (
         f"  osv-scanner: {len(status.lockfiles)} lockfile(s) found but not successfully submitted, "
@@ -2255,7 +2339,26 @@ def main() -> int:
     # Default to the current directory rather than to anything guessed: a
     # scanner that silently walks somewhere the caller did not name is a scanner
     # whose report cannot be trusted to describe what they meant.
-    roots = [Path(r) for r in (args.roots or ["."])]
+    # Resolved, not taken as given. osv-scanner reports absolute source paths in
+    # its results, so a relative root produced relative index keys that never
+    # matched the absolute keys coming back, and every live-database finding for
+    # that run was silently discarded while the coverage line still claimed the
+    # lockfile had been submitted and resolved. A package the offline table does
+    # not already know would have been reported clean.
+    roots = [Path(r).resolve() for r in (args.roots or ["."])]
+
+    # A root that does not resolve is fatal, not skippable. Skipping it left
+    # all_statuses empty, printed "Repositories scanned: 0" and exited 0, so a
+    # mistyped path in an automation produced a clean bill of health for a tree
+    # nothing had looked at. Exit 2 is the documented code for a check that
+    # could not be performed.
+    unusable = [r for r in roots if not r.is_dir()]
+    if unusable:
+        for root in unusable:
+            reason = "does not exist" if not root.exists() else "is not a directory"
+            _progress(f"FAIL: root {root} {reason}")
+        _progress("refusing to report on a scan that could not cover every root given")
+        return 2
 
     # Size the walk before starting it, so the percentage and the estimate have
     # a denominator. Counting repositories rather than top-level directories is

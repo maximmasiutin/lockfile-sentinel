@@ -30,6 +30,15 @@ jobs:
           python -m pip install --upgrade pytest
           python -m pytest -q
 
+      - name: Static analysis
+        # Part of the contract rather than advice: the README states that these
+        # three pass, so CI is what keeps that sentence true.
+        run: |
+          python -m pip install --upgrade mypy pylint bandit
+          python -m mypy --python-version 3.12 --ignore-missing-imports lockfile_sentinel.py update_scanners.py schedule_tasks.py
+          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py
+          python -m bandit -r . -x ./tests
+
       - name: Offline self-test
         # Without osv-scanner on PATH the self-test exercises the offline layer
         # and reports that the live one was not tested, which is exit 2 rather
