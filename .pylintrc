@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Every disabled check below is a deliberate property of this project rather
+# than a warning being hidden. Anything not listed here is expected to pass, so
+# a new message means a new problem.
+
+[MAIN]
+py-version = 3.12
+
+[MESSAGES CONTROL]
+disable =
+    # The three files are deliberately standalone: each must work when copied
+    # out on its own, so the cache resolver, the poisoned-package floor and the
+    # state readers are duplicated on purpose. Sharing them would create the
+    # dependency the design exists to avoid.
+    duplicate-code,
+
+    # Broad excepts are the degrade-rather-than-crash paths, and each one is
+    # commented where it sits. A scanner that dies on an unreadable file reports
+    # nothing about the rest of the tree, which is worse than skipping the file.
+    broad-exception-caught,
+
+    # One module-level table is rebuilt in place when the campaign overlay is
+    # merged, because every matcher reads it. Threading it through instead would
+    # change every call site to remove a single documented global.
+    global-statement,
+
+    # Long functions and long argument lists: the report writers and the CLI
+    # take what they take, and splitting them to satisfy a count would scatter
+    # logic that reads better in one place.
+    line-too-long,
+    too-many-lines,
+    too-many-branches,
+    too-many-statements,
+    too-many-locals,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-return-statements,
+    too-many-instance-attributes,
+    too-many-nested-blocks,
+    too-few-public-methods,
+
+    # ctypes structures mirror the Win32 API, whose field names are fixed.
+    invalid-name,
+    attribute-defined-outside-init,
+
+[FORMAT]
+max-line-length = 100

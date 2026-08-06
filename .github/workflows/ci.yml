@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: GPL-3.0-only
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Unit tests
+        run: |
+          python -m pip install --upgrade pytest
+          python -m pytest -q
+
+      - name: Static analysis
+        # Part of the contract rather than advice: the README states that these
+        # three pass, so CI is what keeps that sentence true.
+        run: |
+          python -m pip install --upgrade mypy pylint bandit
+          python -m mypy --python-version 3.12 --ignore-missing-imports lockfile_sentinel.py update_scanners.py schedule_tasks.py
+          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py
+          python -m bandit -r . -x ./tests
+
+      - name: Offline self-test
+        # Without osv-scanner on PATH the self-test exercises the offline layer
+        # and reports that the live one was not tested, which is exit 2 rather
+        # than a pass. The job below installs the scanner and tests both.
+        run: python lockfile_sentinel.py --selftest || test $? -eq 2
+        shell: bash
+
+  selftest:
+    # The positive control, and the only check that proves the detector still
+    # detects rather than that the code still parses. A scanner reporting
+    # nothing is indistinguishable from a broken one without it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install osv-scanner
+        run: |
+          curl -sSfL -o osv-scanner \
+            https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64
+          chmod +x osv-scanner
+          sudo mv osv-scanner /usr/local/bin/
+          osv-scanner --version
+
+      - name: Self-test, both layers
+        run: python lockfile_sentinel.py --selftest
