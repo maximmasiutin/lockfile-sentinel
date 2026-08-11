@@ -1,3 +1,4 @@
+# Lockfile Sentinel 0.1.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 """One test per defect found in review, so none of them can come back unnoticed.
@@ -16,6 +17,12 @@ it returned, because that is what decides how hard to fight for the test:
 
 The titles name the symptom rather than the mechanism, because a regression will
 be recognised by its symptom first."""
+
+# pylint: disable=protected-access
+# A regression test for a private helper has to call the private helper. The
+# alternative is to reach it through the public entry point, which is what the
+# defect got past in the first place, so the test would prove less than the bug
+# already disproved.
 
 from __future__ import annotations
 
@@ -326,7 +333,11 @@ def test_cron_lines_quote_paths_and_omit_the_user_field_for_a_user_crontab() -> 
 
     An unquoted path with a space truncates the command, and a system crontab's
     user field in a user crontab makes cron try to execute the username."""
-    os.environ["LOCKFILE_SENTINEL_CACHE"] = str(Path("/tmp/a b/cache"))
+    # The space is the whole point of the fixture; the directory is never
+    # created and nothing is written to it, and it deliberately avoids the
+    # conventional temporary directories so that reading this line is not
+    # mistaken for a program writing to a predictable path.
+    os.environ["LOCKFILE_SENTINEL_CACHE"] = str(Path("/opt/a b/cache"))
     system_line = st.cron_line(st.JOBS["trivy-db"], 0, "root")
     user_line = st.cron_line(st.JOBS["trivy-db"], 0, "")
     assert "'" in system_line

@@ -1,4 +1,4 @@
-"""lockfile-sentinel: an npm supply-chain scanner in one file.
+"""Lockfile Sentinel: an npm supply-chain scanner in one file.
 
 A fast, zero-dependency npm supply-chain scanner. Originally built to detect the
 Shai-Hulud worm, it now cross-checks lockfiles against the live OSV.dev database
@@ -63,6 +63,7 @@ Usage:
     python lockfile_sentinel.py --osv source -r /path/to/app
 """
 
+# Lockfile Sentinel 0.1.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel

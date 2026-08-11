@@ -1,4 +1,6 @@
-# lockfile-sentinel
+# Lockfile Sentinel
+
+Copyright (c) 2026 Maxim Masiutin. Released under [GPL-3.0-only](LICENSE.txt).
 
 A fast, zero-dependency npm supply-chain scanner. Originally built to detect the Shai-Hulud worm, it now cross-checks lockfiles against the live OSV.dev database to catch a wide range of malicious packages.
 
@@ -95,7 +97,9 @@ The campaign overlay and fetched advisories live in the platform cache directory
 
 ## Licence
 
-GPL-3.0-only. See [LICENSE.txt](LICENSE.txt).
+Copyright (c) 2026 Maxim Masiutin.
+
+GPL-3.0-only. See [LICENSE.txt](LICENSE.txt). Every source file carries the same notice in its header, alongside the program name and the version it belongs to, so a copy that has been separated from this repository still says what it is and what governs it.
 
 Running the scanner puts you under no obligation, and its output is yours. Copyleft attaches to passing the program on, so scanning a proprietary repository with it creates no obligation for that repository whatsoever. If you redistribute the file on its own, section 4 asks that the licence text go with it.
 
