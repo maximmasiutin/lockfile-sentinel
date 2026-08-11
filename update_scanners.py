@@ -89,6 +89,15 @@ TRIVY_EXE = "trivy.exe" if IS_WINDOWS else "trivy"
 # See scratch_dir for why this is not simply TEMP.
 SCRATCH_BASE = os.environ.get("LOCKFILE_SENTINEL_SCRATCH", "")
 
+# How much room a scratch base has to have before it is worth using. The Java
+# index database is roughly 900 MB compressed and is unpacked beside the archive
+# it arrived in, so the peak is a multiple of the download rather than the
+# download. The figure is measured rather than guessed: the failure this whole
+# mechanism exists for had 2.74 GB free and that was not enough. A base below
+# this is passed over with its figure logged, because finding out by running out
+# of disk costs the download and reports it as an obscure write error.
+SCRATCH_MIN_FREE_BYTES = 5 * 1024 ** 3
+
 
 def cache_dir() -> Path:
     """The cache root for everything this program writes.
@@ -945,6 +954,27 @@ def report_trivy(freshness: dict[str, dict[str, datetime | None]], when: str) ->
             f"next due {describe_age(entry.get('next_update'))}")
 
 
+def free_bytes(path: Path) -> int | None:
+    """Free space at a path, or None when the filesystem will not say.
+
+    None means unknown rather than zero, and an unknown is not treated as a
+    refusal: a base that cannot be measured is still tried, because rejecting
+    every unmeasurable path would send the download to the system temporary
+    directory, which is the one place already known to be too small."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError as exc:
+        log(f"could not read free space at {path} ({exc}); treating it as unknown")
+        return None
+
+
+def describe_free(free: int | None) -> str:
+    """Render a free-space figure for a log line, or say it is unknown."""
+    if free is None:
+        return "free space unknown"
+    return f"{free / 1024 ** 3:.1f} GB free"
+
+
 @contextlib.contextmanager
 def scratch_dir(label: str, near: Path | None = None):
     """Yield a private scratch directory on a volume with room, and remove it after.
@@ -957,8 +987,15 @@ def scratch_dir(label: str, near: Path | None = None):
     kept succeeding. Both databases were four days stale before anyone looked.
 
     Redirecting only our own staging cache would not have fixed it: the write
-    that actually failed was inside Trivy's own getter directory, which it takes
-    from TMP and TEMP. So the caller sets both for the child process as well.
+    that actually failed was inside Trivy's own getter directory, which Trivy
+    takes from the Go runtime's temporary directory. So the caller sets those
+    variables for the child process as well, TMPDIR for Unix and TMP and TEMP
+    for Windows, since the two platforms read different ones.
+
+    A base is passed over unless it has SCRATCH_MIN_FREE_BYTES to spare, because
+    "a volume with room" is the whole point and is-it-a-directory does not
+    establish it. A base whose free space cannot be read is still used, since
+    the alternative is falling back to the volume already known to be too small.
 
     No drive letter appears anywhere in this resolution. LOCKFILE_SENTINEL_SCRATCH
     wins when set; otherwise the scratch goes beside `near`, the directory the
@@ -971,7 +1008,10 @@ def scratch_dir(label: str, near: Path | None = None):
     The name carries 64 bits from secrets rather than a counter or a timestamp,
     because the base can be a volume root that other things write to, and a
     predictable path there is a symlink-swap target. Creation is exclusive, so a
-    collision or a pre-existing directory raises rather than being adopted."""
+    collision or a pre-existing directory raises rather than being adopted, and
+    that half holds on every platform. The mode does not: Windows ignores it and
+    the directory inherits the parent's ACL, so on the host this was written for
+    the unpredictable name and the exclusive creation are the whole defence."""
     candidates = [
         (SCRATCH_BASE, "LOCKFILE_SENTINEL_SCRATCH"),
         (str(near.parent) if near else "", "the cache volume"),
@@ -981,21 +1021,37 @@ def scratch_dir(label: str, near: Path | None = None):
         if not value:
             continue
         path = Path(value)
-        if path.is_dir():
-            base = path
-            break
-        log(f"scratch base {value} from {origin} is not available")
+        if not path.is_dir():
+            log(f"scratch base {value} from {origin} is not available")
+            continue
+        free = free_bytes(path)
+        if free is not None and free < SCRATCH_MIN_FREE_BYTES:
+            log(f"scratch base {value} from {origin} has {describe_free(free)}, under the "
+                f"{SCRATCH_MIN_FREE_BYTES / 1024 ** 3:.0f} GB a database refresh needs; "
+                "passing over it")
+            continue
+        base = path
+        break
     if base is None:
         base = Path(tempfile.gettempdir())
-        log(f"falling back to the system temporary directory {base}, which may be too "
-            "small for the Java index database")
+        log(f"falling back to the system temporary directory {base} "
+            f"({describe_free(free_bytes(base))}), which is the volume the Java index "
+            "download ran out of room on")
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
     log(f"scratch: {path} ({label})")
     try:
         yield path
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        # Not ignore_errors: this directory can hold a gigabyte, and a removal
+        # that fails quietly leaks it where nothing later looks. The failure is
+        # reported rather than raised, so it cannot mask the exception that a
+        # failing download is in the middle of propagating.
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            log(f"WARNING: could not remove the scratch directory {path} ({exc}). It holds "
+                "whatever the download left behind, and nothing else will clean it up.")
 
 
 def target_trivy_db(args) -> int:
@@ -1055,13 +1111,18 @@ def target_trivy_db(args) -> int:
     with scratch_dir("trivy databases", near=live) as staging:
         staged = staging / "cache"
         staged.mkdir(parents=True, exist_ok=True)
-        # TMP and TEMP go to the same scratch directory as the staging cache.
+        # The temporary directory goes to the same scratch as the staging cache.
         # Trivy's OCI downloader writes the compressed artifact into its own
         # temporary directory before unpacking it into the cache, so pointing
         # only TRIVY_CACHE_DIR at a roomy volume leaves the larger of the two
-        # writes on whatever TEMP happens to be.
+        # writes wherever the runtime's temporary directory happens to be.
+        #
+        # All three variables are set because Go reads different ones per
+        # platform: os.TempDir takes TMPDIR on Unix and falls back to /tmp,
+        # while Windows takes TMP then TEMP. Setting only the Windows pair
+        # left this fix doing nothing at all on Linux.
         child_env = dict(os.environ, TRIVY_CACHE_DIR=str(staged),
-                         TMP=str(staging), TEMP=str(staging))
+                         TMPDIR=str(staging), TMP=str(staging), TEMP=str(staging))
         for flag, label in (("--download-db-only", "vulnerability"),
                             ("--download-java-db-only", "Java index")):
             if flag == "--download-java-db-only" and args.skip_java_db:
