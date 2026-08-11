@@ -29,6 +29,7 @@ Usage:
     python schedule_tasks.py --all --elevate --path-var MY_REPOS_DIR
 """
 
+# Lockfile Sentinel 0.1.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel
@@ -58,6 +59,11 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TypedDict
+
+# Carried per file rather than imported, because each of these three runs on its
+# own and an imported version would tie a standalone copy back to a checkout it
+# may not have. tests/test_headers.py is what keeps the three from drifting.
+__version__ = "0.1.0"
 
 
 def escape(text: str) -> str:
@@ -165,7 +171,7 @@ def envify(path: str, var: str) -> str:
     reference to a variable that resolves to nothing.
 
     Windows paths are compared case-insensitively, because a variable holding
-    G:\\q and a path spelled g:\\q\\... name the same directory."""
+    D:\\repos and a path spelled d:\\repos\\... name the same directory."""
     if not var:
         return path
     value = os.environ.get(var, "").rstrip("\\/")

@@ -1,3 +1,4 @@
+# Lockfile Sentinel 0.1.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 """Tests for the detection logic that a reader cannot verify by inspection.
@@ -6,6 +7,10 @@ These cover the parts where a mistake is silent: a range that should have been
 flagged and was not, a lockfile format that stopped matching, an advisory that
 stops being attributed to its campaign. The self-test in the scanner proves the
 whole chain end to end; these prove the pieces without a network."""
+
+# pylint: disable=protected-access
+# The version-pattern table is private and is exactly what these cases pin, so
+# reaching it directly is the test, not a shortcut around one.
 
 from __future__ import annotations
 
