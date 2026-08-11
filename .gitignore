@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+.mypy_cache/
 .pytest_cache/
+.ruff_cache/
 .venv/
+.project/
 findings.json
