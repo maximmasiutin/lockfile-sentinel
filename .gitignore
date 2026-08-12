@@ -9,3 +9,4 @@ coverage.xml
 .venv/
 .project/
 findings.json
+EXTERNAL_TOOLS_SCAN_LOG.md
