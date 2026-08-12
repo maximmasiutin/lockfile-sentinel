@@ -93,7 +93,7 @@ A lockfile the scanner cannot extract is reported by name with the reason, never
 
 ## Releasing
 
-The version is written in eleven places: the header line of every Python file, the `__version__` of every program, the title of this file and the tag pinned in the quick-start URL above. It is duplicated rather than imported because each program has to work when it is copied out on its own, and an import would tie a standalone copy back to a checkout it may not have.
+The version is written in four kinds of place: the header line of every Python file, the `__version__` of every program, the title of this file and the tag pinned in the quick-start URL above. It is duplicated rather than imported because each program has to work when it is copied out on its own, and an import would tie a standalone copy back to a checkout it may not have.
 
 `bump_version.py` is what sets them, and `tests/test_headers.py` is what refuses a release where one was missed:
 

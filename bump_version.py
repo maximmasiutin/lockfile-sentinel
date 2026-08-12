@@ -5,13 +5,14 @@ from one module into the others, because each program is meant to be copied out
 and run on its own and an import would tie a standalone copy back to a checkout
 it may not have. tests/test_headers.py enforces that the copies agree. This is
 the other half of that arrangement: the thing that sets them, so a release does
-not depend on remembering eleven places.
+not depend on remembering every one of them.
 
 Every site is declared in SITES below, and a site that matches nothing is an
 error rather than a silent skip. That is the whole point. A bump that quietly
-updates ten of eleven places produces a file that misstates its own version,
-which is the failure the header test exists to catch and which is far cheaper to
-prevent here.
+misses one produces a file that misstates its own version, which is the failure
+the header test exists to catch and which is far cheaper to prevent here. No
+count is written down anywhere, deliberately: a number in a comment is one more
+thing to be wrong after the next file is added, and `--check` answers it.
 
 The changelog is not rewritten. Its headings are the record of what was
 released, and editing one would restate history; instead the new version must
