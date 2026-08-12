@@ -1079,9 +1079,24 @@ def scratch_dir(label: str, near: Path | None = None):
     that half holds on every platform. The mode does not: Windows ignores it and
     the directory inherits the parent's ACL, so on the host this was written for
     the unpredictable name and the exclusive creation are the whole defence."""
+    # Where the cache really is, because that is the volume sized to hold it and
+    # the one a promotion renames within. A cache path is symlinked precisely
+    # when the databases have to live somewhere roomier, so the parent of the
+    # link is the small volume the link exists to avoid: staging there both
+    # risks the disk-full failure this whole mechanism was written for and turns
+    # the promotion into a copy across two volumes rather than a rename within
+    # one. promote_into resolves for the same reason, and the two have to agree
+    # about where the cache is or each undoes the other's care.
+    real_near = near
+    if near is not None:
+        try:
+            real_near = near.resolve()
+        except (OSError, RuntimeError) as exc:
+            log(f"could not resolve the cache {near} ({exc}); "
+                "using the path as spelled to choose a scratch base")
     candidates = [
         (SCRATCH_BASE, "LOCKFILE_SENTINEL_SCRATCH"),
-        (str(near.parent) if near else "", "the cache volume"),
+        (str(real_near.parent) if real_near else "", "the cache volume"),
     ]
     base = None
     for value, origin in candidates:
@@ -1126,7 +1141,7 @@ def scratch_dir(label: str, near: Path | None = None):
             # it satisfies the rule by construction. It was passed over above, but
             # only for room, and a volume that is probably too small is a better
             # answer than one that is certainly fatal.
-            base = near.parent
+            base = real_near.parent if real_near else system
             if not base.is_dir():
                 raise RuntimeError(
                     f"no scratch base is usable: the system temporary directory {system} sits "

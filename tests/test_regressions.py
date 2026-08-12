@@ -457,6 +457,36 @@ def test_a_symlinked_cache_keeps_pointing_where_it_was_aimed(tmp_path) -> None:
     assert not target.with_name(target.name + ".previous").exists()
 
 
+def test_a_symlinked_cache_stages_on_the_volume_it_points_at(tmp_path, monkeypatch) -> None:
+    """The scratch has to land where the databases are, not where the name is.
+
+    A cache path is symlinked when the databases have to live somewhere roomier,
+    so the parent of the link is the small volume the link exists to avoid.
+    Staging there risks the disk-full failure this mechanism was written for and
+    turns the promotion into a copy across two volumes rather than a rename
+    within one. promote_into resolves the cache for the same reason, and the two
+    have to agree about where it is."""
+    roomy = tmp_path / "roomy-volume"
+    target = roomy / "trivy-cache"
+    target.mkdir(parents=True)
+    small = tmp_path / "small-volume"
+    small.mkdir()
+    cache = small / "trivy-cache"
+    try:
+        cache.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    # Which volume is chosen is the question; whether this machine happens to
+    # have 5 GB free on the temporary volume is not, and without this the
+    # candidate is passed over for room before the choice can be observed.
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert scratch.parent == roomy, f"staged on the wrong volume: {scratch}"
+        assert not us.is_inside(scratch, cache)
+
+
 def test_the_last_resort_scratch_is_refused_inside_the_cache_too(tmp_path, monkeypatch) -> None:
     """The guard is worthless if the fallback walks around it.
 
