@@ -162,6 +162,51 @@ def test_a_site_that_matches_nothing_is_an_error(tree: Path) -> None:
         bv.run(arguments(new_version="0.2.0"))
 
 
+def test_a_header_inside_a_string_literal_is_not_a_header(tree: Path) -> None:
+    """This file is the fixture that proved it, so the case is not hypothetical.
+
+    A test for a version setter holds a miniature project as string literals,
+    headers included. Treating those as headers bumps the fake header while the
+    fake `__version__` beside it stays put, because that site does not read the
+    tests directory, and the fixture comes out stating two versions at once. The
+    suite then fails on the next run, so the documented release command breaks
+    the tests it shipped with. A round trip hides it; only a one-way bump shows
+    it.
+    """
+    fixture = tree / "tests" / "test_fixture_holder.py"
+    fixture.write_text(
+        "# Lockfile Sentinel 0.1.0\n"
+        "from __future__ import annotations\n"
+        'SAMPLE = """\n# Lockfile Sentinel 0.1.0\n__version__ = "0.1.0"\n"""\n',
+        encoding="utf-8",
+    )
+
+    bv.run(arguments(new_version="0.2.0"))
+
+    text = fixture.read_text(encoding="utf-8")
+    assert text.startswith("# Lockfile Sentinel 0.2.0"), "the real header was not set"
+    assert '\n# Lockfile Sentinel 0.1.0\n__version__ = "0.1.0"\n' in text, (
+        "the header inside the string literal was rewritten and now disagrees with "
+        "the __version__ beside it"
+    )
+
+
+def test_a_refusal_leaves_every_file_exactly_as_it_was(tree: Path) -> None:
+    """Reporting failure while making the failure permanent is the worst outcome.
+
+    The site check ran after the writing loop, so a run that refused had already
+    bumped every file whose site still matched. The refusal is real and the tree
+    is half bumped, which is the state neither branch of the decision wanted."""
+    before = {path: path.read_bytes() for path in (
+        tree / "lockfile_sentinel.py", tree / "README.md", tree / "CHANGELOG.md")}
+    (tree / "README.md").unlink()
+
+    with pytest.raises(bv.BumpError, match="no occurrence found"):
+        bv.run(arguments(new_version="0.2.0"))
+
+    assert (tree / "lockfile_sentinel.py").read_bytes() == before[tree / "lockfile_sentinel.py"]
+
+
 def test_steps_move_one_component_and_zero_the_rest() -> None:
     assert bv.stepped("1.2.3", arguments(major=True)) == "2.0.0"
     assert bv.stepped("1.2.3", arguments(minor=True)) == "1.3.0"

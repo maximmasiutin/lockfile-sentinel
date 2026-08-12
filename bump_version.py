@@ -77,20 +77,36 @@ class Site:
 
     `pattern` must carry a group named `version` covering the digits alone, so a
     rewrite replaces the number without disturbing the text around it.
+
+    `header_only` confines the search to the header, which is everything above
+    the first `from __future__` import, the same boundary tests/test_headers.py
+    uses to decide what a header is. A file with no such import is all header,
+    which is what the README wants.
     """
 
     name: str
     globs: tuple[str, ...]
     pattern: re.Pattern[str]
+    header_only: bool = False
 
 
 SITES: tuple[Site, ...] = (
     Site(
         # The same line serves as the comment header of every Python file and as
         # the title of the README, so one pattern covers both.
+        #
+        # Confined to the header because a test fixture holds a whole miniature
+        # project as string literals, headers included. Rewriting those bumped
+        # the fake header while the fake __version__ beside it stayed put, since
+        # that site does not read the tests directory, and the fixture came out
+        # stating two versions at once. The suite then failed on the next run,
+        # so the documented release command broke the tests it was released
+        # with. A round trip hides it, because the second bump puts the fixture
+        # back; only a one-way bump shows it.
         name="the program name line",
         globs=("*.py", "tests/*.py", "README.md"),
         pattern=re.compile(r"(?m)^# Lockfile Sentinel (?P<version>\d+\.\d+\.\d+)$"),
+        header_only=True,
     ),
     Site(
         name="the __version__ assignment",
@@ -250,6 +266,18 @@ def target_version(current: str, args: argparse.Namespace) -> str:
     return requested
 
 
+def header_end(text: str) -> int:
+    """Where a file's header stops, which is its first __future__ import.
+
+    tests/test_headers.py draws the line in the same place and for the same
+    reason: nothing after that import is a header by any reading, and a fixed
+    number of characters would either stop short of a long notice or reach past
+    a short one into the body.
+    """
+    cut = text.find("\nfrom __future__ import")
+    return len(text) if cut == -1 else cut
+
+
 def substitute(text: str, site: Site, version: str) -> tuple[str, int, list[str]]:
     """Return the text with every occurrence set to `version`.
 
@@ -257,11 +285,14 @@ def substitute(text: str, site: Site, version: str) -> tuple[str, int, list[str]
     can tell a file that was already correct from one that was changed, and can
     report a file that disagreed with the rest.
     """
+    limit = header_end(text) if site.header_only else len(text)
     pieces: list[str] = []
     found: list[str] = []
     last = 0
     for match in site.pattern.finditer(text):
         start, end = match.span("version")
+        if start >= limit:
+            break
         found.append(match.group("version"))
         pieces.append(text[last:start])
         pieces.append(version)
@@ -315,8 +346,19 @@ def stray_occurrences(version: str) -> list[str]:
     return reports
 
 
-def apply_to_file(path: Path, version: str, write: bool) -> tuple[dict[str, int], int]:
-    """Set every site in one file, returning what each site matched and what changed."""
+@dataclass(frozen=True)
+class Change:
+    """What one file would become, computed without touching it."""
+
+    path: Path
+    text: str
+    newline: str
+    counts: dict[str, int]
+    changed: int
+
+
+def plan_file(path: Path, version: str) -> Change:
+    """Work out what a file would become, and write nothing."""
     original, newline = read_keeping_newlines(path)
     text = original
     counts: dict[str, int] = {}
@@ -327,9 +369,7 @@ def apply_to_file(path: Path, version: str, write: bool) -> tuple[dict[str, int]
         text, found, seen = substitute(text, site, version)
         counts[site.name] = found
         changed += sum(1 for held in seen if held != version)
-    if write and text != original:
-        write_keeping_newlines(path, text, newline)
-    return counts, changed
+    return Change(path=path, text=text, newline=newline, counts=counts, changed=changed)
 
 
 def check_sites_are_populated(counts: dict[str, int]) -> None:
@@ -362,30 +402,45 @@ def gate_on_the_changelog(version: str, args: argparse.Namespace) -> None:
     )
 
 
-def sweep(version: str, write: bool) -> tuple[int, dict[str, int]]:
-    """Set every site in every file, reporting each file that changes.
-
-    Returns how many occurrences held a different version, and how many each
-    site matched in total, which is what tells a correct file from a pattern
-    that has stopped matching anything.
-    """
+def plan_all(version: str) -> list[Change]:
+    """Work out what every file would become, in a stable order, writing nothing."""
     paths: list[Path] = []
-    per_site: dict[str, int] = {site.name: 0 for site in SITES}
     for site in SITES:
         for path in files_for(site):
             if path not in paths:
                 paths.append(path)
+    return [plan_file(path, version) for path in sorted(paths)]
 
-    total_changed = 0
-    for path in sorted(paths):
-        counts, changed = apply_to_file(path, version, write)
-        for name, count in counts.items():
-            per_site[name] += count
-        total_changed += changed
-        if changed:
-            verb = "set" if write else "would set"
-            print(f"{verb} {path.name} to {version} ({changed} of {sum(counts.values())})")
-    return total_changed, per_site
+
+def site_totals(changes: list[Change]) -> dict[str, int]:
+    """How many occurrences each declared site matched across every file."""
+    totals = {site.name: 0 for site in SITES}
+    for change in changes:
+        for name, count in change.counts.items():
+            totals[name] += count
+    return totals
+
+
+def report_and_write(changes: list[Change], version: str, write: bool) -> int:
+    """Report each file that changes, write when asked, and return the count.
+
+    Writing happens only after every file has been planned and the sites have
+    been validated, so a run that refuses leaves the checkout untouched. Doing
+    it as it went left the tree half bumped whenever validation failed, which
+    reports failure while quietly making the failure permanent, and that is the
+    same defect as a gate placed after the loop rather than before it.
+    """
+    total = 0
+    for change in changes:
+        if not change.changed:
+            continue
+        total += change.changed
+        verb = "set" if write else "would set"
+        found = sum(change.counts.values())
+        print(f"{verb} {change.path.name} to {version} ({change.changed} of {found})")
+        if write:
+            write_keeping_newlines(change.path, change.text, change.newline)
+    return total
 
 
 def report_check(current: str, total_changed: int) -> int:
@@ -423,8 +478,12 @@ def run(args: argparse.Namespace) -> int:
     if not args.check:
         gate_on_the_changelog(version, args)
 
-    total_changed, per_site = sweep(version, write)
-    check_sites_are_populated(per_site)
+    # Plan, validate, then write. Every refusal in this program happens before a
+    # single file is touched, so a run that fails leaves the checkout exactly as
+    # it found it.
+    changes = plan_all(version)
+    check_sites_are_populated(site_totals(changes))
+    total_changed = report_and_write(changes, version, write)
 
     if args.check:
         return report_check(current, total_changed)
