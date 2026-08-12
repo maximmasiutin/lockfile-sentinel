@@ -1223,7 +1223,16 @@ def target_trivy_db(args) -> int:
     elif due:
         log(f"due now: {', '.join(due)}")
     else:
-        soonest = min(before[name]["next_update"] for name in required)  # type: ignore[type-var]
+        # `undated` is exactly the required databases whose next_update is None, and
+        # it is empty here, so the filter drops nothing. Writing it as a filter rather
+        # than a suppression keeps the type checker on this line, and the length check
+        # turns a relaxed guard above into an error rather than the soonest of a
+        # smaller set, which would be a wrong answer reported as a right one.
+        stamps = [before[name]["next_update"] for name in required]
+        dated = [stamp for stamp in stamps if stamp is not None]
+        if len(dated) != len(stamps):
+            raise RuntimeError("a required database has no next-update time here")
+        soonest = min(dated)
         log(f"nothing is due yet, next at {describe_age(soonest)}; skipping the download. "
             "Pass --force to refresh anyway")
         return 0
