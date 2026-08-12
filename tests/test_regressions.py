@@ -14,6 +14,7 @@ it returned, because that is what decides how hard to fight for the test:
   claims coverage it lacks      a verdict about a check that never ran
   accepts unverified input      a gate that passes what it did not read
   fails silently                work that reports success while doing nothing
+  destroys what it maintains    an update that leaves less behind than it found
 
 The titles name the symptom rather than the mechanism, because a regression will
 be recognised by its symptom first."""
@@ -350,6 +351,158 @@ def test_a_task_path_falls_back_to_absolute_when_the_variable_is_unset() -> None
     os.environ.pop("LS_REGRESSION_UNSET", None)
     path = str(Path("/opt/tool.py"))
     assert st.envify(path, "LS_REGRESSION_UNSET") == path
+
+
+# --------------------------------------------------------------------------
+# Destroys what it maintains.
+# --------------------------------------------------------------------------
+
+def test_a_scratch_base_set_to_the_cache_itself_is_passed_over(tmp_path, monkeypatch) -> None:
+    """Staging inside the cache destroys the cache, and reports a write error.
+
+    Promotion renames the live cache aside and then moves the staged tree into
+    its place. A scratch under the cache is carried away by that first rename,
+    so the move names a path that no longer exists, and the run ends with no
+    live cache and both databases stranded in a .previous tree that nothing
+    restores. The next run downloads a gigabyte again; the window in between has
+    no vulnerability database at all."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(cache))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
+
+
+def test_a_scratch_base_under_the_cache_is_passed_over_too(tmp_path, monkeypatch) -> None:
+    """Containment is the test, not equality: a descendant is carried away alike."""
+    cache = tmp_path / "trivy-cache"
+    (cache / "db" / "staging").mkdir(parents=True)
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(cache / "db" / "staging"))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
+
+
+def test_a_link_pointing_into_the_cache_is_caught_as_well(tmp_path, monkeypatch) -> None:
+    """Two spellings can name one directory, and the rename acts on the real one.
+
+    Comparing the literal paths would accept this base, and the failure it
+    produces is identical to the one comparing resolved paths prevents."""
+    cache = tmp_path / "trivy-cache"
+    (cache / "inner").mkdir(parents=True)
+    link = tmp_path / "link-to-inner"
+    try:
+        link.symlink_to(cache / "inner", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(link))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
+
+
+def test_a_promotion_from_beside_the_cache_leaves_a_live_cache(tmp_path) -> None:
+    """The arrangement the guard forces has to actually work.
+
+    Rejecting a bad scratch base is only half the claim; the other half is that
+    staging beside the cache promotes cleanly, including over an existing cache,
+    which is the case that renames the old tree aside first."""
+    live = tmp_path / "trivy-cache"
+    live.mkdir()
+    (live / "db").mkdir()
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert not staged.exists()
+    assert not live.with_name(live.name + ".previous").exists()
+
+
+def test_a_symlinked_cache_keeps_pointing_where_it_was_aimed(tmp_path) -> None:
+    """Renaming a symlink moves the name, not the databases it stands for.
+
+    A cache path is symlinked precisely when the databases have to live on a
+    roomier volume than the configured location sits on. Promoting through the
+    unresolved name renames the link aside, writes a real directory in its place,
+    and leaves the old databases orphaned at the link target: the cache silently
+    migrates back onto the small volume, which is the failure this whole area
+    exists to avoid, and rmtree will not remove a symlink so a .previous link is
+    left behind by every refresh."""
+    target = tmp_path / "roomy-volume" / "trivy-cache"
+    (target / "db").mkdir(parents=True)
+    (target / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    live = tmp_path / "configured-cache"
+    try:
+        live.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live)
+
+    assert live.is_symlink(), "the configured cache path stopped being a link"
+    assert live.resolve() == target.resolve(), "the link stopped pointing at its volume"
+    assert (target / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert not live.with_name(live.name + ".previous").exists()
+    assert not target.with_name(target.name + ".previous").exists()
+
+
+def test_a_symlinked_cache_stages_on_the_volume_it_points_at(tmp_path, monkeypatch) -> None:
+    """The scratch has to land where the databases are, not where the name is.
+
+    A cache path is symlinked when the databases have to live somewhere roomier,
+    so the parent of the link is the small volume the link exists to avoid.
+    Staging there risks the disk-full failure this mechanism was written for and
+    turns the promotion into a copy across two volumes rather than a rename
+    within one. promote_into resolves the cache for the same reason, and the two
+    have to agree about where it is."""
+    roomy = tmp_path / "roomy-volume"
+    target = roomy / "trivy-cache"
+    target.mkdir(parents=True)
+    small = tmp_path / "small-volume"
+    small.mkdir()
+    cache = small / "trivy-cache"
+    try:
+        cache.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    # Which volume is chosen is the question; whether this machine happens to
+    # have 5 GB free on the temporary volume is not, and without this the
+    # candidate is passed over for room before the choice can be observed.
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert scratch.parent == roomy, f"staged on the wrong volume: {scratch}"
+        assert not us.is_inside(scratch, cache)
+
+
+def test_the_last_resort_scratch_is_refused_inside_the_cache_too(tmp_path, monkeypatch) -> None:
+    """The guard is worthless if the fallback walks around it.
+
+    Where the configured base and the cache volume are both unusable, the system
+    temporary directory is taken without argument. If that directory happens to
+    sit inside the cache, the promotion carries the scratch away exactly as it
+    would have for a configured base, and the run ends with no live cache."""
+    cache = tmp_path / "trivy-cache"
+    (cache / "tmp").mkdir(parents=True)
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us.tempfile, "gettempdir", lambda: str(cache / "tmp"))
+    # Leave the cache volume candidate unusable so the fallback is reached at all.
+    monkeypatch.setattr(us, "free_bytes", lambda path: 0)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
 
 
 def test_campaign_attribution_never_guesses() -> None:

@@ -981,6 +981,72 @@ def describe_free(free: int | None) -> str:
     return f"{free / 1024 ** 3:.1f} GB free"
 
 
+def is_inside(path: Path, container: Path) -> bool:
+    """Whether path is container itself or sits somewhere under it.
+
+    Both sides are resolved first, so a symlink or a junction that points into
+    the container is caught. Two spellings can name one directory, and it is the
+    real location that a rename acts on, not the spelling that reached us.
+
+    A path that cannot be resolved answers True. That is the fail-closed
+    direction: this question is asked to protect the only copy of the databases,
+    and a path that cannot be placed is not a path that can be cleared.
+
+    RuntimeError is caught beside OSError because the supported floor is Python
+    3.12, where resolve() raises RuntimeError on a symlink loop whatever strict
+    is set to. 3.13 folded that case in with every other filesystem error, so on
+    a newer interpreter the clause is dead and on the declared minimum it is the
+    difference between failing closed as documented and aborting the run.
+    """
+    try:
+        return path.resolve().is_relative_to(container.resolve())
+    except (OSError, RuntimeError) as exc:
+        log(f"could not resolve {path} against {container} ({exc}); "
+            "treating it as inside, which is the safe answer")
+        return True
+
+
+def promote_into(staged: Path, live: Path) -> None:
+    """Replace the live cache with the staged one, keeping the old copy until it lands.
+
+    The order matters and is the reason this is a function rather than four lines
+    inline. The live tree is renamed aside first so that a failure leaves a
+    complete cache under `.previous` instead of a half-populated one at `live`,
+    and the old copy is removed only after the staged tree has arrived.
+
+    This assumes the caller has established that `staged` is not inside `live`.
+    If it is, the first rename carries the staged tree away with the cache, the
+    move then names a path that no longer exists, and the run ends with no live
+    cache at all. That is what `is_inside` exists to prevent, at the call site,
+    where the answer is still useful: a caller that gets True there picks a
+    different scratch base and proceeds. Repeating the check here would run
+    before the rename and so would prevent the damage, but `is_inside` answers
+    True for a path it cannot resolve, and that fail-closed answer would abort a
+    promotion that was about to succeed on a cache which merely could not be
+    stat'd at that moment.
+
+    OSError propagates. The caller reports it, because it is the caller that
+    knows the run this was part of.
+    """
+    # The real directory, not the name that reached us, for the same reason
+    # is_inside resolves: a rename acts on the location rather than the spelling.
+    # Where the cache path is a symlink onto a roomier volume, os.replace renames
+    # the link and leaves its target untouched, so the cache silently migrates
+    # onto the volume holding the link, which is the small one this mechanism
+    # exists to stay off. The databases are stranded at the old target, and
+    # rmtree refuses a symlink, so ignore_errors swallows that and a stray
+    # .previous link accumulates on every refresh.
+    live = live.resolve()
+    live.parent.mkdir(parents=True, exist_ok=True)
+    previous = live.with_name(live.name + ".previous")
+    if previous.exists():
+        shutil.rmtree(previous, ignore_errors=True)
+    if live.exists():
+        os.replace(live, previous)
+    shutil.move(str(staged), str(live))
+    shutil.rmtree(previous, ignore_errors=True)
+
+
 @contextlib.contextmanager
 def scratch_dir(label: str, near: Path | None = None):
     """Yield a private scratch directory on a volume with room, and remove it after.
@@ -1018,9 +1084,24 @@ def scratch_dir(label: str, near: Path | None = None):
     that half holds on every platform. The mode does not: Windows ignores it and
     the directory inherits the parent's ACL, so on the host this was written for
     the unpredictable name and the exclusive creation are the whole defence."""
+    # Where the cache really is, because that is the volume sized to hold it and
+    # the one a promotion renames within. A cache path is symlinked precisely
+    # when the databases have to live somewhere roomier, so the parent of the
+    # link is the small volume the link exists to avoid: staging there both
+    # risks the disk-full failure this whole mechanism was written for and turns
+    # the promotion into a copy across two volumes rather than a rename within
+    # one. promote_into resolves for the same reason, and the two have to agree
+    # about where the cache is or each undoes the other's care.
+    real_near = near
+    if near is not None:
+        try:
+            real_near = near.resolve()
+        except (OSError, RuntimeError) as exc:
+            log(f"could not resolve the cache {near} ({exc}); "
+                "using the path as spelled to choose a scratch base")
     candidates = [
         (SCRATCH_BASE, "LOCKFILE_SENTINEL_SCRATCH"),
-        (str(near.parent) if near else "", "the cache volume"),
+        (str(real_near.parent) if real_near else "", "the cache volume"),
     ]
     base = None
     for value, origin in candidates:
@@ -1029,6 +1110,18 @@ def scratch_dir(label: str, near: Path | None = None):
         path = Path(value)
         if not path.is_dir():
             log(f"scratch base {value} from {origin} is not available")
+            continue
+        if near is not None and is_inside(path, near):
+            # Promotion renames the live cache aside before moving the staged
+            # tree in. A scratch under the cache travels with that rename, so
+            # the move then names a path that no longer exists and the run ends
+            # with no live cache and the databases stranded in the .previous
+            # tree. Refusing here is the point: a base configured to sit inside
+            # the directory it is staging for is a mistake worth naming rather
+            # than one worth quietly relocating.
+            log(f"scratch base {value} from {origin} is inside the cache {near} that the "
+                "download is promoted into, where it would be carried away by the "
+                "promotion and leave no live cache; passing over it")
             continue
         free = free_bytes(path)
         if free is not None and free < SCRATCH_MIN_FREE_BYTES:
@@ -1039,10 +1132,36 @@ def scratch_dir(label: str, near: Path | None = None):
         base = path
         break
     if base is None:
-        base = Path(tempfile.gettempdir())
-        log(f"falling back to the system temporary directory {base} "
-            f"({describe_free(free_bytes(base))}), which is the volume the Java index "
-            "download ran out of room on")
+        system = Path(tempfile.gettempdir())
+        if near is not None and is_inside(system, near):
+            # The containment rule has to hold on the last resort too, or the
+            # failure it exists to prevent simply moves here: a scratch under the
+            # cache is carried off by the promotion rename, and the run ends with
+            # no live cache at all. Low free space only makes the download likely
+            # to fail, which is why the fallback tolerates it; containment makes
+            # the promotion certain to destroy the cache, and the two are not
+            # comparable.
+            #
+            # The parent of the cache is an ancestor rather than a descendant, so
+            # it satisfies the rule by construction. It was passed over above, but
+            # only for room, and a volume that is probably too small is a better
+            # answer than one that is certainly fatal.
+            base = real_near.parent if real_near else system
+            if not base.is_dir():
+                raise RuntimeError(
+                    f"no scratch base is usable: the system temporary directory {system} sits "
+                    f"inside the cache {near}, where a scratch would be carried away by the "
+                    f"promotion, and the cache parent {base} is not a directory. Set "
+                    "LOCKFILE_SENTINEL_SCRATCH to a directory outside the cache."
+                )
+            log(f"the system temporary directory {system} is inside the cache {near}, where a "
+                f"scratch would be carried away by the promotion; using {base} instead "
+                f"({describe_free(free_bytes(base))}), short of room though it may be")
+        else:
+            base = system
+            log(f"falling back to the system temporary directory {base} "
+                f"({describe_free(free_bytes(base))}), which is the volume the Java index "
+                "download ran out of room on")
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
     log(f"scratch: {path} ({label})")
@@ -1157,14 +1276,7 @@ def target_trivy_db(args) -> int:
             return 1
 
         try:
-            live.parent.mkdir(parents=True, exist_ok=True)
-            previous = live.with_name(live.name + ".previous")
-            if previous.exists():
-                shutil.rmtree(previous, ignore_errors=True)
-            if live.exists():
-                os.replace(live, previous)
-            shutil.move(str(staged), str(live))
-            shutil.rmtree(previous, ignore_errors=True)
+            promote_into(staged, live)
         except OSError as exc:
             log(f"FAIL: could not promote the gated databases into {live} ({exc})")
             return 1
