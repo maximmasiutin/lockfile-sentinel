@@ -1,4 +1,4 @@
-# Lockfile Sentinel
+# Lockfile Sentinel 0.1.0
 
 Copyright (c) 2026 Maxim Masiutin. Released under [GPL-3.0-only](LICENSE.txt).
 
@@ -14,11 +14,11 @@ The code uses syntax that older interpreters reject at parse time, so a 3.11 run
 
 What it relies on: PEP 604 unions written as `X | None` rather than `Optional[X]`, PEP 695 `type` aliases for the shapes the walk passes around, `TypedDict` for the scheduled-job table so a mistyped key is caught before it reaches Task Scheduler, and `tempfile`, `pathlib` and `concurrent.futures` behaviour as of 3.12. There are no third-party dependencies at all, so nothing else constrains the version.
 
-Static analysis is part of the contract rather than an afterthought. The three files pass `mypy` with no issues, `pylint` at 10.00/10 against the committed `.pylintrc`, and `bandit` with no findings; the `.pylintrc` records why each disabled check is a property of the design instead of a warning being hidden.
+Static analysis is part of the contract rather than an afterthought. Every file passes `mypy` with no issues, `pylint` at 10.00/10 against the committed `.pylintrc`, and `bandit` with no findings; the `.pylintrc` records why each disabled check is a property of the design instead of a warning being hidden.
 
 ```bash
-python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py
-python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py
+python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
+python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
 python -m bandit -r . -x ./tests
 python -m pytest -q
 ```
@@ -90,6 +90,22 @@ The range test understands `*`, `latest`, `next`, an exact version, and the `^`,
 Version comparison uses the leading `major.minor.patch` only, so a prerelease suffix is ignored for ordering.
 
 A lockfile the scanner cannot extract is reported by name with the reason, never skipped silently.
+
+## Releasing
+
+The version is written in eleven places: the header line of every Python file, the `__version__` of every program, the title of this file and the tag pinned in the quick-start URL above. It is duplicated rather than imported because each program has to work when it is copied out on its own, and an import would tie a standalone copy back to a checkout it may not have.
+
+`bump_version.py` is what sets them, and `tests/test_headers.py` is what refuses a release where one was missed:
+
+```bash
+python bump_version.py --check       # do they all agree?
+python bump_version.py --dry-run 0.2.0
+python bump_version.py 0.2.0
+python bump_version.py --minor       # or step the current version
+git tag v0.2.0
+```
+
+A site that matches nothing is an error rather than a silent skip, because a pattern that has stopped matching looks exactly like a project that is already correct. The changelog is never rewritten: its headings are the record of what was released, so the new version must already have a section there, and the bump stops if it does not.
 
 ## Cache
 

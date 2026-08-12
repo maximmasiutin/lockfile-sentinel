@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import lockfile_sentinel as ls  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-PROGRAMS = ("lockfile_sentinel.py", "update_scanners.py", "schedule_tasks.py")
+PROGRAMS = ("lockfile_sentinel.py", "update_scanners.py", "schedule_tasks.py", "bump_version.py")
 
 NAME_LINE = re.compile(r"^# Lockfile Sentinel (\d+\.\d+\.\d+)$", re.MULTILINE)
 SPDX_LINE = "# SPDX-License-Identifier: GPL-3.0-only"
@@ -88,3 +88,24 @@ def test_each_program_reports_the_version_its_header_claims() -> None:
         declared = VERSION_ASSIGNMENT.search(text)
         assert declared is not None, f"{name} defines no __version__"
         assert declared.group(1) == ls.__version__
+
+
+def test_the_readme_states_the_version_in_its_title_and_its_pinned_url() -> None:
+    """The README is read far more often than any file it describes.
+
+    Its title is where somebody checks which release they are looking at, and its
+    quick start hands out a raw file URL pinned to a tag. A stale tag there is the
+    worse of the two: it silently serves the previous release to everybody who
+    copies the line, and nothing about the copied command looks wrong.
+    """
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    title = NAME_LINE.search(text)
+    assert title is not None, "README.md does not state a version in its title"
+    assert title.group(1) == ls.__version__, (
+        f"README.md says {title.group(1)} where the scanner says {ls.__version__}"
+    )
+    pinned = re.search(r"/v(\d+\.\d+\.\d+)/", text)
+    assert pinned is not None, "README.md pins no release tag in its raw file URL"
+    assert pinned.group(1) == ls.__version__, (
+        f"README.md pins v{pinned.group(1)} where the scanner says {ls.__version__}"
+    )
