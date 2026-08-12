@@ -1014,11 +1014,16 @@ def promote_into(staged: Path, live: Path) -> None:
     complete cache under `.previous` instead of a half-populated one at `live`,
     and the old copy is removed only after the staged tree has arrived.
 
-    The caller must have established that `staged` is not inside `live`. If it
-    is, the first rename carries the staged tree away with the cache, the move
-    then names a path that no longer exists, and the run ends with no live cache
-    at all. That is what `is_inside` exists to prevent, and asserting it here
-    would be too late to help.
+    This assumes the caller has established that `staged` is not inside `live`.
+    If it is, the first rename carries the staged tree away with the cache, the
+    move then names a path that no longer exists, and the run ends with no live
+    cache at all. That is what `is_inside` exists to prevent, at the call site,
+    where the answer is still useful: a caller that gets True there picks a
+    different scratch base and proceeds. Repeating the check here would run
+    before the rename and so would prevent the damage, but `is_inside` answers
+    True for a path it cannot resolve, and that fail-closed answer would abort a
+    promotion that was about to succeed on a cache which merely could not be
+    stat'd at that moment.
 
     OSError propagates. The caller reports it, because it is the caller that
     knows the run this was part of.
