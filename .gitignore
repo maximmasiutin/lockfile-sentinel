@@ -3,6 +3,10 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+.scannerwork/
 .venv/
 .project/
 findings.json
+EXTERNAL_TOOLS_SCAN_LOG.md
