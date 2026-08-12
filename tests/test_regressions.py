@@ -14,6 +14,7 @@ it returned, because that is what decides how hard to fight for the test:
   claims coverage it lacks      a verdict about a check that never ran
   accepts unverified input      a gate that passes what it did not read
   fails silently                work that reports success while doing nothing
+  destroys what it maintains    an update that leaves less behind than it found
 
 The titles name the symptom rather than the mechanism, because a regression will
 be recognised by its symptom first."""
@@ -350,6 +351,77 @@ def test_a_task_path_falls_back_to_absolute_when_the_variable_is_unset() -> None
     os.environ.pop("LS_REGRESSION_UNSET", None)
     path = str(Path("/opt/tool.py"))
     assert st.envify(path, "LS_REGRESSION_UNSET") == path
+
+
+# --------------------------------------------------------------------------
+# Destroys what it maintains.
+# --------------------------------------------------------------------------
+
+def test_a_scratch_base_set_to_the_cache_itself_is_passed_over(tmp_path, monkeypatch) -> None:
+    """Staging inside the cache destroys the cache, and reports a write error.
+
+    Promotion renames the live cache aside and then moves the staged tree into
+    its place. A scratch under the cache is carried away by that first rename,
+    so the move names a path that no longer exists, and the run ends with no
+    live cache and both databases stranded in a .previous tree that nothing
+    restores. The next run downloads a gigabyte again; the window in between has
+    no vulnerability database at all."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(cache))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
+
+
+def test_a_scratch_base_under_the_cache_is_passed_over_too(tmp_path, monkeypatch) -> None:
+    """Containment is the test, not equality: a descendant is carried away alike."""
+    cache = tmp_path / "trivy-cache"
+    (cache / "db" / "staging").mkdir(parents=True)
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(cache / "db" / "staging"))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
+
+
+def test_a_link_pointing_into_the_cache_is_caught_as_well(tmp_path, monkeypatch) -> None:
+    """Two spellings can name one directory, and the rename acts on the real one.
+
+    Comparing the literal paths would accept this base, and the failure it
+    produces is identical to the one comparing resolved paths prevents."""
+    cache = tmp_path / "trivy-cache"
+    (cache / "inner").mkdir(parents=True)
+    link = tmp_path / "link-to-inner"
+    try:
+        link.symlink_to(cache / "inner", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(link))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
+
+
+def test_a_promotion_from_beside_the_cache_leaves_a_live_cache(tmp_path) -> None:
+    """The arrangement the guard forces has to actually work.
+
+    Rejecting a bad scratch base is only half the claim; the other half is that
+    staging beside the cache promotes cleanly, including over an existing cache,
+    which is the case that renames the old tree aside first."""
+    live = tmp_path / "trivy-cache"
+    live.mkdir()
+    (live / "db").mkdir()
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert not staged.exists()
+    assert not live.with_name(live.name + ".previous").exists()
 
 
 def test_campaign_attribution_never_guesses() -> None:

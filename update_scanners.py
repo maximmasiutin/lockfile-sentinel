@@ -981,6 +981,52 @@ def describe_free(free: int | None) -> str:
     return f"{free / 1024 ** 3:.1f} GB free"
 
 
+def is_inside(path: Path, container: Path) -> bool:
+    """Whether path is container itself or sits somewhere under it.
+
+    Both sides are resolved first, so a symlink or a junction that points into
+    the container is caught. Two spellings can name one directory, and it is the
+    real location that a rename acts on, not the spelling that reached us.
+
+    A path that cannot be resolved answers True. That is the fail-closed
+    direction: this question is asked to protect the only copy of the databases,
+    and a path that cannot be placed is not a path that can be cleared.
+    """
+    try:
+        return path.resolve().is_relative_to(container.resolve())
+    except OSError as exc:
+        log(f"could not resolve {path} against {container} ({exc}); "
+            "treating it as inside, which is the safe answer")
+        return True
+
+
+def promote_into(staged: Path, live: Path) -> None:
+    """Replace the live cache with the staged one, keeping the old copy until it lands.
+
+    The order matters and is the reason this is a function rather than four lines
+    inline. The live tree is renamed aside first so that a failure leaves a
+    complete cache under `.previous` instead of a half-populated one at `live`,
+    and the old copy is removed only after the staged tree has arrived.
+
+    The caller must have established that `staged` is not inside `live`. If it
+    is, the first rename carries the staged tree away with the cache, the move
+    then names a path that no longer exists, and the run ends with no live cache
+    at all. That is what `is_inside` exists to prevent, and asserting it here
+    would be too late to help.
+
+    OSError propagates. The caller reports it, because it is the caller that
+    knows the run this was part of.
+    """
+    live.parent.mkdir(parents=True, exist_ok=True)
+    previous = live.with_name(live.name + ".previous")
+    if previous.exists():
+        shutil.rmtree(previous, ignore_errors=True)
+    if live.exists():
+        os.replace(live, previous)
+    shutil.move(str(staged), str(live))
+    shutil.rmtree(previous, ignore_errors=True)
+
+
 @contextlib.contextmanager
 def scratch_dir(label: str, near: Path | None = None):
     """Yield a private scratch directory on a volume with room, and remove it after.
@@ -1029,6 +1075,18 @@ def scratch_dir(label: str, near: Path | None = None):
         path = Path(value)
         if not path.is_dir():
             log(f"scratch base {value} from {origin} is not available")
+            continue
+        if near is not None and is_inside(path, near):
+            # Promotion renames the live cache aside before moving the staged
+            # tree in. A scratch under the cache travels with that rename, so
+            # the move then names a path that no longer exists and the run ends
+            # with no live cache and the databases stranded in the .previous
+            # tree. Refusing here is the point: a base configured to sit inside
+            # the directory it is staging for is a mistake worth naming rather
+            # than one worth quietly relocating.
+            log(f"scratch base {value} from {origin} is inside the cache {near} that the "
+                "download is promoted into, where it would be carried away by the "
+                "promotion and leave no live cache; passing over it")
             continue
         free = free_bytes(path)
         if free is not None and free < SCRATCH_MIN_FREE_BYTES:
@@ -1157,14 +1215,7 @@ def target_trivy_db(args) -> int:
             return 1
 
         try:
-            live.parent.mkdir(parents=True, exist_ok=True)
-            previous = live.with_name(live.name + ".previous")
-            if previous.exists():
-                shutil.rmtree(previous, ignore_errors=True)
-            if live.exists():
-                os.replace(live, previous)
-            shutil.move(str(staged), str(live))
-            shutil.rmtree(previous, ignore_errors=True)
+            promote_into(staged, live)
         except OSError as exc:
             log(f"FAIL: could not promote the gated databases into {live} ({exc})")
             return 1
