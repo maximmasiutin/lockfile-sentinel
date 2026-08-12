@@ -991,10 +991,16 @@ def is_inside(path: Path, container: Path) -> bool:
     A path that cannot be resolved answers True. That is the fail-closed
     direction: this question is asked to protect the only copy of the databases,
     and a path that cannot be placed is not a path that can be cleared.
+
+    RuntimeError is caught beside OSError because the supported floor is Python
+    3.12, where resolve() raises RuntimeError on a symlink loop whatever strict
+    is set to. 3.13 folded that case in with every other filesystem error, so on
+    a newer interpreter the clause is dead and on the declared minimum it is the
+    difference between failing closed as documented and aborting the run.
     """
     try:
         return path.resolve().is_relative_to(container.resolve())
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         log(f"could not resolve {path} against {container} ({exc}); "
             "treating it as inside, which is the safe answer")
         return True
@@ -1017,6 +1023,15 @@ def promote_into(staged: Path, live: Path) -> None:
     OSError propagates. The caller reports it, because it is the caller that
     knows the run this was part of.
     """
+    # The real directory, not the name that reached us, for the same reason
+    # is_inside resolves: a rename acts on the location rather than the spelling.
+    # Where the cache path is a symlink onto a roomier volume, os.replace renames
+    # the link and leaves its target untouched, so the cache silently migrates
+    # onto the volume holding the link, which is the small one this mechanism
+    # exists to stay off. The databases are stranded at the old target, and
+    # rmtree refuses a symlink, so ignore_errors swallows that and a stray
+    # .previous link accumulates on every refresh.
+    live = live.resolve()
     live.parent.mkdir(parents=True, exist_ok=True)
     previous = live.with_name(live.name + ".previous")
     if previous.exists():
@@ -1097,10 +1112,36 @@ def scratch_dir(label: str, near: Path | None = None):
         base = path
         break
     if base is None:
-        base = Path(tempfile.gettempdir())
-        log(f"falling back to the system temporary directory {base} "
-            f"({describe_free(free_bytes(base))}), which is the volume the Java index "
-            "download ran out of room on")
+        system = Path(tempfile.gettempdir())
+        if near is not None and is_inside(system, near):
+            # The containment rule has to hold on the last resort too, or the
+            # failure it exists to prevent simply moves here: a scratch under the
+            # cache is carried off by the promotion rename, and the run ends with
+            # no live cache at all. Low free space only makes the download likely
+            # to fail, which is why the fallback tolerates it; containment makes
+            # the promotion certain to destroy the cache, and the two are not
+            # comparable.
+            #
+            # The parent of the cache is an ancestor rather than a descendant, so
+            # it satisfies the rule by construction. It was passed over above, but
+            # only for room, and a volume that is probably too small is a better
+            # answer than one that is certainly fatal.
+            base = near.parent
+            if not base.is_dir():
+                raise RuntimeError(
+                    f"no scratch base is usable: the system temporary directory {system} sits "
+                    f"inside the cache {near}, where a scratch would be carried away by the "
+                    f"promotion, and the cache parent {base} is not a directory. Set "
+                    "LOCKFILE_SENTINEL_SCRATCH to a directory outside the cache."
+                )
+            log(f"the system temporary directory {system} is inside the cache {near}, where a "
+                f"scratch would be carried away by the promotion; using {base} instead "
+                f"({describe_free(free_bytes(base))}), short of room though it may be")
+        else:
+            base = system
+            log(f"falling back to the system temporary directory {base} "
+                f"({describe_free(free_bytes(base))}), which is the volume the Java index "
+                "download ran out of room on")
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
     log(f"scratch: {path} ({label})")

@@ -424,6 +424,57 @@ def test_a_promotion_from_beside_the_cache_leaves_a_live_cache(tmp_path) -> None
     assert not live.with_name(live.name + ".previous").exists()
 
 
+def test_a_symlinked_cache_keeps_pointing_where_it_was_aimed(tmp_path) -> None:
+    """Renaming a symlink moves the name, not the databases it stands for.
+
+    A cache path is symlinked precisely when the databases have to live on a
+    roomier volume than the configured location sits on. Promoting through the
+    unresolved name renames the link aside, writes a real directory in its place,
+    and leaves the old databases orphaned at the link target: the cache silently
+    migrates back onto the small volume, which is the failure this whole area
+    exists to avoid, and rmtree will not remove a symlink so a .previous link is
+    left behind by every refresh."""
+    target = tmp_path / "roomy-volume" / "trivy-cache"
+    (target / "db").mkdir(parents=True)
+    (target / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    live = tmp_path / "configured-cache"
+    try:
+        live.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live)
+
+    assert live.is_symlink(), "the configured cache path stopped being a link"
+    assert live.resolve() == target.resolve(), "the link stopped pointing at its volume"
+    assert (target / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert not live.with_name(live.name + ".previous").exists()
+    assert not target.with_name(target.name + ".previous").exists()
+
+
+def test_the_last_resort_scratch_is_refused_inside_the_cache_too(tmp_path, monkeypatch) -> None:
+    """The guard is worthless if the fallback walks around it.
+
+    Where the configured base and the cache volume are both unusable, the system
+    temporary directory is taken without argument. If that directory happens to
+    sit inside the cache, the promotion carries the scratch away exactly as it
+    would have for a configured base, and the run ends with no live cache."""
+    cache = tmp_path / "trivy-cache"
+    (cache / "tmp").mkdir(parents=True)
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us.tempfile, "gettempdir", lambda: str(cache / "tmp"))
+    # Leave the cache volume candidate unusable so the fallback is reached at all.
+    monkeypatch.setattr(us, "free_bytes", lambda path: 0)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert not us.is_inside(scratch, cache)
+
+
 def test_campaign_attribution_never_guesses() -> None:
     """A wrong campaign name is worse than none, so an unknown advisory is None.
 
