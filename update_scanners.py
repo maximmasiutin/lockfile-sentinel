@@ -1089,21 +1089,47 @@ def current_user_sid() -> str | None:
 def restrict_to_owner(path: Path) -> None:
     """Cut a Windows directory's inherited ACL down to this account, SYSTEM and administrators.
 
-    `mkdir(mode=0o700)` is honoured on Unix and ignored on Windows, where the new
-    directory instead inherits whatever the base grants. Measured on the host
-    this was written for, that inversion is real: the Trivy cache carries an
-    explicit non-inherited ACL naming its owner, SYSTEM and the administrators
-    group and nobody else, while the scratch base sits under a general-purpose
-    directory that grants modify to Authenticated Users. So the staged database
-    is least protected exactly while it is least verified, in the window between
-    the ClamAV gate approving it and the promotion installing it, which is a
-    local user's opportunity to substitute a database nothing scanned.
+    This is a backstop, not the primary mechanism, and the distinction is the
+    whole reason it is worth its two subprocesses. Since the fix for
+    CVE-2024-4030, CPython special-cases `mkdir(mode=0o700)` on Windows and
+    creates the directory with
+    `D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)`, which is already
+    private. So on a current interpreter, on NTFS, the mode has done this job
+    before this function runs and it finds nothing to fix. An earlier version of
+    this docstring claimed Windows ignores the mode. That was true once and is
+    not now, and the claim survived because the measurement behind it read the
+    permissions of the scratch *base* rather than of a directory Python had
+    actually created.
 
-    The three grants mirror the cache's own ACL rather than being minimised
-    further. Dropping the administrators group would buy nothing, since an
-    administrator can take ownership and rewrite the ACL regardless, and it would
-    cost an operator the ability to clear a leaked scratch left by a scheduled
-    task running as another account.
+    What is left is the set of cases where that mechanism is silently absent,
+    and the silence is what makes them worth covering:
+
+      * Version. The fix shipped in 3.12.4, and this program supports 3.12 or
+        newer, so 3.12.0 through 3.12.3 are in range and create the directory
+        with the inherited ACL instead.
+      * Mode. CPython tests `mode == 0700` for exact equality and ignores every
+        other value, so editing that literal to anything else, however
+        reasonable-looking, drops the protection without a word.
+      * Build. The special case sits behind an API-set guard, and CPython's own
+        comment says that where those APIs are missing it has "no choice but to
+        silently create a directory with default ACL".
+      * Filesystem. `CreateDirectoryW` accepts the security attributes and
+        discards them on a filesystem that does not carry ACLs. That one is not
+        hypothetical here: scratch_dir deliberately hunts for a volume with
+        room, which is how a download ends up on an exFAT external disk or a
+        network share.
+
+    None of those raise. Each leaves the staged database in a directory the
+    base's ACL governs, during the window between the ClamAV gate approving it
+    and the promotion installing it, which is a local user's opportunity to
+    substitute a database nothing scanned.
+
+    The three grants match what CPython's own descriptor grants, less the
+    substitution of this account's SID for OWNER RIGHTS, so a directory that
+    took either path ends up with the same access. Dropping the administrators
+    group would buy nothing, since an administrator can take ownership and
+    rewrite the ACL regardless, and it would cost an operator the ability to
+    clear a leaked scratch left by a scheduled task running as another account.
 
     A failure warns rather than raises. The exposure this closes needs a second
     local account to exploit, while raising would stop the databases updating at
@@ -1178,12 +1204,15 @@ def scratch_dir(label: str, near: Path | None = None):
     The name carries 64 bits from secrets rather than a counter or a timestamp,
     because the base can be a volume root that other things write to, and a
     predictable path there is a symlink-swap target. Creation is exclusive, so a
-    collision or a pre-existing directory raises rather than being adopted, and
-    that half holds on every platform. The mode does not: Windows ignores it and
-    the directory would inherit the parent's ACL, which on a general-purpose base
-    grants modify to every authenticated user. restrict_to_owner rewrites it
-    afterwards for that reason, and warns rather than raising when it cannot, so
-    a run that did not obtain a private directory says so."""
+    collision or a pre-existing directory raises rather than being adopted.
+
+    The mode is load-bearing on both platforms, for different reasons. Unix
+    applies it directly. Windows applies it too, since the fix for
+    CVE-2024-4030, but only for exactly 0o700 and only where the interpreter is
+    3.12.4 or newer and the filesystem carries ACLs; outside those the directory
+    is created with the base's inherited permissions and nothing says so.
+    restrict_to_owner covers that remainder and warns rather than raising when
+    it cannot, so a run that did not obtain a private directory reports it."""
     # Where the cache really is, because that is the volume sized to hold it and
     # the one a promotion renames within. A cache path is symlinked precisely
     # when the databases have to live somewhere roomier, so the parent of the

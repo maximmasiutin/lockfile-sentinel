@@ -391,24 +391,19 @@ def test_a_whoami_that_succeeds_and_says_nothing_does_not_raise(monkeypatch) -> 
         assert us.current_user_sid() is None, f"raised or accepted on {output!r}"
 
 
-def test_a_failure_to_read_the_sid_does_not_leak_the_scratch_directory(
+def test_an_unreadable_sid_warns_and_still_produces_a_usable_scratch(
         tmp_path, monkeypatch) -> None:
-    """The hardening step runs between a mkdir and the cleanup that undoes it.
+    """The whole path with the real parser in it, rather than stubbed past.
 
-    Placed before the try that arms the removal, anything raising there left a
-    directory behind that nothing else deletes, because the name is random by
-    design and no later run recognises it as garbage. That is the leak the
-    contextmanager exists to prevent, reintroduced by the step added to close a
-    different hole. The check is that the directory is gone afterwards whichever
-    way the SID lookup ends."""
+    The command-level test above monkeypatches current_user_sid out, which is
+    exactly why the suite did not catch the crash: it fed run the empty output
+    that used to raise and then arranged for the parser never to see it. Here
+    the empty output reaches the real parser, and the run has to survive it."""
     cache = tmp_path / "trivy-cache"
     cache.mkdir()
     monkeypatch.setattr(us, "SCRATCH_BASE", "")
     monkeypatch.setattr(us, "IS_WINDOWS", True)
     monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
-    # The shape that used to raise, fed through the real parser rather than past
-    # it: the test above this one stubs current_user_sid out, which is precisely
-    # why the suite did not catch the crash.
     monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, ""))
 
     with us.scratch_dir("test", near=cache) as scratch:
@@ -416,24 +411,128 @@ def test_a_failure_to_read_the_sid_does_not_leak_the_scratch_directory(
     assert not scratch.exists(), f"the scratch directory was left behind at {scratch}"
 
 
-@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
-def test_the_real_scratch_acl_excludes_everyone_else(tmp_path, monkeypatch) -> None:
-    """The end-to-end claim, checked against what Windows actually stored.
+def test_a_raising_hardening_step_does_not_leak_the_scratch_directory(
+        tmp_path, monkeypatch) -> None:
+    """The placement half of the fix, which the test above cannot reach.
 
-    The test above pins the command; this one pins the outcome, because an icacls
-    invocation that is well formed and still leaves the directory shared would
-    satisfy the first and none of the point of it."""
+    restrict_to_owner sat between the mkdir and the try whose finally removes
+    the directory, so anything raising there left a directory behind that
+    nothing else deletes: the name is random by design, so no later run
+    recognises it as garbage. Fixing the parser stopped the raise that was
+    known about, which is why the test above passes either way and would go on
+    passing if the call moved back outside the try. This one injects a raise
+    directly, so it pins the placement rather than the parser, and it fails on
+    any future step added in the same wrong place."""
     cache = tmp_path / "trivy-cache"
     cache.mkdir()
     monkeypatch.setattr(us, "SCRATCH_BASE", "")
     monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    monkeypatch.setattr(us.secrets, "token_hex", lambda _n: "fixedname")
+
+    def refuse(_path):
+        raise RuntimeError("the ACL could not be rewritten")
+
+    monkeypatch.setattr(us, "restrict_to_owner", refuse)
+
+    with pytest.raises(RuntimeError, match="the ACL could not be rewritten"):
+        with us.scratch_dir("test", near=cache):
+            pytest.fail("the body must not run when the hardening step raised")
+
+    leaked = cache.parent / "temp-fixedname"
+    assert not leaked.exists(), f"the scratch directory was left behind at {leaked}"
+
+
+def _sddl_of(path: Path, into: Path) -> str:
+    """The directory's own DACL as SDDL, or a skip if icacls cannot be used.
+
+    Read as SDDL rather than from the display listing, because `icacls <dir>`
+    prints principal names in the system's language: asserting that the English
+    "Authenticated Users" is absent passes on a localised Windows whether the
+    directory is shared or not, which is a security check that stops checking
+    and does not say so. The /save form writes fixed aliases instead — AU for
+    Authenticated Users, BU for the built-in Users group — and those do not move
+    with the locale.
+
+    /findsid is not the alternative it appears to be: it searches the files
+    inside a directory rather than that directory's own ACL, and on a directory
+    carrying an inherited AU entry it reports no match at all."""
+    code, output = us.run(["icacls", str(path), "/save", str(into)], timeout=60)
+    if code != 0 or not into.exists():
+        pytest.skip(f"icacls /save is not usable here: {output}")
+    # UTF-16LE with no byte-order mark, so it cannot be read as plain "utf-16":
+    # that codec looks for a mark and raises without one.
+    return into.read_text(encoding="utf-16-le")
+
+
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
+def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_path) -> None:
+    """The only test here that can fail if restrict_to_owner stops working.
+
+    Everything else about the scratch directory is now done by CPython itself:
+    since the fix for CVE-2024-4030, mkdir(mode=0o700) creates a protected DACL
+    on Windows, so a scratch is private before restrict_to_owner is reached and
+    an end-to-end assertion about its permissions passes on an empty
+    implementation. restrict_to_owner exists for the cases where that mechanism
+    is silently absent — an interpreter older than 3.12.4, a mode other than
+    exactly 0o700, an API-set build, a filesystem without ACLs — and none of
+    those can be produced inside a test on this host.
+
+    So the function is exercised directly, against a directory deliberately
+    created the way those cases leave it: with the default mode, inheriting a
+    base that grants Authenticated Users."""
+    base = tmp_path / "shared-base"
+    base.mkdir()
+    seeded, seed_output = us.run(
+        ["icacls", str(base), "/grant", "*S-1-5-11:(OI)(CI)M"], timeout=60)
+    if seeded != 0:
+        pytest.skip(f"cannot seed a shared base here: {seed_output}")
+
+    # No mode, so CPython creates it with the inherited ACL rather than its own
+    # protected one. This is the state restrict_to_owner has to be able to fix.
+    shared = base / "created-without-the-mode"
+    shared.mkdir()
+    before = _sddl_of(shared, tmp_path / "before.sddl")
+    assert ";AU)" in before, f"the base did not share, so this proves nothing: {before}"
+
+    us.restrict_to_owner(shared)
+
+    after = _sddl_of(shared, tmp_path / "after.sddl")
+    assert ";AU)" not in after, f"authenticated users can still write it: {after}"
+    assert ";BU)" not in after, f"the users group can still read it: {after}"
+    # P marks the DACL protected, which is what /inheritance:r sets. Without it
+    # the grants would sit on top of whatever the base still passes down.
+    assert "D:P" in after, f"the directory still inherits from its base: {after}"
+
+
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
+def test_a_scratch_directory_ends_up_private_whichever_mechanism_did_it(
+        tmp_path, monkeypatch) -> None:
+    """The property that matters, without claiming which step delivered it.
+
+    On a current interpreter and an ACL-bearing filesystem this passes because
+    mkdir(mode=0o700) already produced a protected DACL, so it would pass with
+    restrict_to_owner removed entirely. That is stated rather than hidden: the
+    test pins the outcome a caller depends on, and the test above pins the
+    function that has to deliver it everywhere else."""
+    base = tmp_path / "shared-base"
+    base.mkdir()
+    seeded, seed_output = us.run(
+        ["icacls", str(base), "/grant", "*S-1-5-11:(OI)(CI)M"], timeout=60)
+    if seeded != 0:
+        pytest.skip(f"cannot seed a shared base here: {seed_output}")
+
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(base))
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
 
     with us.scratch_dir("test", near=cache) as scratch:
-        code, output = us.run(["icacls", str(scratch)], timeout=60)
-        if code != 0:
-            pytest.skip(f"icacls is not usable here: {output}")
-        assert "Authenticated Users" not in output, f"the scratch is still shared: {output}"
-        assert "BUILTIN\\Users" not in output, f"the scratch is still shared: {output}"
+        assert scratch.parent == base, f"the scratch did not land on the seeded base: {scratch}"
+        sddl = _sddl_of(scratch, tmp_path / "scratch.sddl")
+
+    assert ";AU)" not in sddl, f"the staged database sits somewhere shared: {sddl}"
+    assert ";BU)" not in sddl, f"the staged database sits somewhere shared: {sddl}"
+    assert "D:P" in sddl, f"the scratch still inherits from its base: {sddl}"
 
 
 # --------------------------------------------------------------------------
