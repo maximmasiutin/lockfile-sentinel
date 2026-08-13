@@ -23,6 +23,10 @@ python -m bandit -r . -x ./tests
 python -m pytest -q
 ```
 
+Those four run in CI on every push and pull request, across Linux, Windows and macOS and on both supported Python versions, which is what keeps the paragraph above true rather than aspirational. Two more are run against changed files before a merge and are not in CI: `semgrep`, with the `p/python` and `p/security-audit` rule sets, and SonarQube Community Build, whose quality gate has to come back clean. They are outside CI because one needs a rule download and the other a server, so putting them in the workflow would trade a check that always runs for one that fails when a network does; the tradeoff is worth restating rather than assuming, and if it ever stops holding they belong in the workflow.
+
+The distinction that matters when reading a claim of cleanliness: `mypy`, `pylint` and `pytest` say the code is consistent and does what its tests pin, while `bandit`, `semgrep` and SonarQube are the three that can raise a security finding. A green CI run is evidence of the first group only.
+
 Two optional companions keep its inputs current and are not needed to scan: `update_scanners.py` builds or updates osv-scanner, refreshes the campaign overlay and the OSV offline database, and refreshes the Trivy databases; `schedule_tasks.py` installs those four jobs on a daily schedule through Windows Task Scheduler or cron, idempotently. Each is standalone too.
 
 ## Quick Start
