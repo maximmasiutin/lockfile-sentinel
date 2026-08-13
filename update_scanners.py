@@ -1250,10 +1250,20 @@ def scratch_dacl(path: Path) -> str | None:
     # locale to translate the answer.
     import ctypes  # pylint: disable=import-outside-toplevel
 
+    # sys.platform rather than the IS_WINDOWS constant used everywhere else, and
+    # not interchangeable with it here. ctypes.WinDLL does not exist off Windows,
+    # so a type checker running for Linux reports the attribute as missing; it
+    # narrows on sys.platform and treats what follows as unreachable, where
+    # os.name tells it nothing. The caller already returns early off Windows, so
+    # this guard is for the checker rather than for the run — which is exactly
+    # how it was found, by CI failing on Linux and macOS while the same command
+    # passed here.
+    if sys.platform != "win32":
+        return None
     try:
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    except (AttributeError, OSError):
+    except OSError:
         return None
 
     # Declared rather than left to ctypes' defaults, because a pointer returned
