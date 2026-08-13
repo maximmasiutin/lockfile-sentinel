@@ -365,15 +365,55 @@ def test_an_unreadable_account_sid_is_not_written_into_an_acl(monkeypatch) -> No
     """Whatever whoami printed must not be pasted into a grant unexamined.
 
     A blank or error line parsed as a principal would either fail the icacls call
-    or, worse, name something other than this account."""
+    or, worse, name something other than this account. The prefix test this
+    originally used accepted "S-1-" followed by anything, which is not a SID and
+    is not what the docstring promised to discard."""
     monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, '"CORP\\alice","S-1-5-21-9-8-7-500"\n'))
     assert us.current_user_sid() == "S-1-5-21-9-8-7-500"
 
-    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, "ERROR: something went wrong\n"))
-    assert us.current_user_sid() is None
+    for output in ("ERROR: something went wrong\n", "S-1-\n", "S-1-5\n", '"CORP\\alice","S-1-x-y"\n'):
+        monkeypatch.setattr(us, "run", lambda cmd, _o=output, **_kwargs: (0, _o))
+        assert us.current_user_sid() is None, f"accepted {output!r} as a SID"
 
     monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (1, ""))
     assert us.current_user_sid() is None
+
+
+def test_a_whoami_that_succeeds_and_says_nothing_does_not_raise(monkeypatch) -> None:
+    """Exit 0 with no output is a success carrying no answer, not an impossibility.
+
+    The first version indexed the last line of the output unconditionally, so
+    this input raised IndexError from inside a function whose whole contract is
+    to return None when the SID cannot be read. A redirected or policy-restricted
+    whoami produces exactly this."""
+    for output in ("", "   ", "\n", " \r\n \n"):
+        monkeypatch.setattr(us, "run", lambda cmd, _o=output, **_kwargs: (0, _o))
+        assert us.current_user_sid() is None, f"raised or accepted on {output!r}"
+
+
+def test_a_failure_to_read_the_sid_does_not_leak_the_scratch_directory(
+        tmp_path, monkeypatch) -> None:
+    """The hardening step runs between a mkdir and the cleanup that undoes it.
+
+    Placed before the try that arms the removal, anything raising there left a
+    directory behind that nothing else deletes, because the name is random by
+    design and no later run recognises it as garbage. That is the leak the
+    contextmanager exists to prevent, reintroduced by the step added to close a
+    different hole. The check is that the directory is gone afterwards whichever
+    way the SID lookup ends."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    # The shape that used to raise, fed through the real parser rather than past
+    # it: the test above this one stubs current_user_sid out, which is precisely
+    # why the suite did not catch the crash.
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, ""))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert scratch.is_dir()
+    assert not scratch.exists(), f"the scratch directory was left behind at {scratch}"
 
 
 @pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")

@@ -1058,15 +1058,32 @@ def current_user_sid() -> str | None:
     `whoami` is asked rather than the Win32 token API because the answer is one
     line of CSV and the alternative is forty lines of ctypes around
     OpenProcessToken and ConvertSidToStringSidW for a value that does not change
-    during a run. The cost is a process; this is called once per scratch."""
+    during a run. The cost is a process; this is called once per scratch.
+
+    Every failure returns None rather than raising, including the shapes a
+    success can take that carry no answer. That is not defensiveness for its own
+    sake: the caller's contract is to warn and continue when the SID cannot be
+    read, and a function that raises instead would break that contract from the
+    inside, at a point where the scratch directory exists and its cleanup has
+    not been armed yet."""
     code, output = run(["whoami", "/user", "/fo", "csv", "/nh"], timeout=30)
     if code != 0:
         return None
+    # Exit 0 with nothing on stdout is not a contradiction worth trusting: a
+    # redirected or policy-restricted whoami can succeed and print nothing, and
+    # indexing the last line of no lines would raise where the caller expects a
+    # None it can warn about.
+    lines = output.strip().splitlines()
+    if not lines:
+        return None
     # "DOMAIN\\user","S-1-5-21-...". The SID is the last quoted field, and taking
     # it from the end rather than by index survives a user name containing a comma.
-    fields = [field.strip().strip('"') for field in output.strip().splitlines()[-1].split(",")]
-    sid = fields[-1] if fields else ""
-    return sid if sid.startswith("S-1-") else None
+    sid = lines[-1].split(",")[-1].strip().strip('"')
+    # A full shape rather than a prefix. "S-1-" alone passes a startswith test and
+    # is not a SID, and while icacls would merely reject it — run passes an
+    # argument list, so nothing here reaches a shell — a check that admits what
+    # the docstring says it discards is a claim the code does not keep.
+    return sid if re.fullmatch(r"S-1-\d+(?:-\d+)+", sid) else None
 
 
 def restrict_to_owner(path: Path) -> None:
@@ -1247,9 +1264,17 @@ def scratch_dir(label: str, near: Path | None = None):
                 "download ran out of room on")
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
-    restrict_to_owner(path)
     log(f"scratch: {path} ({label})")
     try:
+        # Inside the try, not between the mkdir and it. restrict_to_owner is
+        # written to warn rather than raise, but it is the one step here that
+        # shells out, and a step that only ever warns by construction is a
+        # claim rather than a guarantee. Placed above the try it held that
+        # guarantee for exactly as long as it stayed true: a raise there left
+        # the directory behind with nothing to remove it, which is the leak
+        # this contextmanager exists to prevent. Here the finally runs whatever
+        # happens, so the guarantee is the block's rather than the function's.
+        restrict_to_owner(path)
         yield path
     finally:
         # Not ignore_errors: this directory can hold a gigabyte, and a removal
