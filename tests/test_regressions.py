@@ -801,6 +801,31 @@ def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
         f"an inherited directory read back as protected: {inherited_sddl}")
 
 
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="reparse points are a Windows shape")
+def test_a_junction_left_where_the_scratch_was_is_recognised_as_a_link(tmp_path) -> None:
+    """Path.is_symlink() answers False for a junction, so the scratch check cannot use it.
+
+    An account that can delete the scratch during the window before the ACL is
+    rewritten can leave a link at the same name, and everything after that point
+    would describe and fill a directory somewhere else. A junction is the form
+    that needs no privilege to create, and it is exactly the form is_symlink()
+    misses, so a check written the obvious way would have covered only the attack
+    that needs Developer Mode."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    junction = tmp_path / "junction"
+    made, output = us.run(["cmd", "/c", "mklink", "/J", str(junction), str(victim)], timeout=60)
+    if made != 0:
+        pytest.skip(f"cannot create a junction here: {output}")
+
+    assert not junction.is_symlink(), (
+        "is_symlink() now reports junctions, so the comment explaining this check is stale")
+    assert us.is_reparse_point(junction), "a junction was taken for the scratch directory itself"
+    assert not us.is_reparse_point(plain), "an ordinary directory was refused as a link"
+
+
 @pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
 def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_path) -> None:
     """The only test here that can fail if restrict_to_owner stops working.

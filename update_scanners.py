@@ -1088,6 +1088,30 @@ def current_user_sid() -> str | None:
     return sid if re.fullmatch(r"S-1-\d+(?:-\d+)+", sid) else None
 
 
+def is_reparse_point(path: Path) -> bool:
+    """Whether this name is a link of some kind rather than the directory itself.
+
+    The attribute rather than `Path.is_symlink()`, which answers False for a
+    junction. Measured on 3.13: a junction reports `is_symlink()` False with the
+    reparse attribute set and tag 0xa0000003, while a symbolic link reports both.
+    That is the wrong way round for a check like this. Creating a symbolic link
+    needs SeCreateSymbolicLinkPrivilege or Developer Mode, while a junction needs
+    nothing beyond write access to the parent, so the attack any account can
+    mount is precisely the one `is_symlink()` would have waved through.
+
+    False off Windows, where there is no such attribute and where the scratch
+    base is not the shared directory this guards against."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(os.lstat(path).st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        # A name that cannot be stat'd is not a name this program should stage
+        # a database through, so the conservative answer is the same as for a
+        # link: refuse it rather than continue on an unread directory.
+        return True
+
+
 def restrict_to_owner(path: Path, sid: str | None) -> None:
     """Cut a Windows directory's inherited ACL down to this account, SYSTEM and administrators.
 
@@ -1180,8 +1204,24 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
     # rather than a name. S-1-5-18 is SYSTEM and S-1-5-32-544 is the local
     # administrators group; both are the same on every install and in every
     # locale, which a name is not.
+    #
+    # /L operates on the name given rather than on what it points at, and it is
+    # here so that this call cannot be aimed at somebody else's directory. In the
+    # fallback cases this function exists for, the scratch is created with the
+    # inherited ACL, so an account holding Modify on the base can delete the
+    # empty directory and put a reparse point in its place during the window
+    # before this runs. Without /L the command would then strip the inheritance
+    # from the *target* and rewrite it with this process's privileges, which
+    # turns an exposed scratch into damage to an arbitrary directory.
+    #
+    # Measured rather than assumed, because the two kinds of reparse point do not
+    # behave alike: with a junction, icacls writes the junction's own ACL and the
+    # target is untouched, so only a true symbolic link follows. That narrows the
+    # case to an account holding SeCreateSymbolicLinkPrivilege or a machine with
+    # Developer Mode on — which is a developer machine, and this is a developer's
+    # tool. On an ordinary directory /L changes nothing.
     code, output = run(
-        ["icacls", str(path), "/inheritance:r",
+        ["icacls", str(path), "/L", "/inheritance:r",
          "/grant:r", f"*{sid}:(OI)(CI)F",
          "/grant:r", "*S-1-5-18:(OI)(CI)F",
          "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
@@ -1215,6 +1255,11 @@ SDDL_ALIAS_FOR_SID = {
     "S-1-5-20": "NS",
     "S-1-5-32-544": "BA",
 }
+
+# FILE_ATTRIBUTE_REPARSE_POINT. Named here rather than written as a bare 0x400 at
+# the one place it is tested, because a bare constant in a security check is a
+# claim nobody can audit without a search engine. stat carries no name for it.
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 # The bits in an access mask that let the holder change what is in a directory,
 # rather than only look at it: write data, append, write extended attributes and
@@ -1642,6 +1687,19 @@ def scratch_dir(label: str, near: Path | None = None):
         # this contextmanager exists to prevent. Here the finally runs whatever
         # happens, so the guarantee is the block's rather than the function's.
         restrict_to_owner(path, sid)
+        # And it is still the directory mkdir made, rather than a reparse point
+        # standing where that directory was. An account that can delete the
+        # scratch during the window before the step above can leave a junction or
+        # a symbolic link at the same name, and every check after this one would
+        # then describe, and every download would then fill, a directory
+        # somewhere else entirely. mkdir refused to follow one, so anything
+        # bearing the attribute here appeared after it and is not ours.
+        if is_reparse_point(path):
+            raise RuntimeError(
+                f"the scratch directory {path} is a link rather than the directory that was "
+                "just created there, so another account replaced it. Nothing staged through "
+                "it would be under this program's control."
+            )
         # A directory created exclusively a moment ago has nothing in it. If it
         # does, another account wrote there while the ACL was still the base's,
         # and the rewrite did not touch that child because icacls without /T
