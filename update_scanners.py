@@ -1211,23 +1211,34 @@ def scratch_dacl(path: Path) -> str | None:
     filesystem what the ACL actually says is the only answer that covers both,
     and it is the difference between warning about an exposure and warning about
     a step that did not run."""
-    handle, name = tempfile.mkstemp(prefix="scratch-acl-", suffix=".sddl")
-    os.close(handle)
-    saved = Path(name)
+    # Beside the scratch, not in the system temporary directory. tempfile.mkstemp
+    # would have written to TEMP, which is the small volume this entire mechanism
+    # exists to keep writes off, and on the host this was written for that volume
+    # is the one that filled. A few hundred bytes would rarely be the straw, but
+    # a verification step that aborts the refresh because the disk it chose for
+    # itself was full is a step that costs more than it reports.
+    saved = path.parent / f"{path.name}.sddl"
     try:
         code, _output = run(["icacls", str(path), "/save", str(saved)], timeout=60)
         if code != 0 or not saved.exists():
             return None
         # UTF-16LE with no byte-order mark, so the plain "utf-16" codec, which
-        # looks for a mark, raises on it.
+        # looks for a mark, raises on it. ValueError is caught beside OSError
+        # because a truncated or non-UTF16 body raises UnicodeDecodeError, which
+        # is a ValueError, and this function's whole contract is to answer None
+        # rather than to raise where the caller expects an answer it can warn on.
         return saved.read_text(encoding="utf-16-le")
-    except OSError:
+    except (OSError, ValueError):
         return None
     finally:
-        saved.unlink(missing_ok=True)
+        # Suppressed rather than allowed to propagate: an exception raised in a
+        # finally replaces whatever the try was returning, so a failed cleanup
+        # would turn a successful reading of the ACL into an aborted refresh.
+        with contextlib.suppress(OSError):
+            saved.unlink(missing_ok=True)
 
 
-def report_scratch_privacy(path: Path) -> None:
+def report_scratch_privacy(path: Path, sid: str | None) -> None:
     """Say whether the scratch directory is actually private, from its own ACL.
 
     This exists because the two earlier warnings could not tell the difference
@@ -1237,6 +1248,16 @@ def report_scratch_privacy(path: Path) -> None:
     saying otherwise raised a security alarm that was false on the common path.
     A scanner that cries wolf about its own staging is a scanner whose warnings
     stop being read.
+
+    `sid` is this account, and only this account is exempt. The first version
+    exempted every principal whose SID began S-1-5-21, on the reasoning that a
+    raw SID in the output was this account's. That prefix belongs to every local
+    and domain account, so a DACL granting a different user full control passed
+    without a word: the false alarm had been traded for a false silence, in the
+    one case the whole change exists to catch. Where the SID could not be read
+    there is nothing to exempt and nothing lost, because that is also the case
+    where the icacls step did not run, leaving CPython's own descriptor, which
+    names the creating account as OWNER RIGHTS rather than by SID.
 
     So nothing is said when the ACL is what it should be. What is said otherwise
     names the principals actually found, because "somebody else can write here"
@@ -1248,13 +1269,16 @@ def report_scratch_privacy(path: Path) -> None:
         log(f"WARNING: could not read the permissions on the scratch directory {path}, so "
             "whether the staged database is private here is unknown rather than confirmed.")
         return
+    trusted = set(TRUSTED_SDDL_PRINCIPALS)
+    if sid is not None:
+        trusted.add(sid)
     # Every allow entry is (A;<flags>;<rights>;<object>;<inherit>;<principal>).
     # A protected DACL is the other half: without the P flag the directory still
     # inherits, so an entry can arrive after this check.
     others = sorted({
         match.group(1)
         for match in re.finditer(r"\(A;[^;]*;[^;]*;[^;]*;[^;]*;([^)]+)\)", sddl)
-        if match.group(1) not in TRUSTED_SDDL_PRINCIPALS and not match.group(1).startswith("S-1-5-21-")
+        if match.group(1) not in trusted
     })
     if others:
         log(f"WARNING: the scratch directory {path} grants access to {', '.join(others)} as "
@@ -1434,7 +1458,7 @@ def scratch_dir(label: str, near: Path | None = None):
             )
         # After both mechanisms have had their turn, and after the emptiness
         # check, so the answer describes the directory the download will use.
-        report_scratch_privacy(path)
+        report_scratch_privacy(path, sid)
         yield path
     finally:
         # Not ignore_errors: this directory can hold a gigabyte, and a removal

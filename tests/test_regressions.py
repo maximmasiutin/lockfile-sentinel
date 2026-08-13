@@ -392,15 +392,34 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     # principals a private scratch legitimately carries.
     monkeypatch.setattr(us, "scratch_dacl",
                         lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)\n")
-    us.report_scratch_privacy(tmp_path)
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
     assert not said, f"a correct ACL produced a warning: {said}"
+
+    # This account named by its raw SID, which is how SDDL spells an ordinary
+    # account, is the same correct outcome and must also be silent.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert not said, f"this account's own entry produced a warning: {said}"
+
+    # And the case the first version of this check let through in silence. Every
+    # ordinary account's SID begins S-1-5-21, so exempting that prefix exempted
+    # everybody: a DACL granting a different user full control passed without a
+    # word, in exactly the situation the whole change exists to report.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-9-9-9-1055)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("S-1-5-21-9-9-9-1055" in line for line in said), (
+        f"another account's full control went unreported: {said}")
 
     # An inherited entry for authenticated users, which is the measured shape of
     # a general-purpose base and the case the whole change exists for.
     said.clear()
     monkeypatch.setattr(us, "scratch_dacl",
                         lambda path: "d\nD:AI(A;OICI;FA;;;SY)(A;OICIID;0x1301bf;;;AU)\n")
-    us.report_scratch_privacy(tmp_path)
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
     assert any("AU" in line for line in said), f"the intruding principal was not named: {said}"
     assert any("can substitute a database" in line for line in said), (
         f"the warning does not say what the exposure costs: {said}")
@@ -410,7 +429,7 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     said.clear()
     monkeypatch.setattr(us, "scratch_dacl",
                         lambda path: "d\nD:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\n")
-    us.report_scratch_privacy(tmp_path)
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
     assert any("still inherits" in line for line in said), (
         f"an unprotected DACL was reported as private: {said}")
 
@@ -418,7 +437,7 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     # of the two verdicts above.
     said.clear()
     monkeypatch.setattr(us, "scratch_dacl", lambda path: None)
-    us.report_scratch_privacy(tmp_path)
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
     assert any("unknown rather than confirmed" in line for line in said), (
         f"an unreadable ACL was reported as a verdict: {said}")
 
