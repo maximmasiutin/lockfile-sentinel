@@ -331,10 +331,16 @@ def test_the_scratch_directory_does_not_keep_the_permissions_it_inherited(
     monkeypatch.setattr(us, "run", record)
 
     with us.scratch_dir("test", near=cache) as scratch:
-        acl = [cmd for cmd in issued if cmd[0] == "icacls" and cmd[1] == str(scratch)]
+        # Selected by the option that identifies it rather than by position.
+        # report_scratch_privacy issues its own command against the same path
+        # before the yield, so acl[0] was the restriction command only because
+        # the two happen to run in that order, and a reordering would have
+        # failed this test against the wrong command with a message blaming the
+        # ACL rather than the sequence.
+        acl = [cmd for cmd in issued
+               if cmd[0] == "icacls" and cmd[1] == str(scratch) and "/inheritance:r" in cmd]
 
     assert acl, f"the scratch directory kept its inherited ACL: {issued}"
-    assert "/inheritance:r" in acl[0], "the inherited entries were left in place"
     granted = {acl[0][index + 1] for index, arg in enumerate(acl[0]) if arg == "/grant:r"}
     assert granted == {
         "*S-1-5-21-1-2-3-1001:(OI)(CI)F",
@@ -432,6 +438,36 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
     assert any("still inherits" in line for line in said), (
         f"an unprotected DACL was reported as private: {said}")
+
+    # A conditional entry, which SDDL spells XA rather than A. Matching only A
+    # made a DACL handing another account full control read as empty, which is
+    # the same false silence the S-1-5-21 exemption produced, by a second route.
+    said.clear()
+    monkeypatch.setattr(
+        us, "scratch_dacl",
+        lambda path: 'd\nD:P(A;OICI;FA;;;SY)(XA;;FA;;;S-1-5-21-9-9-9-1055;(Title=="PM"))\n')
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("S-1-5-21-9-9-9-1055" in line for line in said), (
+        f"a conditional grant to another account went unreported: {said}")
+
+    # A service account reading its own directory. whoami answers S-1-5-19 and
+    # the descriptor abbreviates it to LS, so matching the numeric SID alone
+    # reported the process as an intruder in the scratch it had just created.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;LS)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-19")
+    assert not said, f"the process reported its own service account as an intruder: {said}"
+
+    # The same alias when it is not this account is still an intruder, because
+    # LocalService being the process is a different fact from LocalService
+    # holding a grant on somebody else's directory.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;LS)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("LS" in line for line in said), (
+        f"a service account's grant went unreported for a different process: {said}")
 
     # And the honest answer when the ACL cannot be read at all, which is neither
     # of the two verdicts above.
@@ -580,6 +616,37 @@ def _sddl_of(path: Path, into: Path) -> str:
     return into.read_text(encoding="utf-16-le")
 
 
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this reads exists only on Windows")
+def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
+    """The real reader against real directories, because a stub proved nothing.
+
+    Every other test of the privacy report monkeypatches scratch_dacl, and the
+    end-to-end tests read ACLs through their own icacls helper, so nothing
+    exercised this function. A rewrite of it shipped broken and the whole suite
+    stayed green: it answered None for every directory, which the report then
+    faithfully turned into "permissions unknown". A verifier that cannot verify
+    is the quietest kind of failure, so this asserts it can.
+
+    Two directories, distinguished by the flag that matters. mkdir with the mode
+    produces a protected DACL and without it an inherited one, so a reader that
+    returned a constant, or the same answer for both, fails here."""
+    inherited = tmp_path / "inherited"
+    inherited.mkdir()
+    protected = tmp_path / "protected"
+    protected.mkdir(mode=0o700)
+
+    inherited_sddl = us.scratch_dacl(inherited)
+    protected_sddl = us.scratch_dacl(protected)
+
+    assert inherited_sddl is not None, "the reader could not read an ordinary directory"
+    assert protected_sddl is not None, "the reader could not read a protected directory"
+    assert inherited_sddl.startswith("D:"), f"not a DACL: {inherited_sddl}"
+    assert "D:P" in protected_sddl, (
+        f"mode 0o700 did not read back as protected: {protected_sddl}")
+    assert "D:P" not in inherited_sddl, (
+        f"an inherited directory read back as protected: {inherited_sddl}")
+
+
 @pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
 def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_path) -> None:
     """The only test here that can fail if restrict_to_owner stops working.
@@ -634,7 +701,12 @@ def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_pa
     # out of the display listing.
     assert "(A;OICI;FA;;;SY)" in after, f"SYSTEM lost full control: {after}"
     assert "(A;OICI;FA;;;BA)" in after, f"the administrators group lost full control: {after}"
-    assert after.count("(A;") >= 3, f"the lockdown granted fewer principals than it names: {after}"
+    # No count of the entries here. Requiring three was meant to catch a
+    # protected but empty DACL, which the two assertions above already exclude,
+    # and it fails under an account that is itself one of the principals
+    # granted: as LocalSystem the account grant and the SYSTEM grant collapse
+    # into one entry, so a correct ACL carries two and the test failed on a
+    # directory with nothing wrong with it.
 
     # The account's own access is claimed from the other side instead, which is
     # the stronger half anyway: an ACL that reads correctly and denies in

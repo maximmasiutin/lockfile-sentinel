@@ -1202,6 +1202,20 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
 # this directory was not meant to be readable by.
 TRUSTED_SDDL_PRINCIPALS = frozenset({"SY", "BA", "OW", "LA", "CO"})
 
+# What SDDL calls the accounts a scheduled task is likely to run as. `whoami`
+# answers with the numeric SID and the descriptor abbreviates it, so a service
+# account would otherwise be reported as an intruder in its own scratch
+# directory: LocalService is S-1-5-19 and appears as LS. The alias is added only
+# when it is this account's, rather than trusted outright, because LocalService
+# being the process is a different fact from LocalService having been granted
+# access to a directory belonging to somebody else.
+SDDL_ALIAS_FOR_SID = {
+    "S-1-5-18": "SY",
+    "S-1-5-19": "LS",
+    "S-1-5-20": "NS",
+    "S-1-5-32-544": "BA",
+}
+
 
 def scratch_dacl(path: Path) -> str | None:
     """The directory's DACL as SDDL, or None when it cannot be read.
@@ -1211,31 +1225,80 @@ def scratch_dacl(path: Path) -> str | None:
     filesystem what the ACL actually says is the only answer that covers both,
     and it is the difference between warning about an exposure and warning about
     a step that did not run."""
-    # Beside the scratch, not in the system temporary directory. tempfile.mkstemp
-    # would have written to TEMP, which is the small volume this entire mechanism
-    # exists to keep writes off, and on the host this was written for that volume
-    # is the one that filled. A few hundred bytes would rarely be the straw, but
-    # a verification step that aborts the refresh because the disk it chose for
-    # itself was full is a step that costs more than it reports.
-    saved = path.parent / f"{path.name}.sddl"
+    # Asked of the kernel directly, which took three attempts to arrive at and is
+    # worth recording, because each rejected route failed for a different reason
+    # and all three reasons are the sort a security check must not carry.
+    #
+    # `icacls /save` needs an interchange file and every location is wrong. The
+    # system temporary directory is the small volume this whole mechanism exists
+    # to keep writes off. The scratch's base is the directory whose permissions
+    # are under suspicion, so on the very base this was written for the file
+    # inherits Authenticated Users and another account can replace it between the
+    # write and the read, forging a descriptor that says the directory is
+    # private. The scratch itself is circular: an account that can write there
+    # can forge the answer saying it cannot.
+    #
+    # PowerShell's Get-Acl returns the descriptor on stdout and needs no file,
+    # but it failed outright here: Windows PowerShell could not autoload its own
+    # Security module under a PSModulePath inherited from PowerShell 7, and
+    # dropping that variable did not fix it. A check that depends on which shell
+    # launched the updater is a check that reports "unknown" for reasons having
+    # nothing to do with the directory.
+    #
+    # GetNamedSecurityInfoW has none of those failure modes: no file to forge, no
+    # process to spawn, no environment to inherit, no PATH entry to hijack and no
+    # locale to translate the answer.
+    import ctypes  # pylint: disable=import-outside-toplevel
+
     try:
-        code, _output = run(["icacls", str(path), "/save", str(saved)], timeout=60)
-        if code != 0 or not saved.exists():
-            return None
-        # UTF-16LE with no byte-order mark, so the plain "utf-16" codec, which
-        # looks for a mark, raises on it. ValueError is caught beside OSError
-        # because a truncated or non-UTF16 body raises UnicodeDecodeError, which
-        # is a ValueError, and this function's whole contract is to answer None
-        # rather than to raise where the caller expects an answer it can warn on.
-        return saved.read_text(encoding="utf-16-le")
-    except (OSError, ValueError):
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError):
         return None
+
+    # Declared rather than left to ctypes' defaults, because a pointer returned
+    # into an undeclared restype is truncated to 32 bits on a 64-bit build, and
+    # the failure is a wild free rather than an error.
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_int, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_ulong
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(ctypes.c_ulong),
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    se_file_object = 1
+    dacl_security_information = 0x00000004
+    sddl_revision_1 = 1
+
+    descriptor = ctypes.c_void_p()
+    if advapi32.GetNamedSecurityInfoW(
+            str(path), se_file_object, dacl_security_information,
+            None, None, None, None, ctypes.byref(descriptor)) != 0:
+        return None
+    try:
+        text = ctypes.c_wchar_p()
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, sddl_revision_1, dacl_security_information,
+                ctypes.byref(text), None):
+            return None
+        try:
+            # Copied out of the ctypes buffer before it is freed, and as a plain
+            # str: c_wchar_p.value carries the ctypes type through to every
+            # caller, so the annotation said str while the object did not.
+            sddl = text.value
+            return str(sddl) if sddl is not None else None
+        finally:
+            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
     finally:
-        # Suppressed rather than allowed to propagate: an exception raised in a
-        # finally replaces whatever the try was returning, so a failed cleanup
-        # would turn a successful reading of the ACL into an aborted refresh.
-        with contextlib.suppress(OSError):
-            saved.unlink(missing_ok=True)
+        kernel32.LocalFree(descriptor)
 
 
 def report_scratch_privacy(path: Path, sid: str | None) -> None:
@@ -1272,12 +1335,25 @@ def report_scratch_privacy(path: Path, sid: str | None) -> None:
     trusted = set(TRUSTED_SDDL_PRINCIPALS)
     if sid is not None:
         trusted.add(sid)
-    # Every allow entry is (A;<flags>;<rights>;<object>;<inherit>;<principal>).
+        alias = SDDL_ALIAS_FOR_SID.get(sid)
+        if alias is not None:
+            trusted.add(alias)
+    # An allow entry is <type>;<flags>;<rights>;<object>;<inherit>;<principal>,
+    # and the type is not only A: SDDL spells an access-allowed entry as OA when
+    # it carries object GUIDs and as XA or ZA when it carries a condition. All
+    # four grant access, so matching only A left a DACL that hands another
+    # account full control through a conditional entry looking empty, which is
+    # the same false silence the S-1-5-21 exemption produced.
+    #
+    # The principal stops at the next separator rather than at the closing
+    # bracket, because a conditional entry continues past it with the condition
+    # itself: (XA;;FA;;;WD;(Title=="PM")).
+    #
     # A protected DACL is the other half: without the P flag the directory still
     # inherits, so an entry can arrive after this check.
     others = sorted({
         match.group(1)
-        for match in re.finditer(r"\(A;[^;]*;[^;]*;[^;]*;[^;]*;([^)]+)\)", sddl)
+        for match in re.finditer(r"\((?:A|OA|XA|ZA);[^;]*;[^;]*;[^;]*;[^;]*;([^);]+)", sddl)
         if match.group(1) not in trusted
     })
     if others:
