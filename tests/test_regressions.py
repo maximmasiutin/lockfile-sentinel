@@ -302,15 +302,20 @@ def test_the_gate_still_refuses_when_there_is_nothing_to_scan(tmp_path: Path) ->
 
 def test_the_scratch_directory_does_not_keep_the_permissions_it_inherited(
         tmp_path, monkeypatch) -> None:
-    """mode=0o700 is ignored on Windows, so the staged database inherited a shared ACL.
+    """The lockdown is issued for the directory that was just created, and drops inheritance.
 
-    The gate scans the staged tree and the promotion installs it, and between
-    those two the bytes sat in a directory that a general-purpose base grants
-    modify on to every authenticated user. A local user could replace an approved
-    database with one nothing scanned, which is a gate passing what it did not
-    read by a route that does not go through the gate at all. Measured on the
-    host this runs on: the cache carried an explicit owner-only ACL while the
-    scratch feeding it did not."""
+    Where the mode does not reach the filesystem — an interpreter older than
+    3.12.4, a mode other than exactly 0o700, an API-set build, a volume without
+    ACLs — the staged database sits in a directory a general-purpose base grants
+    modify on to every authenticated user. The gate scans the staged tree and the
+    promotion installs it, and between those two a local user could replace an
+    approved database with one nothing scanned, which is a gate passing what it
+    did not read by a route that does not go through the gate at all.
+
+    This one pins the command rather than the outcome, so it runs everywhere.
+    Do not read it as evidence that the directory ends up private: the tests
+    further down cover that, and one of them explains why the outcome is already
+    delivered by CPython on a current build."""
     cache = tmp_path / "trivy-cache"
     cache.mkdir()
     monkeypatch.setattr(us, "SCRATCH_BASE", "")
@@ -503,6 +508,20 @@ def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_pa
     # the grants would sit on top of whatever the base still passes down.
     assert "D:P" in after, f"the directory still inherits from its base: {after}"
 
+    # The three absences above are satisfied by a protected DACL with no entries
+    # at all, which locks this account out of its own staging directory and
+    # fails the download rather than the test. Removing access is as much a
+    # defect as leaving it, so the grants are asserted rather than assumed.
+    sid = us.current_user_sid()
+    assert sid is not None, "the account SID could not be read, so the grant cannot be checked"
+    for principal in (sid, "SY", "BA"):
+        assert f"(A;OICI;FA;;;{principal})" in after, (
+            f"{principal} lost full control of the scratch directory: {after}")
+
+    # And the same claim from the other side, because an ACL that reads correctly
+    # and denies in practice is the failure a string comparison cannot see.
+    (shared / "written-after-lockdown").write_text("staged", encoding="utf-8")
+
 
 @pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
 def test_a_scratch_directory_ends_up_private_whichever_mechanism_did_it(
@@ -528,6 +547,12 @@ def test_a_scratch_directory_ends_up_private_whichever_mechanism_did_it(
 
     with us.scratch_dir("test", near=cache) as scratch:
         assert scratch.parent == base, f"the scratch did not land on the seeded base: {scratch}"
+        # A download has to be able to write here, whichever mechanism set the
+        # ACL. The grants are not asserted by name because the two mechanisms
+        # spell them differently — CPython's descriptor grants OWNER RIGHTS,
+        # restrict_to_owner grants this account's SID — and pinning either would
+        # make the test fail on the wrong build rather than on a real defect.
+        (scratch / "staged.db").write_text("staged", encoding="utf-8")
         sddl = _sddl_of(scratch, tmp_path / "scratch.sddl")
 
     assert ";AU)" not in sddl, f"the staged database sits somewhere shared: {sddl}"
