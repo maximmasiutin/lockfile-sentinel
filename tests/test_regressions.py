@@ -501,6 +501,37 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     assert any("can substitute a database" in line for line in said), (
         f"a modify mask was not reported as write access: {said}")
 
+    # The object-rights mnemonics, whose letters describe a directory-service
+    # object and whose bits mean something else on a filesystem directory. The
+    # first version of this check kept a list of "write" letters and got both of
+    # these the wrong way round: CC reads as create-child and is 0x1, which only
+    # lists, while LC reads as list-children and is 0x4, which adds a
+    # subdirectory. One of them was a false alarm and the other a false silence.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;LC;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"LC adds a subdirectory and was not reported as write access: {said}")
+
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;CC;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("readable by" in line for line in said), (
+        f"CC only lists the directory and was not reported at all: {said}")
+    assert not any("can substitute a database" in line for line in said), (
+        f"CC only lists the directory and was reported as write access: {said}")
+
+    # A letter pair that is not a right at all reads as write, because an entry
+    # nobody can parse must not become silence.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;ZZ;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an unparseable rights field was treated as harmless: {said}")
+
     # And the honest answer when the ACL cannot be read at all, which is neither
     # of the two verdicts above.
     said.clear()
@@ -675,8 +706,15 @@ def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
     inherited.mkdir()
     protected = tmp_path / "protected"
     protected.mkdir()
+    # This account is granted alongside SYSTEM, rather than SYSTEM alone. The
+    # first version named only SYSTEM, which does protect the directory and also
+    # leaves the account running the tests unable to delete it, so pytest could
+    # not clear its own temporary tree and every run left one behind. What this
+    # case needs is a protected DACL, not an inaccessible one.
+    sid = us.current_user_sid() or "S-1-5-32-544"
     code, output = us.run(
-        ["icacls", str(protected), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F"],
+        ["icacls", str(protected), "/inheritance:r",
+         "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", f"*{sid}:(OI)(CI)F"],
         timeout=60)
     if code != 0:
         pytest.skip(f"cannot protect a directory here, so the reader cannot be told apart: {output}")

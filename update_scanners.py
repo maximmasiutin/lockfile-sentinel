@@ -1222,31 +1222,67 @@ SDDL_ALIAS_FOR_SID = {
 # ACL. Reading alone is a smaller finding and gets a smaller sentence.
 SDDL_WRITE_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
 
-# The two-letter rights that include any of those. FA and GA are everything, FW
-# and GW are the write set, SD deletes, DC deletes a child, WD rewrites the ACL,
-# WO takes ownership, CC creates a child and DT deletes a tree.
-SDDL_WRITE_RIGHTS = frozenset({"FA", "GA", "FW", "GW", "SD", "DC", "WD", "WO", "CC", "DT"})
+# What each two-letter right is worth as a mask, so that one definition decides
+# both spellings. Keeping a separate set of "write" letters beside the mask above
+# was the first attempt and it was wrong in both directions: the object-rights
+# mnemonics describe a directory-service object, and on a filesystem directory
+# the same bits mean something else. CC is 0x1, which lists the directory and
+# grants nothing, while it reads as "create child"; LC is 0x4, which adds a
+# subdirectory, while it reads as "list children". So the set called CC a write
+# and LC a read, each the reverse of the truth.
+#
+# The generic four are given their file equivalents rather than their generic
+# bits, because that is what they mean once the generic mapping is applied and it
+# lets every spelling meet the same mask.
+SDDL_RIGHT_BITS = {
+    "CC": 0x1,        # list directory
+    "DC": 0x2,        # add file
+    "LC": 0x4,        # add subdirectory
+    "SW": 0x8,        # read extended attributes
+    "RP": 0x10,       # write extended attributes
+    "WP": 0x20,       # traverse
+    "DT": 0x40,       # delete child
+    "LO": 0x80,       # read attributes
+    "CR": 0x100,      # write attributes
+    "SD": 0x10000,    # delete
+    "RC": 0x20000,    # read the security descriptor
+    "WD": 0x40000,    # rewrite the ACL
+    "WO": 0x80000,    # take ownership
+    "FA": 0x1F01FF,   # file all
+    "FR": 0x120089,   # file generic read
+    "FW": 0x120116,   # file generic write
+    "FX": 0x1200A0,   # file generic execute
+    "GA": 0x1F01FF,   # generic all, mapped
+    "GR": 0x120089,   # generic read, mapped
+    "GW": 0x120116,   # generic write, mapped
+    "GX": 0x1200A0,   # generic execute, mapped
+}
 
 
 def sddl_grants_write(rights: str) -> bool:
     """Whether an SDDL rights field lets its holder change the directory.
 
-    Rights arrive in two spellings and both have to be read. A hexadecimal mask
-    is tested against the bits that matter; a run of two-letter codes is split
-    into pairs and tested against the set above. A mask that parses as neither is
-    reported as write, because guessing "read only" would turn an unreadable
-    entry into silence, and this function exists to stop the report claiming more
-    than it established rather than to start it claiming less."""
+    Rights arrive in two spellings and both are reduced to a mask so that one
+    definition answers for both. A hexadecimal field is taken as it stands; a run
+    of two-letter codes is split into pairs and each looked up.
+
+    Anything that does not parse is reported as write. Guessing "read only"
+    would turn an entry nobody could read into silence, and this function exists
+    to stop the report claiming more than it established, not to start it
+    claiming less."""
     text = rights.strip()
     if text.lower().startswith("0x"):
         try:
             return bool(int(text, 16) & SDDL_WRITE_MASK)
         except ValueError:
             return True
-    codes = {text[index:index + 2].upper() for index in range(0, len(text) - 1, 2)}
-    if not codes:
+    codes = [text[index:index + 2].upper() for index in range(0, len(text) - 1, 2)]
+    if not codes or any(code not in SDDL_RIGHT_BITS for code in codes):
         return True
-    return bool(codes & SDDL_WRITE_RIGHTS)
+    mask = 0
+    for code in codes:
+        mask |= SDDL_RIGHT_BITS[code]
+    return bool(mask & SDDL_WRITE_MASK)
 
 
 def scratch_dacl(path: Path) -> str | None:
