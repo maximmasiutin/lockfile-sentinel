@@ -31,12 +31,18 @@ jobs:
           python -m pytest -q
 
       - name: Static analysis
-        # Part of the contract rather than advice: the README states that these
-        # three pass, so CI is what keeps that sentence true.
+        # Part of the contract rather than advice: the README states that every
+        # file passes these three, so CI is what keeps that sentence true. The
+        # file list therefore has to match the one the README tells a reader to
+        # run, or the claim outlives the check that supports it. bump_version.py
+        # was added after this step was written and was missing from the mypy and
+        # pylint lines until 2026-08-13, so a type or lint regression in it left
+        # CI green while the README said otherwise. bandit was never affected: it
+        # walks the tree rather than a file list.
         run: |
           python -m pip install --upgrade mypy pylint bandit
-          python -m mypy --python-version 3.12 --ignore-missing-imports lockfile_sentinel.py update_scanners.py schedule_tasks.py
-          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py
+          python -m mypy --python-version 3.12 --ignore-missing-imports lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
+          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
           python -m bandit -r . -x ./tests
 
       - name: Offline self-test
