@@ -627,13 +627,27 @@ def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
     faithfully turned into "permissions unknown". A verifier that cannot verify
     is the quietest kind of failure, so this asserts it can.
 
-    Two directories, distinguished by the flag that matters. mkdir with the mode
-    produces a protected DACL and without it an inherited one, so a reader that
-    returned a constant, or the same answer for both, fails here."""
+    Two directories, distinguished by the flag that matters, so a reader that
+    returned a constant or the same answer for both fails here.
+
+    The protected one is made protected with icacls rather than with
+    mkdir(mode=0o700), which is the obvious way and the wrong one. This very
+    change documents four configurations in which the interpreter does not apply
+    that mode — 3.12.0 to 3.12.3, a mode other than exactly 0o700, an API-set
+    build, a volume without ACLs — and three of them are supported here. A test
+    asserting the mode worked would therefore fail on a configuration where
+    nothing is wrong and the reader is fine, which is the same conditional-read-
+    as-universal mistake this branch has made repeatedly. icacls either works or
+    reports that it did not, and the skip says which."""
     inherited = tmp_path / "inherited"
     inherited.mkdir()
     protected = tmp_path / "protected"
-    protected.mkdir(mode=0o700)
+    protected.mkdir()
+    code, output = us.run(
+        ["icacls", str(protected), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F"],
+        timeout=60)
+    if code != 0:
+        pytest.skip(f"cannot protect a directory here, so the reader cannot be told apart: {output}")
 
     inherited_sddl = us.scratch_dacl(inherited)
     protected_sddl = us.scratch_dacl(protected)
@@ -642,7 +656,7 @@ def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
     assert protected_sddl is not None, "the reader could not read a protected directory"
     assert inherited_sddl.startswith("D:"), f"not a DACL: {inherited_sddl}"
     assert "D:P" in protected_sddl, (
-        f"mode 0o700 did not read back as protected: {protected_sddl}")
+        f"a directory icacls protected did not read back as protected: {protected_sddl}")
     assert "D:P" not in inherited_sddl, (
         f"an inherited directory read back as protected: {inherited_sddl}")
 
