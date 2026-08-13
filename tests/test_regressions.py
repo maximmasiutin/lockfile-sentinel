@@ -552,6 +552,17 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     assert any("can substitute a database" in line for line in said), (
         f"an unparseable rights field was treated as harmless: {said}")
 
+    # And an odd number of letters, which is the same malformation arriving in a
+    # shape that used to parse. The pairs were cut one short of the end, so the
+    # trailing character was dropped without a word and CCD read as CC alone: a
+    # field nobody could parse became a read-only verdict rather than a warning.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;CCD;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an odd-length rights field had its last character dropped: {said}")
+
     # A NULL DACL, which grants every account full access and which Windows
     # writes as a token rather than as entries. With nothing for the parser to
     # find, both lists came back empty, and the protected flag then silenced the

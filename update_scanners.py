@@ -1286,7 +1286,14 @@ def sddl_grants_write(rights: str) -> bool:
             return bool(int(text, 16) & SDDL_WRITE_MASK)
         except ValueError:
             return True
-    codes = [text[index:index + 2].upper() for index in range(0, len(text) - 1, 2)]
+    # An odd length is malformed and is treated as such, rather than parsed as
+    # far as it goes. Stopping one short of the end was how the pairs were cut,
+    # so a trailing character was dropped in silence: "CCD" read as CC alone and
+    # was called read-only, which is the one direction this function must never
+    # fail in.
+    if len(text) % 2:
+        return True
+    codes = [text[index:index + 2].upper() for index in range(0, len(text), 2)]
     if not codes or any(code not in SDDL_RIGHT_BITS for code in codes):
         return True
     mask = 0
