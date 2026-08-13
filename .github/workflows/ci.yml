@@ -16,7 +16,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.12", "3.13"]
+        # Every version the README advertises and can name. It says 3.12 or
+        # newer, so a release after 3.14 is claimed and untested until this list
+        # grows; the README says that rather than leaving the matrix to imply
+        # otherwise. 3.14 was added on 2026-08-13 after review pointed out that
+        # it was both the advertised floor's successor and the interpreter the
+        # author runs by default, so the least tested version was the one most
+        # used.
+        python: ["3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -31,17 +38,28 @@ jobs:
           python -m pytest -q
 
       - name: Static analysis
-        # Part of the contract rather than advice: the README states that every
-        # file passes these three, so CI is what keeps that sentence true. The
-        # file list therefore has to match the one the README tells a reader to
-        # run, or the claim outlives the check that supports it. bump_version.py
-        # was added after this step was written and was missing from the mypy and
-        # pylint lines until 2026-08-13, so a type or lint regression in it left
-        # CI green while the README said otherwise. bandit was never affected: it
-        # walks the tree rather than a file list.
+        # Part of the contract rather than advice: the README states that these
+        # four programs pass mypy and pylint and that bandit is clean outside
+        # tests/, so this step is what keeps those sentences true. Each command
+        # therefore has to match the one the README tells a reader to run,
+        # argument for argument, or the claim outlives the check that supports
+        # it. Two ways it had already drifted, both found in review and both
+        # corrected on 2026-08-13: bump_version.py was added after this step was
+        # written and was missing from the mypy and pylint lines, so a type or
+        # lint regression in it left CI green; and mypy carried
+        # --ignore-missing-imports, which the README's command does not, making
+        # CI the weaker of the two checks that were supposed to be the same one.
+        # The project is standard library only, so nothing needed the flag.
+        # bandit was never affected by the file-list drift, because it walks the
+        # tree rather than a list.
+        #
+        # --python-version stays pinned to the floor rather than following the
+        # matrix on purpose: the question mypy answers here is whether the code
+        # is valid on the oldest interpreter the README claims, and the matrix
+        # answers the newer ones by running the suite on them.
         run: |
           python -m pip install --upgrade mypy pylint bandit
-          python -m mypy --python-version 3.12 --ignore-missing-imports lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
+          python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
           python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
           python -m bandit -r . -x ./tests
 
