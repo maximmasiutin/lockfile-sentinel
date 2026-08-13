@@ -512,14 +512,22 @@ def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_pa
     # at all, which locks this account out of its own staging directory and
     # fails the download rather than the test. Removing access is as much a
     # defect as leaving it, so the grants are asserted rather than assumed.
-    sid = us.current_user_sid()
-    assert sid is not None, "the account SID could not be read, so the grant cannot be checked"
-    for principal in (sid, "SY", "BA"):
-        assert f"(A;OICI;FA;;;{principal})" in after, (
-            f"{principal} lost full control of the scratch directory: {after}")
+    # SYSTEM and the administrators group are asserted by their SDDL aliases,
+    # which are fixed. The account's own entry is deliberately not asserted as
+    # text: SDDL abbreviates a well-known SID and spells out any other, so one
+    # working ACL reads as the raw S-1-5-21-...-1001 on a workstation whose
+    # account is an ordinary user, and as LA on a CI runner whose account is the
+    # built-in administrator at RID 500. The first version of this test pinned
+    # the raw SID, passed here and failed on both Windows runners while nothing
+    # was wrong, which is the same mistake as reading localised principal names
+    # out of the display listing.
+    assert "(A;OICI;FA;;;SY)" in after, f"SYSTEM lost full control: {after}"
+    assert "(A;OICI;FA;;;BA)" in after, f"the administrators group lost full control: {after}"
+    assert after.count("(A;") >= 3, f"the lockdown granted fewer principals than it names: {after}"
 
-    # And the same claim from the other side, because an ACL that reads correctly
-    # and denies in practice is the failure a string comparison cannot see.
+    # The account's own access is claimed from the other side instead, which is
+    # the stronger half anyway: an ACL that reads correctly and denies in
+    # practice is the failure no string comparison can see.
     (shared / "written-after-lockdown").write_text("staged", encoding="utf-8")
 
 
