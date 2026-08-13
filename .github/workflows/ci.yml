@@ -16,7 +16,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.12", "3.13"]
+        # Every version the README names. It advertises 3.12 or newer, so a
+        # release after the last entry here is claimed and untested, which the
+        # README states rather than leaving this list to imply otherwise.
+        python: ["3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -31,12 +34,18 @@ jobs:
           python -m pytest -q
 
       - name: Static analysis
-        # Part of the contract rather than advice: the README states that these
-        # three pass, so CI is what keeps that sentence true.
+        # These three commands must match the README's argument for argument.
+        # It states that the four programs pass mypy and pylint and that bandit
+        # is clean outside tests/, and this step is the only thing keeping those
+        # sentences true.
+        #
+        # --python-version is pinned to the floor rather than following the
+        # matrix on purpose: it asks whether the code is valid on the oldest
+        # interpreter the README claims, and the matrix answers the newer ones.
         run: |
           python -m pip install --upgrade mypy pylint bandit
-          python -m mypy --python-version 3.12 --ignore-missing-imports lockfile_sentinel.py update_scanners.py schedule_tasks.py
-          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py
+          python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
+          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
           python -m bandit -r . -x ./tests
 
       - name: Offline self-test
@@ -68,3 +77,26 @@ jobs:
 
       - name: Self-test, both layers
         run: python lockfile_sentinel.py --selftest
+
+  ci-passed:
+    # One context to require in branch protection, so that the list of required
+    # checks does not have to be re-edited whenever the matrix changes. Requiring
+    # the matrix jobs by name is the alternative, and it fails in a way that is
+    # hard to diagnose: a required context that no longer reports blocks every
+    # merge and gives no reason on the pull request.
+    #
+    # if: always() so this runs even when a dependency failed; without it the job
+    # would be skipped, and a skipped required check never turns red, which is
+    # the shape of gate that reports success by not running.
+    if: always()
+    needs: [test, selftest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report whether every job passed
+        run: |
+          echo "test:     ${{ needs.test.result }}"
+          echo "selftest: ${{ needs.selftest.result }}"
+          # Anything other than success fails this job, so cancelled and skipped
+          # count against it too rather than passing by not being a failure.
+          test "${{ needs.test.result }}" = success || exit 1
+          test "${{ needs.selftest.result }}" = success || exit 1
