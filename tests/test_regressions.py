@@ -532,6 +532,27 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     assert any("can substitute a database" in line for line in said), (
         f"an unparseable rights field was treated as harmless: {said}")
 
+    # A NULL DACL, which grants every account full access and which Windows
+    # writes as a token rather than as entries. With nothing for the parser to
+    # find, both lists came back empty, and the protected flag then silenced the
+    # inheritance branch as well, so the most exposed directory a filesystem can
+    # hold produced no warning at all.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl", lambda path: "d\nD:PNO_ACCESS_CONTROL\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("no access control list at all" in line for line in said), (
+        f"a NULL DACL was reported as private: {said}")
+    assert any("can substitute a database" in line for line in said), (
+        f"a NULL DACL was not reported as write exposure: {said}")
+
+    # And the unprotected spelling of the same thing, which would otherwise have
+    # been reported as merely inheriting.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl", lambda path: "d\nD:NO_ACCESS_CONTROL\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("no access control list at all" in line for line in said), (
+        f"a NULL DACL was reported as an inheritance problem: {said}")
+
     # And the honest answer when the ACL cannot be read at all, which is neither
     # of the two verdicts above.
     said.clear()
@@ -711,7 +732,15 @@ def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
     # leaves the account running the tests unable to delete it, so pytest could
     # not clear its own temporary tree and every run left one behind. What this
     # case needs is a protected DACL, not an inaccessible one.
-    sid = us.current_user_sid() or "S-1-5-32-544"
+    #
+    # Skipped rather than falling back to the administrators group when the SID
+    # cannot be read. The fallback looked harmless and was not: on a
+    # non-administrator account icacls would still succeed at removing this
+    # account's own access, and the test would then be locked out of the
+    # directory it just made instead of reporting that the setup is unavailable.
+    sid = us.current_user_sid()
+    if sid is None:
+        pytest.skip("this account's SID could not be read, so the fixture cannot be built safely")
     code, output = us.run(
         ["icacls", str(protected), "/inheritance:r",
          "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", f"*{sid}:(OI)(CI)F"],
@@ -747,6 +776,15 @@ def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_pa
     So the function is exercised directly, against a directory deliberately
     created the way those cases leave it: with the default mode, inheriting a
     base that grants Authenticated Users."""
+    # Resolved once, up front, and the case skipped when it is missing. Reading
+    # it inline at the call below made this test assert the opposite of what the
+    # code does: with no SID, restrict_to_owner takes its documented path of
+    # warning and leaving the ACL alone, so the inherited Authenticated Users
+    # grant stays and every assertion here fails on behaviour that is correct.
+    sid = us.current_user_sid()
+    if sid is None:
+        pytest.skip("this account's SID could not be read, which is the graceful path, not this one")
+
     base = tmp_path / "shared-base"
     base.mkdir()
     seeded, seed_output = us.run(
@@ -761,7 +799,7 @@ def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_pa
     before = _sddl_of(shared, tmp_path / "before.sddl")
     assert ";AU)" in before, f"the base did not share, so this proves nothing: {before}"
 
-    us.restrict_to_owner(shared, us.current_user_sid())
+    us.restrict_to_owner(shared, sid)
 
     after = _sddl_of(shared, tmp_path / "after.sddl")
     assert ";AU)" not in after, f"authenticated users can still write it: {after}"

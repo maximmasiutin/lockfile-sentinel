@@ -1410,6 +1410,18 @@ def report_scratch_privacy(path: Path, sid: str | None) -> None:
         log(f"WARNING: could not read the permissions on the scratch directory {path}, so "
             "whether the staged database is private here is unknown rather than confirmed.")
         return
+    # A NULL DACL is not an empty one. It grants every account full access, and
+    # Windows writes it as this token instead of as entries, so there is nothing
+    # for the parser below to find: `writers` and `readers` both come back empty
+    # and the protected-flag branch is skipped whenever the descriptor also
+    # carries P. The most exposed directory a filesystem can hold would have
+    # produced silence, which is the failure this whole report exists to avoid,
+    # so it is tested for before anything is parsed.
+    if "NO_ACCESS_CONTROL" in sddl:
+        log(f"WARNING: the scratch directory {path} has no access control list at all, which "
+            "grants every account full access rather than none. A local user can substitute a "
+            "database between the ClamAV gate and promotion.")
+        return
     trusted = set(TRUSTED_SDDL_PRINCIPALS)
     if sid is not None:
         trusted.add(sid)
