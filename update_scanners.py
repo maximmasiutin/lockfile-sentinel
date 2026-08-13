@@ -1220,7 +1220,17 @@ SDDL_ALIAS_FOR_SID = {
 # rather than only look at it: write data, append, write extended attributes and
 # attributes, delete a child, delete the object, and rewrite its owner or its
 # ACL. Reading alone is a smaller finding and gets a smaller sentence.
-SDDL_WRITE_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
+#
+# The last two are the generic bits, GENERIC_ALL and GENERIC_WRITE, and they are
+# here because a mask is not always mapped by the time it is stored. The letter
+# spellings GA and GW are translated to their file equivalents by the table
+# below, so those meet this mask already; a mask written out in hexadecimal is
+# taken as it stands, and an ACE can legitimately keep its generic bits — an
+# inherit-only entry keeps them until it is inherited, and an entry set through
+# the raw API keeps whatever was written. So (A;;0x40000000;;;AU) granted every
+# authenticated user write access and was reported as read-only.
+SDDL_WRITE_MASK = (0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
+                   | 0x10000000 | 0x40000000)
 
 # What each two-letter right is worth as a mask, so that one definition decides
 # both spellings. Keeping a separate set of "write" letters beside the mask above

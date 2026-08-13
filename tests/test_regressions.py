@@ -501,6 +501,26 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     assert any("can substitute a database" in line for line in said), (
         f"a modify mask was not reported as write access: {said}")
 
+    # An unmapped generic bit, which the hexadecimal branch has to weigh even
+    # though the letter branch never produces one: GA and GW are translated to
+    # their file equivalents, but a mask spelled out in hex keeps whatever it was
+    # written with, and an inherit-only entry keeps its generic bits until it is
+    # inherited. GENERIC_WRITE here alongside a harmless list bit, so nothing but
+    # the generic bit can carry the verdict.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x40000001;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an unmapped GENERIC_WRITE was reported as read-only: {said}")
+
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x10000000;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an unmapped GENERIC_ALL was reported as read-only: {said}")
+
     # The object-rights mnemonics, whose letters describe a directory-service
     # object and whose bits mean something else on a filesystem directory. The
     # first version of this check kept a list of "write" letters and got both of
@@ -747,6 +767,16 @@ def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
         timeout=60)
     if code != 0:
         pytest.skip(f"cannot protect a directory here, so the reader cannot be told apart: {output}")
+    # And read back with the other reader before trusting the exit status, because
+    # a zero from icacls says the command was accepted, not that the filesystem
+    # kept what it accepted. On a volume that carries no ACLs — the exFAT case
+    # this whole change warns about rather than refuses — the descriptor is
+    # discarded and the D:P assertion below would then blame scratch_dacl for a
+    # fixture the test could not build. Checked with the icacls reader rather
+    # than with scratch_dacl, so that the thing under test is not also the thing
+    # certifying its own input.
+    if "D:P" not in _sddl_of(protected, tmp_path / "fixture.sddl"):
+        pytest.skip("this volume did not keep a protected DACL, so the two cases are not distinct")
 
     inherited_sddl = us.scratch_dacl(inherited)
     protected_sddl = us.scratch_dacl(protected)
@@ -797,7 +827,13 @@ def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_pa
     shared = base / "created-without-the-mode"
     shared.mkdir()
     before = _sddl_of(shared, tmp_path / "before.sddl")
-    assert ";AU)" in before, f"the base did not share, so this proves nothing: {before}"
+    # Skipped rather than asserted, because this is the fixture rather than the
+    # subject. icacls returning zero says the grant was accepted, and on a volume
+    # that holds no ACLs it is accepted and discarded; failing here would then
+    # report a regression in restrict_to_owner on a host where the shared
+    # directory it is asked to fix could not be created in the first place.
+    if ";AU)" not in before:
+        pytest.skip(f"the base did not share, so there is nothing here to privatise: {before}")
 
     us.restrict_to_owner(shared, sid)
 
