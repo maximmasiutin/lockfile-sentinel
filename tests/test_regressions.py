@@ -345,14 +345,21 @@ def test_the_scratch_directory_does_not_keep_the_permissions_it_inherited(
 
 def test_a_scratch_that_cannot_be_locked_down_says_so_and_still_runs(
         tmp_path, monkeypatch) -> None:
-    """The warning is the deliverable when the ACL cannot be rewritten.
+    """The warning reports the step that did not run, and claims nothing beyond it.
 
     Raising would stop the databases updating on any host where icacls is
     unavailable, and a stale vulnerability database is the larger everyday risk
     than a staging window that needs a second local account to exploit. What must
-    not happen is the silent version, where the run reports success and the
-    docstring's promise of a private directory is the only record of a privacy it
-    did not obtain."""
+    not happen is the silent version, where the run reports success and nothing
+    records that the hardening step failed.
+
+    What must also not happen is the opposite, which this originally did: the
+    warning asserted that the directory kept its inherited permissions and that a
+    local user could substitute a database. On any interpreter from 3.12.4 that
+    is false, because mkdir already protected the directory, so the alarm fired
+    on the common path and was wrong. Whether the directory is exposed is a
+    different question from whether this step ran, and it is answered from the
+    ACL by report_scratch_privacy instead."""
     monkeypatch.setattr(us, "IS_WINDOWS", True)
     monkeypatch.setattr(us, "current_user_sid", lambda: "S-1-5-21-1-2-3-1001")
     monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (1, "Access is denied."))
@@ -362,8 +369,58 @@ def test_a_scratch_that_cannot_be_locked_down_says_so_and_still_runs(
     us.restrict_to_owner(tmp_path, "S-1-5-21-1-2-3-1001")
 
     assert any("WARNING" in line for line in said), f"the failure was not reported: {said}"
-    assert any("between the ClamAV gate and promotion" in line for line in said), (
-        f"the warning does not say what the exposure is: {said}")
+    assert any("could not restrict the permissions" in line for line in said), (
+        f"the warning does not name the step that failed: {said}")
+    assert not any("can substitute a database" in line for line in said), (
+        f"the warning asserts an exposure it has not established: {said}")
+
+
+def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
+        tmp_path, monkeypatch) -> None:
+    """Three ACLs, three verdicts, and silence for the one that is correct.
+
+    The warnings this replaced could not tell a hardening step that failed from
+    a directory that is exposed, so they claimed the second whenever the first
+    happened. Reading the DACL back distinguishes them, and the cost of getting
+    it wrong is asymmetric: a false alarm on the common path teaches an operator
+    to ignore the log, and a missed one is the exposure itself."""
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    said: list[str] = []
+    monkeypatch.setattr(us, "log", said.append)
+
+    # What both mechanisms produce on a healthy host: protected, and naming only
+    # principals a private scratch legitimately carries.
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)\n")
+    us.report_scratch_privacy(tmp_path)
+    assert not said, f"a correct ACL produced a warning: {said}"
+
+    # An inherited entry for authenticated users, which is the measured shape of
+    # a general-purpose base and the case the whole change exists for.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:AI(A;OICI;FA;;;SY)(A;OICIID;0x1301bf;;;AU)\n")
+    us.report_scratch_privacy(tmp_path)
+    assert any("AU" in line for line in said), f"the intruding principal was not named: {said}"
+    assert any("can substitute a database" in line for line in said), (
+        f"the warning does not say what the exposure costs: {said}")
+
+    # Trusted principals only, but the DACL is not protected, so the base can
+    # still add one later. Silence here would report a privacy with a hole in it.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\n")
+    us.report_scratch_privacy(tmp_path)
+    assert any("still inherits" in line for line in said), (
+        f"an unprotected DACL was reported as private: {said}")
+
+    # And the honest answer when the ACL cannot be read at all, which is neither
+    # of the two verdicts above.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl", lambda path: None)
+    us.report_scratch_privacy(tmp_path)
+    assert any("unknown rather than confirmed" in line for line in said), (
+        f"an unreadable ACL was reported as a verdict: {said}")
 
 
 def test_an_unreadable_account_sid_is_not_written_into_an_acl(monkeypatch) -> None:

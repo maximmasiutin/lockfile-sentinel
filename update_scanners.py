@@ -1063,9 +1063,11 @@ def current_user_sid() -> str | None:
     Every failure returns None rather than raising, including the shapes a
     success can take that carry no answer. That is not defensiveness for its own
     sake: the caller's contract is to warn and continue when the SID cannot be
-    read, and a function that raises instead would break that contract from the
-    inside, at a point where the scratch directory exists and its cleanup has
-    not been armed yet."""
+    read, so raising instead would break that contract from the inside. The
+    caller now resolves this before it creates the scratch directory, precisely
+    so that the interval between creating and hardening holds no process spawn,
+    which means a raise here would abort the run before any directory exists
+    rather than leaking one."""
     code, output = run(["whoami", "/user", "/fo", "csv", "/nh"], timeout=30)
     if code != 0:
         return None
@@ -1156,16 +1158,22 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
     rather than two spawns, because the SID is resolved before the directory
     exists and passed in. That narrows the race; it does not end it. What ends it
     is the interpreter creating the directory protected in the first place, which
-    is why the supported floor for that guarantee is 3.12.4 rather than 3.12, and
-    why the caller refuses a scratch that is not empty once this returns: a fresh
-    directory with something already in it is one that somebody else reached
-    first."""
+    needs 3.12.4 or newer, a build carrying the guarded API set, and a filesystem
+    that holds ACLs. That is why the caller refuses a scratch that is not empty
+    once this returns, and why it reads the resulting ACL back rather than
+    inferring it: a fresh directory with something already in it is one somebody
+    else reached first, and a version number cannot tell you about the build or
+    the volume."""
     if not IS_WINDOWS:
         return
     if sid is None:
+        # Says what did not happen and stops there. Whether the directory is
+        # actually exposed is a separate question with a separate answer, and
+        # report_scratch_privacy reads the DACL to give it. Asserting the
+        # exposure here would be a false alarm on every current interpreter,
+        # where mkdir already protected the directory before this ran.
         log(f"WARNING: could not read this account's SID, so the scratch directory {path} "
-            "keeps the permissions it inherited from its parent. A local user with write "
-            "access there can substitute a database between the ClamAV gate and promotion.")
+            "was not hardened by this step.")
         return
     # /inheritance:r drops the inherited entries; /grant:r replaces rather than
     # adds, so a rerun is idempotent. The leading * marks each principal as a SID
@@ -1180,11 +1188,81 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
         timeout=60,
     )
     if code != 0:
-        log(f"WARNING: could not restrict the permissions on the scratch directory {path}, "
-            "which therefore keeps the ones it inherited from its parent. A local user with "
-            "write access there can substitute a database between the ClamAV gate and "
-            "promotion.")
+        log(f"WARNING: could not restrict the permissions on the scratch directory {path}. "
+            "Whether that leaves it exposed is reported separately, from the ACL itself.")
         echo(output, "icacls")
+
+
+# SDDL abbreviates the well-known principals, and these are the ones a private
+# scratch legitimately names. SY is SYSTEM and BA the administrators group, which
+# both mechanisms grant. OW is OWNER RIGHTS, which is what CPython's own
+# descriptor uses for the creating account, and LA the built-in administrator,
+# which is how a RID-500 account is spelled. CO is CREATOR OWNER, which appears
+# on some inherited layouts. Anything else holding an allow entry is somebody
+# this directory was not meant to be readable by.
+TRUSTED_SDDL_PRINCIPALS = frozenset({"SY", "BA", "OW", "LA", "CO"})
+
+
+def scratch_dacl(path: Path) -> str | None:
+    """The directory's DACL as SDDL, or None when it cannot be read.
+
+    Read rather than assumed, because the two mechanisms that can protect this
+    directory fail in different ways and neither reports it. Asking the
+    filesystem what the ACL actually says is the only answer that covers both,
+    and it is the difference between warning about an exposure and warning about
+    a step that did not run."""
+    handle, name = tempfile.mkstemp(prefix="scratch-acl-", suffix=".sddl")
+    os.close(handle)
+    saved = Path(name)
+    try:
+        code, _output = run(["icacls", str(path), "/save", str(saved)], timeout=60)
+        if code != 0 or not saved.exists():
+            return None
+        # UTF-16LE with no byte-order mark, so the plain "utf-16" codec, which
+        # looks for a mark, raises on it.
+        return saved.read_text(encoding="utf-16-le")
+    except OSError:
+        return None
+    finally:
+        saved.unlink(missing_ok=True)
+
+
+def report_scratch_privacy(path: Path) -> None:
+    """Say whether the scratch directory is actually private, from its own ACL.
+
+    This exists because the two earlier warnings could not tell the difference
+    between a hardening step that did not run and a directory that is exposed.
+    On any interpreter from 3.12.4 the directory was already protected by
+    `mkdir`, so a failure in the icacls step usually leaves nothing wrong, and
+    saying otherwise raised a security alarm that was false on the common path.
+    A scanner that cries wolf about its own staging is a scanner whose warnings
+    stop being read.
+
+    So nothing is said when the ACL is what it should be. What is said otherwise
+    names the principals actually found, because "somebody else can write here"
+    is only actionable if the operator can see who."""
+    if not IS_WINDOWS:
+        return
+    sddl = scratch_dacl(path)
+    if sddl is None:
+        log(f"WARNING: could not read the permissions on the scratch directory {path}, so "
+            "whether the staged database is private here is unknown rather than confirmed.")
+        return
+    # Every allow entry is (A;<flags>;<rights>;<object>;<inherit>;<principal>).
+    # A protected DACL is the other half: without the P flag the directory still
+    # inherits, so an entry can arrive after this check.
+    others = sorted({
+        match.group(1)
+        for match in re.finditer(r"\(A;[^;]*;[^;]*;[^;]*;[^;]*;([^)]+)\)", sddl)
+        if match.group(1) not in TRUSTED_SDDL_PRINCIPALS and not match.group(1).startswith("S-1-5-21-")
+    })
+    if others:
+        log(f"WARNING: the scratch directory {path} grants access to {', '.join(others)} as "
+            "well as this account, SYSTEM and the administrators. A local user with write "
+            "access there can substitute a database between the ClamAV gate and promotion.")
+    elif "D:P" not in sddl:
+        log(f"WARNING: the scratch directory {path} still inherits permissions from its base, "
+            "so an entry granted there later reaches the staged database.")
 
 
 @contextlib.contextmanager
@@ -1224,19 +1302,23 @@ def scratch_dir(label: str, near: Path | None = None):
 
     The mode is load-bearing on both platforms, for different reasons. Unix
     applies it directly. Windows applies it too, since the fix for
-    CVE-2024-4030, but only for exactly 0o700 and only where the interpreter is
-    3.12.4 or newer and the filesystem carries ACLs; outside those the directory
-    is created with the base's inherited permissions and nothing says so.
+    CVE-2024-4030, but only for exactly 0o700, only from 3.12.4, only on a build
+    carrying the API set the special case sits behind, and only on a filesystem
+    that holds ACLs; outside those the directory is created with the base's
+    inherited permissions and nothing says so.
 
     That distinction is the whole security story, and it is sharper than a
     fallback. Where the interpreter applies the mode, the directory is created
     protected by one call and there is no interval in which it is not. Where it
     does not, restrict_to_owner narrows the interval to a single icacls but
     cannot remove it, because Windows grants access when a handle is opened and
-    a later DACL does not revoke one already held. 3.12.4 on an ACL-bearing
-    volume is therefore the configuration in which the scratch is private, and
-    anything older is a configuration in which it is probably private. The
-    emptiness check below is what catches the cheap half of the difference."""
+    a later DACL does not revoke one already held.
+
+    Which of those happened is not knowable from the version alone, since the
+    build and the filesystem are conditions the interpreter does not report. So
+    the answer is read rather than inferred: report_scratch_privacy asks the
+    filesystem what the ACL says once both mechanisms have had their turn, and
+    the emptiness check above catches the cheap half of the remaining race."""
     # Where the cache really is, because that is the volume sized to hold it and
     # the one a promotion renames within. A cache path is symlinked precisely
     # when the databases have to live somewhere roomier, so the parent of the
@@ -1350,6 +1432,9 @@ def scratch_dir(label: str, near: Path | None = None):
                 f"holding {', '.join(intruders)}. Another account reached it before its "
                 "permissions were restricted, so nothing staged there can be trusted."
             )
+        # After both mechanisms have had their turn, and after the emptiness
+        # check, so the answer describes the directory the download will use.
+        report_scratch_privacy(path)
         yield path
     finally:
         # Not ignore_errors: this directory can hold a gigabyte, and a removal
