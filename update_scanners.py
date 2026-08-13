@@ -1216,6 +1216,38 @@ SDDL_ALIAS_FOR_SID = {
     "S-1-5-32-544": "BA",
 }
 
+# The bits in an access mask that let the holder change what is in a directory,
+# rather than only look at it: write data, append, write extended attributes and
+# attributes, delete a child, delete the object, and rewrite its owner or its
+# ACL. Reading alone is a smaller finding and gets a smaller sentence.
+SDDL_WRITE_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
+
+# The two-letter rights that include any of those. FA and GA are everything, FW
+# and GW are the write set, SD deletes, DC deletes a child, WD rewrites the ACL,
+# WO takes ownership, CC creates a child and DT deletes a tree.
+SDDL_WRITE_RIGHTS = frozenset({"FA", "GA", "FW", "GW", "SD", "DC", "WD", "WO", "CC", "DT"})
+
+
+def sddl_grants_write(rights: str) -> bool:
+    """Whether an SDDL rights field lets its holder change the directory.
+
+    Rights arrive in two spellings and both have to be read. A hexadecimal mask
+    is tested against the bits that matter; a run of two-letter codes is split
+    into pairs and tested against the set above. A mask that parses as neither is
+    reported as write, because guessing "read only" would turn an unreadable
+    entry into silence, and this function exists to stop the report claiming more
+    than it established rather than to start it claiming less."""
+    text = rights.strip()
+    if text.lower().startswith("0x"):
+        try:
+            return bool(int(text, 16) & SDDL_WRITE_MASK)
+        except ValueError:
+            return True
+    codes = {text[index:index + 2].upper() for index in range(0, len(text) - 1, 2)}
+    if not codes:
+        return True
+    return bool(codes & SDDL_WRITE_RIGHTS)
+
 
 def scratch_dacl(path: Path) -> str | None:
     """The directory's DACL as SDDL, or None when it cannot be read.
@@ -1361,16 +1393,34 @@ def report_scratch_privacy(path: Path, sid: str | None) -> None:
     #
     # A protected DACL is the other half: without the P flag the directory still
     # inherits, so an entry can arrive after this check.
-    others = sorted({
-        match.group(1)
-        for match in re.finditer(r"\((?:A|OA|XA|ZA);[^;]*;[^;]*;[^;]*;[^;]*;([^);]+)", sddl)
-        if match.group(1) not in trusted
-    })
-    if others:
-        log(f"WARNING: the scratch directory {path} grants access to {', '.join(others)} as "
-            "well as this account, SYSTEM and the administrators. A local user with write "
+    #
+    # The rights are read as well as the principal, because the two lead to
+    # different sentences. Every allow entry used to produce the substitution
+    # warning, so a read-only grant such as (A;OICI;GR;;;BU) was reported as an
+    # account that can replace the database, which it cannot. Overstating what
+    # was established is the same defect as understating it, and this warning
+    # exists precisely because the previous one overstated.
+    entries = [
+        (match.group(2), match.group(1))
+        for match in re.finditer(
+            r"\((?:A|OA|XA|ZA);[^;]*;([^;]*);[^;]*;[^;]*;([^);]+)", sddl)
+        if match.group(2) not in trusted
+    ]
+    writers = sorted({principal for principal, rights in entries if sddl_grants_write(rights)})
+    readers = sorted({principal for principal, rights in entries
+                      if not sddl_grants_write(rights)})
+    if writers:
+        log(f"WARNING: the scratch directory {path} grants write access to {', '.join(writers)} "
+            "as well as this account, SYSTEM and the administrators. A local user with write "
             "access there can substitute a database between the ClamAV gate and promotion.")
-    elif "D:P" not in sddl:
+    if readers:
+        log(f"WARNING: the scratch directory {path} is readable by {', '.join(readers)} as well "
+            "as this account, SYSTEM and the administrators. That does not let them replace the "
+            "staged database, so it is a smaller finding than a write grant, and it is still "
+            "not the private directory this step is meant to produce.")
+    if writers or readers:
+        return
+    if "D:P" not in sddl:
         log(f"WARNING: the scratch directory {path} still inherits permissions from its base, "
             "so an entry granted there later reaches the staged database.")
 

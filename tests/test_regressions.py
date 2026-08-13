@@ -331,12 +331,13 @@ def test_the_scratch_directory_does_not_keep_the_permissions_it_inherited(
     monkeypatch.setattr(us, "run", record)
 
     with us.scratch_dir("test", near=cache) as scratch:
-        # Selected by the option that identifies it rather than by position.
-        # report_scratch_privacy issues its own command against the same path
-        # before the yield, so acl[0] was the restriction command only because
-        # the two happen to run in that order, and a reordering would have
-        # failed this test against the wrong command with a message blaming the
-        # ACL rather than the sequence.
+        # Selected by the option that identifies it rather than by position, so
+        # that any other icacls call made against the same path inside the block
+        # cannot be mistaken for the restriction and fail this test with a
+        # message blaming the ACL rather than the ordering. Nothing issues one
+        # today — report_scratch_privacy reads the descriptor through
+        # GetNamedSecurityInfoW and spawns nothing — but it did when this was
+        # written, which is how the fragility was found.
         acl = [cmd for cmd in issued
                if cmd[0] == "icacls" and cmd[1] == str(scratch) and "/inheritance:r" in cmd]
 
@@ -383,7 +384,7 @@ def test_a_scratch_that_cannot_be_locked_down_says_so_and_still_runs(
 
 def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
         tmp_path, monkeypatch) -> None:
-    """Three ACLs, three verdicts, and silence for the one that is correct.
+    """Every shape the descriptor comes in, and silence for the ones that are correct.
 
     The warnings this replaced could not tell a hardening step that failed from
     a directory that is exposed, so they claimed the second whenever the first
@@ -468,6 +469,37 @@ def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
     us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
     assert any("LS" in line for line in said), (
         f"a service account's grant went unreported for a different process: {said}")
+
+    # A read-only grant. Every allow entry used to produce the substitution
+    # warning regardless of its rights, so a group that can only look at the
+    # directory was reported as able to replace the database. Overstating what
+    # was established is the same defect as understating it, and this warning
+    # replaced one that overstated.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;GR;;;BU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("readable by" in line and "BU" in line for line in said), (
+        f"a read-only grant was not reported at all: {said}")
+    assert not any("can substitute a database" in line for line in said), (
+        f"a read-only grant was reported as able to replace the database: {said}")
+
+    # The hexadecimal spelling of the same distinction, since a mask is what an
+    # inherited entry usually carries: 0x1200a9 is read and execute, and
+    # 0x1301bf is the modify set.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert not any("can substitute a database" in line for line in said), (
+        f"a read-only mask was reported as write access: {said}")
+
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"a modify mask was not reported as write access: {said}")
 
     # And the honest answer when the ACL cannot be read at all, which is neither
     # of the two verdicts above.
