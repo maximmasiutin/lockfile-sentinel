@@ -300,6 +300,651 @@ def test_the_gate_still_refuses_when_there_is_nothing_to_scan(tmp_path: Path) ->
     assert us.gate(tmp_path / "absent", "a missing artifact", skip=False) is False
 
 
+def test_the_scratch_directory_does_not_keep_the_permissions_it_inherited(
+        tmp_path, monkeypatch) -> None:
+    """The lockdown is issued for the directory that was just created, and drops inheritance.
+
+    Where the mode does not reach the filesystem — an interpreter older than
+    3.12.4, a mode other than exactly 0o700, an API-set build, a volume without
+    ACLs — the staged database sits in a directory a general-purpose base grants
+    modify on to every authenticated user. The gate scans the staged tree and the
+    promotion installs it, and between those two a local user could replace an
+    approved database with one nothing scanned, which is a gate passing what it
+    did not read by a route that does not go through the gate at all.
+
+    This one pins the command rather than the outcome, so it runs everywhere.
+    Do not read it as evidence that the directory ends up private: the tests
+    further down cover that, and one of them explains why the outcome is already
+    delivered by CPython on a current build."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    monkeypatch.setattr(us, "current_user_sid", lambda: "S-1-5-21-1-2-3-1001")
+    issued: list[list[str]] = []
+
+    def record(cmd, **_kwargs):
+        issued.append(cmd)
+        return 0, ""
+
+    monkeypatch.setattr(us, "run", record)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        # Selected by the option that identifies it rather than by position, so
+        # that any other icacls call made against the same path inside the block
+        # cannot be mistaken for the restriction and fail this test with a
+        # message blaming the ACL rather than the ordering. Nothing issues one
+        # today — report_scratch_privacy reads the descriptor through
+        # GetNamedSecurityInfoW and spawns nothing — but it did when this was
+        # written, which is how the fragility was found.
+        acl = [cmd for cmd in issued
+               if cmd[0] == "icacls" and cmd[1] == str(scratch) and "/inheritance:r" in cmd]
+
+    assert acl, f"the scratch directory kept its inherited ACL: {issued}"
+    granted = {acl[0][index + 1] for index, arg in enumerate(acl[0]) if arg == "/grant:r"}
+    assert granted == {
+        "*S-1-5-21-1-2-3-1001:(OI)(CI)F",
+        "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F",
+    }, f"the replacement ACL is not this account, SYSTEM and administrators: {granted}"
+
+
+def test_a_scratch_that_cannot_be_locked_down_says_so_and_still_runs(
+        tmp_path, monkeypatch) -> None:
+    """The warning reports the step that did not run, and claims nothing beyond it.
+
+    Raising would stop the databases updating on any host where icacls is
+    unavailable, and a stale vulnerability database is the larger everyday risk
+    than a staging window that needs a second local account to exploit. What must
+    not happen is the silent version, where the run reports success and nothing
+    records that the hardening step failed.
+
+    What must also not happen is the opposite, which this originally did: the
+    warning asserted that the directory kept its inherited permissions and that a
+    local user could substitute a database. On any interpreter from 3.12.4 that
+    is false, because mkdir already protected the directory, so the alarm fired
+    on the common path and was wrong. Whether the directory is exposed is a
+    different question from whether this step ran, and it is answered from the
+    ACL by report_scratch_privacy instead."""
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "current_user_sid", lambda: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (1, "Access is denied."))
+    said: list[str] = []
+    monkeypatch.setattr(us, "log", said.append)
+
+    us.restrict_to_owner(tmp_path, "S-1-5-21-1-2-3-1001")
+
+    assert any("WARNING" in line for line in said), f"the failure was not reported: {said}"
+    assert any("could not restrict the permissions" in line for line in said), (
+        f"the warning does not name the step that failed: {said}")
+    assert not any("can substitute a database" in line for line in said), (
+        f"the warning asserts an exposure it has not established: {said}")
+
+
+def test_the_scratch_privacy_report_reads_the_acl_rather_than_assuming_it(
+        tmp_path, monkeypatch) -> None:
+    """Every shape the descriptor comes in, and silence for the ones that are correct.
+
+    The warnings this replaced could not tell a hardening step that failed from
+    a directory that is exposed, so they claimed the second whenever the first
+    happened. Reading the DACL back distinguishes them, and the cost of getting
+    it wrong is asymmetric: a false alarm on the common path teaches an operator
+    to ignore the log, and a missed one is the exposure itself."""
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    said: list[str] = []
+    monkeypatch.setattr(us, "log", said.append)
+
+    # What both mechanisms produce on a healthy host: protected, and naming only
+    # principals a private scratch legitimately carries.
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert not said, f"a correct ACL produced a warning: {said}"
+
+    # This account named by its raw SID, which is how SDDL spells an ordinary
+    # account, is the same correct outcome and must also be silent.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert not said, f"this account's own entry produced a warning: {said}"
+
+    # And the case the first version of this check let through in silence. Every
+    # ordinary account's SID begins S-1-5-21, so exempting that prefix exempted
+    # everybody: a DACL granting a different user full control passed without a
+    # word, in exactly the situation the whole change exists to report.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-9-9-9-1055)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("S-1-5-21-9-9-9-1055" in line for line in said), (
+        f"another account's full control went unreported: {said}")
+
+    # An inherited entry for authenticated users, which is the measured shape of
+    # a general-purpose base and the case the whole change exists for.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:AI(A;OICI;FA;;;SY)(A;OICIID;0x1301bf;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("AU" in line for line in said), f"the intruding principal was not named: {said}"
+    assert any("can substitute a database" in line for line in said), (
+        f"the warning does not say what the exposure costs: {said}")
+
+    # Trusted principals only, but the DACL is not protected, so the base can
+    # still add one later. Silence here would report a privacy with a hole in it.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("still inherits" in line for line in said), (
+        f"an unprotected DACL was reported as private: {said}")
+
+    # A conditional entry, which SDDL spells XA rather than A. Matching only A
+    # made a DACL handing another account full control read as empty, which is
+    # the same false silence the S-1-5-21 exemption produced, by a second route.
+    said.clear()
+    monkeypatch.setattr(
+        us, "scratch_dacl",
+        lambda path: 'd\nD:P(A;OICI;FA;;;SY)(XA;;FA;;;S-1-5-21-9-9-9-1055;(Title=="PM"))\n')
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("S-1-5-21-9-9-9-1055" in line for line in said), (
+        f"a conditional grant to another account went unreported: {said}")
+
+    # A service account reading its own directory. whoami answers S-1-5-19 and
+    # the descriptor abbreviates it to LS, so matching the numeric SID alone
+    # reported the process as an intruder in the scratch it had just created.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;LS)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-19")
+    assert not said, f"the process reported its own service account as an intruder: {said}"
+
+    # The same alias when it is not this account is still an intruder, because
+    # LocalService being the process is a different fact from LocalService
+    # holding a grant on somebody else's directory.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;LS)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("LS" in line for line in said), (
+        f"a service account's grant went unreported for a different process: {said}")
+
+    # A read-only grant. Every allow entry used to produce the substitution
+    # warning regardless of its rights, so a group that can only look at the
+    # directory was reported as able to replace the database. Overstating what
+    # was established is the same defect as understating it, and this warning
+    # replaced one that overstated.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;GR;;;BU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("readable by" in line and "BU" in line for line in said), (
+        f"a read-only grant was not reported at all: {said}")
+    assert not any("can substitute a database" in line for line in said), (
+        f"a read-only grant was reported as able to replace the database: {said}")
+
+    # The hexadecimal spelling of the same distinction, since a mask is what an
+    # inherited entry usually carries: 0x1200a9 is read and execute, and
+    # 0x1301bf is the modify set.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert not any("can substitute a database" in line for line in said), (
+        f"a read-only mask was reported as write access: {said}")
+
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"a modify mask was not reported as write access: {said}")
+
+    # An unmapped generic bit, which the hexadecimal branch has to weigh even
+    # though the letter branch never produces one: GA and GW are translated to
+    # their file equivalents, but a mask spelled out in hex keeps whatever it was
+    # written with, and an inherit-only entry keeps its generic bits until it is
+    # inherited. GENERIC_WRITE here alongside a harmless list bit, so nothing but
+    # the generic bit can carry the verdict.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x40000001;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an unmapped GENERIC_WRITE was reported as read-only: {said}")
+
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;0x10000000;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an unmapped GENERIC_ALL was reported as read-only: {said}")
+
+    # The object-rights mnemonics, whose letters describe a directory-service
+    # object and whose bits mean something else on a filesystem directory. The
+    # first version of this check kept a list of "write" letters and got both of
+    # these the wrong way round: CC reads as create-child and is 0x1, which only
+    # lists, while LC reads as list-children and is 0x4, which adds a
+    # subdirectory. One of them was a false alarm and the other a false silence.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;LC;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"LC adds a subdirectory and was not reported as write access: {said}")
+
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;CC;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("readable by" in line for line in said), (
+        f"CC only lists the directory and was not reported at all: {said}")
+    assert not any("can substitute a database" in line for line in said), (
+        f"CC only lists the directory and was reported as write access: {said}")
+
+    # A letter pair that is not a right at all reads as write, because an entry
+    # nobody can parse must not become silence.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;ZZ;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an unparseable rights field was treated as harmless: {said}")
+
+    # And an odd number of letters, which is the same malformation arriving in a
+    # shape that used to parse. The pairs were cut one short of the end, so the
+    # trailing character was dropped without a word and CCD read as CC alone: a
+    # field nobody could parse became a read-only verdict rather than a warning.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl",
+                        lambda path: "d\nD:P(A;OICI;FA;;;SY)(A;OICI;CCD;;;AU)\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("can substitute a database" in line for line in said), (
+        f"an odd-length rights field had its last character dropped: {said}")
+
+    # A NULL DACL, which grants every account full access and which Windows
+    # writes as a token rather than as entries. With nothing for the parser to
+    # find, both lists came back empty, and the protected flag then silenced the
+    # inheritance branch as well, so the most exposed directory a filesystem can
+    # hold produced no warning at all.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl", lambda path: "d\nD:PNO_ACCESS_CONTROL\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("no access control list at all" in line for line in said), (
+        f"a NULL DACL was reported as private: {said}")
+    assert any("can substitute a database" in line for line in said), (
+        f"a NULL DACL was not reported as write exposure: {said}")
+
+    # And the unprotected spelling of the same thing, which would otherwise have
+    # been reported as merely inheriting.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl", lambda path: "d\nD:NO_ACCESS_CONTROL\n")
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("no access control list at all" in line for line in said), (
+        f"a NULL DACL was reported as an inheritance problem: {said}")
+
+    # And the honest answer when the ACL cannot be read at all, which is neither
+    # of the two verdicts above.
+    said.clear()
+    monkeypatch.setattr(us, "scratch_dacl", lambda path: None)
+    us.report_scratch_privacy(tmp_path, "S-1-5-21-1-2-3-1001")
+    assert any("unknown rather than confirmed" in line for line in said), (
+        f"an unreadable ACL was reported as a verdict: {said}")
+
+
+def test_an_unreadable_account_sid_is_not_written_into_an_acl(monkeypatch) -> None:
+    """Whatever whoami printed must not be pasted into a grant unexamined.
+
+    A blank or error line parsed as a principal would either fail the icacls call
+    or, worse, name something other than this account. The prefix test this
+    originally used accepted "S-1-" followed by anything, which is not a SID and
+    is not what the docstring promised to discard."""
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, '"CORP\\alice","S-1-5-21-9-8-7-500"\n'))
+    assert us.current_user_sid() == "S-1-5-21-9-8-7-500"
+
+    for output in ("ERROR: something went wrong\n", "S-1-\n", "S-1-5\n", '"CORP\\alice","S-1-x-y"\n'):
+        monkeypatch.setattr(us, "run", lambda cmd, _o=output, **_kwargs: (0, _o))
+        assert us.current_user_sid() is None, f"accepted {output!r} as a SID"
+
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (1, ""))
+    assert us.current_user_sid() is None
+
+
+def test_a_whoami_that_succeeds_and_says_nothing_does_not_raise(monkeypatch) -> None:
+    """Exit 0 with no output is a success carrying no answer, not an impossibility.
+
+    The first version indexed the last line of the output unconditionally, so
+    this input raised IndexError from inside a function whose whole contract is
+    to return None when the SID cannot be read. A redirected or policy-restricted
+    whoami produces exactly this."""
+    for output in ("", "   ", "\n", " \r\n \n"):
+        monkeypatch.setattr(us, "run", lambda cmd, _o=output, **_kwargs: (0, _o))
+        assert us.current_user_sid() is None, f"raised or accepted on {output!r}"
+
+
+def test_an_unreadable_sid_warns_and_still_produces_a_usable_scratch(
+        tmp_path, monkeypatch) -> None:
+    """The whole path with the real parser in it, rather than stubbed past.
+
+    The command-level test above monkeypatches current_user_sid out, which is
+    exactly why the suite did not catch the crash: it fed run the empty output
+    that used to raise and then arranged for the parser never to see it. Here
+    the empty output reaches the real parser, and the run has to survive it."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, ""))
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert scratch.is_dir()
+    assert not scratch.exists(), f"the scratch directory was left behind at {scratch}"
+
+
+def test_a_raising_hardening_step_does_not_leak_the_scratch_directory(
+        tmp_path, monkeypatch) -> None:
+    """The placement half of the fix, which the test above cannot reach.
+
+    restrict_to_owner sat between the mkdir and the try whose finally removes
+    the directory, so anything raising there left a directory behind that
+    nothing else deletes: the name is random by design, so no later run
+    recognises it as garbage. Fixing the parser stopped the raise that was
+    known about, which is why the test above passes either way and would go on
+    passing if the call moved back outside the try. This one injects a raise
+    directly, so it pins the placement rather than the parser, and it fails on
+    any future step added in the same wrong place."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    monkeypatch.setattr(us.secrets, "token_hex", lambda _n: "fixedname")
+
+    def refuse(_path, _sid):
+        raise RuntimeError("the ACL could not be rewritten")
+
+    monkeypatch.setattr(us, "restrict_to_owner", refuse)
+
+    with pytest.raises(RuntimeError, match="the ACL could not be rewritten"):
+        with us.scratch_dir("test", near=cache):
+            pytest.fail("the body must not run when the hardening step raised")
+
+    leaked = cache.parent / "temp-fixedname"
+    assert not leaked.exists(), f"the scratch directory was left behind at {leaked}"
+
+
+def test_a_scratch_that_someone_else_reached_first_is_refused(tmp_path, monkeypatch) -> None:
+    """A fresh scratch with anything in it was not fresh, and must not be staged into.
+
+    Where the interpreter does not apply mode 0o700 — older than 3.12.4, an
+    API-set build, a volume without ACLs — the directory exists with the base's
+    permissions until icacls rewrites them. An account watching the base is
+    handed the name by the filesystem the moment it appears, so the random name
+    does not help, and it can create a child inside that interval. icacls
+    without /T does not touch that child, and the staging path adopts what it
+    finds with exist_ok=True, so a hostile file would be carried through the
+    ClamAV gate as though it had been downloaded.
+
+    Refusing is the only safe answer, and it is cheap: nothing else can be in a
+    directory created exclusively a moment earlier. This does not close the race
+    — a handle opened during the interval keeps its access whatever the DACL
+    says afterwards — and the docstrings say so rather than implying otherwise."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    monkeypatch.setattr(us, "current_user_sid", lambda: "S-1-5-21-1-2-3-1001")
+
+    # Stand in for the attacker: the lockdown step is where the interval ends, so
+    # a child appearing during it is a child that was created inside it.
+    def plant(path, _sid):
+        (path / "cache").mkdir()
+
+    monkeypatch.setattr(us, "restrict_to_owner", plant)
+
+    with pytest.raises(RuntimeError, match="was not empty immediately after being created"):
+        with us.scratch_dir("test", near=cache):
+            pytest.fail("the body must not run on a scratch someone else reached first")
+
+
+def _sddl_of(path: Path, into: Path) -> str:
+    """The directory's own DACL as SDDL, or a skip if icacls cannot be used.
+
+    Read as SDDL rather than from the display listing, because `icacls <dir>`
+    prints principal names in the system's language: asserting that the English
+    "Authenticated Users" is absent passes on a localised Windows whether the
+    directory is shared or not, which is a security check that stops checking
+    and does not say so. The /save form writes fixed aliases instead — AU for
+    Authenticated Users, BU for the built-in Users group — and those do not move
+    with the locale.
+
+    /findsid is not the alternative it appears to be: it searches the files
+    inside a directory rather than that directory's own ACL, and on a directory
+    carrying an inherited AU entry it reports no match at all."""
+    code, output = us.run(["icacls", str(path), "/save", str(into)], timeout=60)
+    if code != 0 or not into.exists():
+        pytest.skip(f"icacls /save is not usable here: {output}")
+    # UTF-16LE with no byte-order mark, so it cannot be read as plain "utf-16":
+    # that codec looks for a mark and raises without one.
+    return into.read_text(encoding="utf-16-le")
+
+
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this reads exists only on Windows")
+def test_the_dacl_reader_actually_reads_a_dacl(tmp_path) -> None:
+    """The real reader against real directories, because a stub proved nothing.
+
+    Every other test of the privacy report monkeypatches scratch_dacl, and the
+    end-to-end tests read ACLs through their own icacls helper, so nothing
+    exercised this function. A rewrite of it shipped broken and the whole suite
+    stayed green: it answered None for every directory, which the report then
+    faithfully turned into "permissions unknown". A verifier that cannot verify
+    is the quietest kind of failure, so this asserts it can.
+
+    Two directories, distinguished by the flag that matters, so a reader that
+    returned a constant or the same answer for both fails here.
+
+    The protected one is made protected with icacls rather than with
+    mkdir(mode=0o700), which is the obvious way and the wrong one. This very
+    change documents four configurations in which the interpreter does not apply
+    that mode — 3.12.0 to 3.12.3, a mode other than exactly 0o700, an API-set
+    build, a volume without ACLs — and three of them are supported here. A test
+    asserting the mode worked would therefore fail on a configuration where
+    nothing is wrong and the reader is fine, which is the same conditional-read-
+    as-universal mistake this branch has made repeatedly. icacls either works or
+    reports that it did not, and the skip says which."""
+    inherited = tmp_path / "inherited"
+    inherited.mkdir()
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    # This account is granted alongside SYSTEM, rather than SYSTEM alone. The
+    # first version named only SYSTEM, which does protect the directory and also
+    # leaves the account running the tests unable to delete it, so pytest could
+    # not clear its own temporary tree and every run left one behind. What this
+    # case needs is a protected DACL, not an inaccessible one.
+    #
+    # Skipped rather than falling back to the administrators group when the SID
+    # cannot be read. The fallback looked harmless and was not: on a
+    # non-administrator account icacls would still succeed at removing this
+    # account's own access, and the test would then be locked out of the
+    # directory it just made instead of reporting that the setup is unavailable.
+    sid = us.current_user_sid()
+    if sid is None:
+        pytest.skip("this account's SID could not be read, so the fixture cannot be built safely")
+    code, output = us.run(
+        ["icacls", str(protected), "/inheritance:r",
+         "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", f"*{sid}:(OI)(CI)F"],
+        timeout=60)
+    if code != 0:
+        pytest.skip(f"cannot protect a directory here, so the reader cannot be told apart: {output}")
+    # And read back with the other reader before trusting the exit status, because
+    # a zero from icacls says the command was accepted, not that the filesystem
+    # kept what it accepted. On a volume that carries no ACLs — the exFAT case
+    # this whole change warns about rather than refuses — the descriptor is
+    # discarded and the D:P assertion below would then blame scratch_dacl for a
+    # fixture the test could not build. Checked with the icacls reader rather
+    # than with scratch_dacl, so that the thing under test is not also the thing
+    # certifying its own input.
+    if "D:P" not in _sddl_of(protected, tmp_path / "fixture.sddl"):
+        pytest.skip("this volume did not keep a protected DACL, so the two cases are not distinct")
+
+    inherited_sddl = us.scratch_dacl(inherited)
+    protected_sddl = us.scratch_dacl(protected)
+
+    assert inherited_sddl is not None, "the reader could not read an ordinary directory"
+    assert protected_sddl is not None, "the reader could not read a protected directory"
+    assert inherited_sddl.startswith("D:"), f"not a DACL: {inherited_sddl}"
+    assert "D:P" in protected_sddl, (
+        f"a directory icacls protected did not read back as protected: {protected_sddl}")
+    assert "D:P" not in inherited_sddl, (
+        f"an inherited directory read back as protected: {inherited_sddl}")
+
+
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="reparse points are a Windows shape")
+def test_a_junction_left_where_the_scratch_was_is_recognised_as_a_link(tmp_path) -> None:
+    """Path.is_symlink() answers False for a junction, so the scratch check cannot use it.
+
+    An account that can delete the scratch during the window before the ACL is
+    rewritten can leave a link at the same name, and everything after that point
+    would describe and fill a directory somewhere else. A junction is the form
+    that needs no privilege to create, and it is exactly the form is_symlink()
+    misses, so a check written the obvious way would have covered only the attack
+    that needs Developer Mode."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    junction = tmp_path / "junction"
+    made, output = us.run(["cmd", "/c", "mklink", "/J", str(junction), str(victim)], timeout=60)
+    if made != 0:
+        pytest.skip(f"cannot create a junction here: {output}")
+
+    assert not junction.is_symlink(), (
+        "is_symlink() now reports junctions, so the comment explaining this check is stale")
+    assert us.is_reparse_point(junction), "a junction was taken for the scratch directory itself"
+    assert not us.is_reparse_point(plain), "an ordinary directory was refused as a link"
+
+
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
+def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_path) -> None:
+    """The only test here that can fail if restrict_to_owner stops working.
+
+    Everything else about the scratch directory is now done by CPython itself:
+    since the fix for CVE-2024-4030, mkdir(mode=0o700) creates a protected DACL
+    on Windows, so a scratch is private before restrict_to_owner is reached and
+    an end-to-end assertion about its permissions passes on an empty
+    implementation. restrict_to_owner exists for the cases where that mechanism
+    is silently absent — an interpreter older than 3.12.4, a mode other than
+    exactly 0o700, an API-set build, a filesystem without ACLs — and none of
+    those can be produced inside a test on this host.
+
+    So the function is exercised directly, against a directory deliberately
+    created the way those cases leave it: with the default mode, inheriting a
+    base that grants Authenticated Users."""
+    # Resolved once, up front, and the case skipped when it is missing. Reading
+    # it inline at the call below made this test assert the opposite of what the
+    # code does: with no SID, restrict_to_owner takes its documented path of
+    # warning and leaving the ACL alone, so the inherited Authenticated Users
+    # grant stays and every assertion here fails on behaviour that is correct.
+    sid = us.current_user_sid()
+    if sid is None:
+        pytest.skip("this account's SID could not be read, which is the graceful path, not this one")
+
+    base = tmp_path / "shared-base"
+    base.mkdir()
+    seeded, seed_output = us.run(
+        ["icacls", str(base), "/grant", "*S-1-5-11:(OI)(CI)M"], timeout=60)
+    if seeded != 0:
+        pytest.skip(f"cannot seed a shared base here: {seed_output}")
+
+    # No mode, so CPython creates it with the inherited ACL rather than its own
+    # protected one. This is the state restrict_to_owner has to be able to fix.
+    shared = base / "created-without-the-mode"
+    shared.mkdir()
+    before = _sddl_of(shared, tmp_path / "before.sddl")
+    # Skipped rather than asserted, because this is the fixture rather than the
+    # subject. icacls returning zero says the grant was accepted, and on a volume
+    # that holds no ACLs it is accepted and discarded; failing here would then
+    # report a regression in restrict_to_owner on a host where the shared
+    # directory it is asked to fix could not be created in the first place.
+    if ";AU)" not in before:
+        pytest.skip(f"the base did not share, so there is nothing here to privatise: {before}")
+
+    us.restrict_to_owner(shared, sid)
+
+    after = _sddl_of(shared, tmp_path / "after.sddl")
+    assert ";AU)" not in after, f"authenticated users can still write it: {after}"
+    assert ";BU)" not in after, f"the users group can still read it: {after}"
+    # P marks the DACL protected, which is what /inheritance:r sets. Without it
+    # the grants would sit on top of whatever the base still passes down.
+    assert "D:P" in after, f"the directory still inherits from its base: {after}"
+
+    # The three absences above are satisfied by a protected DACL with no entries
+    # at all, which locks this account out of its own staging directory and
+    # fails the download rather than the test. Removing access is as much a
+    # defect as leaving it, so the grants are asserted rather than assumed.
+    # SYSTEM and the administrators group are asserted by their SDDL aliases,
+    # which are fixed. The account's own entry is deliberately not asserted as
+    # text: SDDL abbreviates a well-known SID and spells out any other, so one
+    # working ACL reads as the raw S-1-5-21-...-1001 on a workstation whose
+    # account is an ordinary user, and as LA on a CI runner whose account is the
+    # built-in administrator at RID 500. The first version of this test pinned
+    # the raw SID, passed here and failed on both Windows runners while nothing
+    # was wrong, which is the same mistake as reading localised principal names
+    # out of the display listing.
+    assert "(A;OICI;FA;;;SY)" in after, f"SYSTEM lost full control: {after}"
+    assert "(A;OICI;FA;;;BA)" in after, f"the administrators group lost full control: {after}"
+    # No count of the entries here. Requiring three was meant to catch a
+    # protected but empty DACL, which the two assertions above already exclude,
+    # and it fails under an account that is itself one of the principals
+    # granted: as LocalSystem the account grant and the SYSTEM grant collapse
+    # into one entry, so a correct ACL carries two and the test failed on a
+    # directory with nothing wrong with it.
+
+    # The account's own access is claimed from the other side instead, which is
+    # the stronger half anyway: an ACL that reads correctly and denies in
+    # practice is the failure no string comparison can see.
+    (shared / "written-after-lockdown").write_text("staged", encoding="utf-8")
+
+
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
+def test_a_scratch_directory_ends_up_private_whichever_mechanism_did_it(
+        tmp_path, monkeypatch) -> None:
+    """The property that matters, without claiming which step delivered it.
+
+    On a current interpreter and an ACL-bearing filesystem this passes because
+    mkdir(mode=0o700) already produced a protected DACL, so it would pass with
+    restrict_to_owner removed entirely. That is stated rather than hidden: the
+    test pins the outcome a caller depends on, and the test above pins the
+    function that has to deliver it everywhere else."""
+    base = tmp_path / "shared-base"
+    base.mkdir()
+    seeded, seed_output = us.run(
+        ["icacls", str(base), "/grant", "*S-1-5-11:(OI)(CI)M"], timeout=60)
+    if seeded != 0:
+        pytest.skip(f"cannot seed a shared base here: {seed_output}")
+
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", str(base))
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert scratch.parent == base, f"the scratch did not land on the seeded base: {scratch}"
+        # A download has to be able to write here, whichever mechanism set the
+        # ACL. The grants are not asserted by name because the two mechanisms
+        # spell them differently — CPython's descriptor grants OWNER RIGHTS,
+        # restrict_to_owner grants this account's SID — and pinning either would
+        # make the test fail on the wrong build rather than on a real defect.
+        (scratch / "staged.db").write_text("staged", encoding="utf-8")
+        sddl = _sddl_of(scratch, tmp_path / "scratch.sddl")
+
+    assert ";AU)" not in sddl, f"the staged database sits somewhere shared: {sddl}"
+    assert ";BU)" not in sddl, f"the staged database sits somewhere shared: {sddl}"
+    assert "D:P" in sddl, f"the scratch still inherits from its base: {sddl}"
+
+
 # --------------------------------------------------------------------------
 # Fails silently: work reported as done that was never done.
 # --------------------------------------------------------------------------

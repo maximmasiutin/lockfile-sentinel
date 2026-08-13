@@ -1047,6 +1047,494 @@ def promote_into(staged: Path, live: Path) -> None:
     shutil.rmtree(previous, ignore_errors=True)
 
 
+def current_user_sid() -> str | None:
+    """Return the SID of the account this process runs as, or None if it cannot be read.
+
+    The SID rather than the name, because a name has to be qualified by a domain
+    to be unambiguous and the environment variables that would supply one are
+    both spoofable and absent under some service accounts. A SID needs no
+    qualification and is what the ACL stores anyway.
+
+    `whoami` is asked rather than the Win32 token API because the answer is one
+    line of CSV and the alternative is forty lines of ctypes around
+    OpenProcessToken and ConvertSidToStringSidW for a value that does not change
+    during a run. The cost is a process; this is called once per scratch.
+
+    Every failure returns None rather than raising, including the shapes a
+    success can take that carry no answer. That is not defensiveness for its own
+    sake: the caller's contract is to warn and continue when the SID cannot be
+    read, so raising instead would break that contract from the inside. The
+    caller now resolves this before it creates the scratch directory, precisely
+    so that the interval between creating and hardening holds no process spawn,
+    which means a raise here would abort the run before any directory exists
+    rather than leaking one."""
+    code, output = run(["whoami", "/user", "/fo", "csv", "/nh"], timeout=30)
+    if code != 0:
+        return None
+    # Exit 0 with nothing on stdout is not a contradiction worth trusting: a
+    # redirected or policy-restricted whoami can succeed and print nothing, and
+    # indexing the last line of no lines would raise where the caller expects a
+    # None it can warn about.
+    lines = output.strip().splitlines()
+    if not lines:
+        return None
+    # "DOMAIN\\user","S-1-5-21-...". The SID is the last quoted field, and taking
+    # it from the end rather than by index survives a user name containing a comma.
+    sid = lines[-1].split(",")[-1].strip().strip('"')
+    # A full shape rather than a prefix. "S-1-" alone passes a startswith test and
+    # is not a SID, and while icacls would merely reject it — run passes an
+    # argument list, so nothing here reaches a shell — a check that admits what
+    # the docstring says it discards is a claim the code does not keep.
+    return sid if re.fullmatch(r"S-1-\d+(?:-\d+)+", sid) else None
+
+
+def is_reparse_point(path: Path) -> bool:
+    """Whether this name is a link of some kind rather than the directory itself.
+
+    The attribute rather than `Path.is_symlink()`, which answers False for a
+    junction. Measured on 3.13: a junction reports `is_symlink()` False with the
+    reparse attribute set and tag 0xa0000003, while a symbolic link reports both.
+    That is the wrong way round for a check like this. Creating a symbolic link
+    needs SeCreateSymbolicLinkPrivilege or Developer Mode, while a junction needs
+    nothing beyond write access to the parent, so the attack any account can
+    mount is precisely the one `is_symlink()` would have waved through.
+
+    False off Windows, where there is no such attribute and where the scratch
+    base is not the shared directory this guards against."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(os.lstat(path).st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        # A name that cannot be stat'd is not a name this program should stage
+        # a database through, so the conservative answer is the same as for a
+        # link: refuse it rather than continue on an unread directory.
+        return True
+
+
+def restrict_to_owner(path: Path, sid: str | None) -> None:
+    """Cut a Windows directory's inherited ACL down to this account, SYSTEM and administrators.
+
+    `sid` is resolved by the caller before the directory exists, deliberately.
+    Resolving it here put a process spawn inside the interval between creating
+    the directory and restricting it, which is the interval an attacker uses.
+
+    This is a backstop, not the primary mechanism, and the distinction is the
+    whole reason it is worth its two subprocesses. Since the fix for
+    CVE-2024-4030, CPython special-cases `mkdir(mode=0o700)` on Windows and
+    creates the directory with
+    `D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)`, which is already
+    private. So on a current interpreter, on NTFS, the mode has done this job
+    before this function runs and it finds nothing to fix. An earlier version of
+    this docstring claimed Windows ignores the mode. That was true once and is
+    not now, and the claim survived because the measurement behind it read the
+    permissions of the scratch *base* rather than of a directory Python had
+    actually created.
+
+    What is left is the set of cases where that mechanism is silently absent,
+    and the silence is what makes them worth covering:
+
+      * Version. The fix shipped in 3.12.4, and this program supports 3.12 or
+        newer, so 3.12.0 through 3.12.3 are in range and create the directory
+        with the inherited ACL instead.
+      * Mode. CPython tests `mode == 0700` for exact equality and ignores every
+        other value, so editing that literal to anything else, however
+        reasonable-looking, drops the protection without a word.
+      * Build. The special case sits behind an API-set guard, and CPython's own
+        comment says that where those APIs are missing it has "no choice but to
+        silently create a directory with default ACL".
+      * Filesystem. `CreateDirectoryW` accepts the security attributes and
+        discards them on a filesystem that does not carry ACLs. That one is not
+        hypothetical here: scratch_dir deliberately hunts for a volume with
+        room, which is how a download ends up on an exFAT external disk or a
+        network share.
+
+    None of those raise. Each leaves the staged database in a directory the
+    base's ACL governs, during the window between the ClamAV gate approving it
+    and the promotion installing it, which is a local user's opportunity to
+    substitute a database nothing scanned.
+
+    The three grants match what CPython's own descriptor grants, less the
+    substitution of this account's SID for OWNER RIGHTS, so a directory that
+    took either path ends up with the same access. Dropping the administrators
+    group would buy nothing, since an administrator can take ownership and
+    rewrite the ACL regardless, and it would cost an operator the ability to
+    clear a leaked scratch left by a scheduled task running as another account.
+
+    A failure warns rather than raises. The exposure this closes needs a second
+    local account to exploit, while raising would stop the databases updating at
+    all on any host where `icacls` is unavailable or the account cannot rewrite
+    the ACL, and a stale vulnerability database is the larger everyday risk. The
+    warning names what did not happen so the log says so plainly instead of the
+    docstring quietly promising a privacy the run did not obtain.
+
+    What this does not do is close the race, and an earlier version of this
+    docstring said otherwise. It claimed the gap between `mkdir` and the rewrite
+    was microseconds and that the random name left nobody able to wait for it.
+    Both halves were wrong. The gap included a `whoami` process spawn, which is
+    milliseconds rather than microseconds, and the name defeats predicting the
+    path rather than learning it: an account watching the base is handed the name
+    by ReadDirectoryChangesW the moment the directory appears. Worse, Windows
+    checks access when a handle is opened, so tightening the DACL afterwards does
+    not revoke a handle already opened against the permissive one.
+
+    So the ordering is now the caller's job and the window is one `icacls` call
+    rather than two spawns, because the SID is resolved before the directory
+    exists and passed in. That narrows the race; it does not end it. What ends it
+    is the interpreter creating the directory protected in the first place, which
+    needs 3.12.4 or newer, a build carrying the guarded API set, and a filesystem
+    that holds ACLs. That is why the caller refuses a scratch that is not empty
+    once this returns, and why it reads the resulting ACL back rather than
+    inferring it: a fresh directory with something already in it is one somebody
+    else reached first, and a version number cannot tell you about the build or
+    the volume."""
+    if not IS_WINDOWS:
+        return
+    if sid is None:
+        # Says what did not happen and stops there. Whether the directory is
+        # actually exposed is a separate question with a separate answer, and
+        # report_scratch_privacy reads the DACL to give it. Asserting the
+        # exposure here would be a false alarm on every current interpreter,
+        # where mkdir already protected the directory before this ran.
+        log(f"WARNING: could not read this account's SID, so the scratch directory {path} "
+            "was not hardened by this step.")
+        return
+    # /inheritance:r drops the inherited entries; /grant:r replaces rather than
+    # adds, so a rerun is idempotent. The leading * marks each principal as a SID
+    # rather than a name. S-1-5-18 is SYSTEM and S-1-5-32-544 is the local
+    # administrators group; both are the same on every install and in every
+    # locale, which a name is not.
+    #
+    # /L operates on the name given rather than on what it points at, and it is
+    # here so that this call cannot be aimed at somebody else's directory. In the
+    # fallback cases this function exists for, the scratch is created with the
+    # inherited ACL, so an account holding Modify on the base can delete the
+    # empty directory and put a reparse point in its place during the window
+    # before this runs. Without /L the command would then strip the inheritance
+    # from the *target* and rewrite it with this process's privileges, which
+    # turns an exposed scratch into damage to an arbitrary directory.
+    #
+    # Measured rather than assumed, because the two kinds of reparse point do not
+    # behave alike: with a junction, icacls writes the junction's own ACL and the
+    # target is untouched, so only a true symbolic link follows. That narrows the
+    # case to an account holding SeCreateSymbolicLinkPrivilege or a machine with
+    # Developer Mode on — which is a developer machine, and this is a developer's
+    # tool. On an ordinary directory /L changes nothing.
+    code, output = run(
+        ["icacls", str(path), "/L", "/inheritance:r",
+         "/grant:r", f"*{sid}:(OI)(CI)F",
+         "/grant:r", "*S-1-5-18:(OI)(CI)F",
+         "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
+        timeout=60,
+    )
+    if code != 0:
+        log(f"WARNING: could not restrict the permissions on the scratch directory {path}. "
+            "Whether that leaves it exposed is reported separately, from the ACL itself.")
+        echo(output, "icacls")
+
+
+# SDDL abbreviates the well-known principals, and these are the ones a private
+# scratch legitimately names. SY is SYSTEM and BA the administrators group, which
+# both mechanisms grant. OW is OWNER RIGHTS, which is what CPython's own
+# descriptor uses for the creating account, and LA the built-in administrator,
+# which is how a RID-500 account is spelled. CO is CREATOR OWNER, which appears
+# on some inherited layouts. Anything else holding an allow entry is somebody
+# this directory was not meant to be readable by.
+TRUSTED_SDDL_PRINCIPALS = frozenset({"SY", "BA", "OW", "LA", "CO"})
+
+# What SDDL calls the accounts a scheduled task is likely to run as. `whoami`
+# answers with the numeric SID and the descriptor abbreviates it, so a service
+# account would otherwise be reported as an intruder in its own scratch
+# directory: LocalService is S-1-5-19 and appears as LS. The alias is added only
+# when it is this account's, rather than trusted outright, because LocalService
+# being the process is a different fact from LocalService having been granted
+# access to a directory belonging to somebody else.
+SDDL_ALIAS_FOR_SID = {
+    "S-1-5-18": "SY",
+    "S-1-5-19": "LS",
+    "S-1-5-20": "NS",
+    "S-1-5-32-544": "BA",
+}
+
+# FILE_ATTRIBUTE_REPARSE_POINT. Named here rather than written as a bare 0x400 at
+# the one place it is tested, because a bare constant in a security check is a
+# claim nobody can audit without a search engine. stat carries no name for it.
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+# The bits in an access mask that let the holder change what is in a directory,
+# rather than only look at it: write data, append, write extended attributes and
+# attributes, delete a child, delete the object, and rewrite its owner or its
+# ACL. Reading alone is a smaller finding and gets a smaller sentence.
+#
+# The last two are the generic bits, GENERIC_ALL and GENERIC_WRITE, and they are
+# here because a mask is not always mapped by the time it is stored. The letter
+# spellings GA and GW are translated to their file equivalents by the table
+# below, so those meet this mask already; a mask written out in hexadecimal is
+# taken as it stands, and an ACE can legitimately keep its generic bits — an
+# inherit-only entry keeps them until it is inherited, and an entry set through
+# the raw API keeps whatever was written. So (A;;0x40000000;;;AU) granted every
+# authenticated user write access and was reported as read-only.
+SDDL_WRITE_MASK = (0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
+                   | 0x10000000 | 0x40000000)
+
+# What each two-letter right is worth as a mask, so that one definition decides
+# both spellings. Keeping a separate set of "write" letters beside the mask above
+# was the first attempt and it was wrong in both directions: the object-rights
+# mnemonics describe a directory-service object, and on a filesystem directory
+# the same bits mean something else. CC is 0x1, which lists the directory and
+# grants nothing, while it reads as "create child"; LC is 0x4, which adds a
+# subdirectory, while it reads as "list children". So the set called CC a write
+# and LC a read, each the reverse of the truth.
+#
+# The generic four are given their file equivalents rather than their generic
+# bits, because that is what they mean once the generic mapping is applied and it
+# lets every spelling meet the same mask.
+SDDL_RIGHT_BITS = {
+    "CC": 0x1,        # list directory
+    "DC": 0x2,        # add file
+    "LC": 0x4,        # add subdirectory
+    "SW": 0x8,        # read extended attributes
+    "RP": 0x10,       # write extended attributes
+    "WP": 0x20,       # traverse
+    "DT": 0x40,       # delete child
+    "LO": 0x80,       # read attributes
+    "CR": 0x100,      # write attributes
+    "SD": 0x10000,    # delete
+    "RC": 0x20000,    # read the security descriptor
+    "WD": 0x40000,    # rewrite the ACL
+    "WO": 0x80000,    # take ownership
+    "FA": 0x1F01FF,   # file all
+    "FR": 0x120089,   # file generic read
+    "FW": 0x120116,   # file generic write
+    "FX": 0x1200A0,   # file generic execute
+    "GA": 0x1F01FF,   # generic all, mapped
+    "GR": 0x120089,   # generic read, mapped
+    "GW": 0x120116,   # generic write, mapped
+    "GX": 0x1200A0,   # generic execute, mapped
+}
+
+
+def sddl_grants_write(rights: str) -> bool:
+    """Whether an SDDL rights field lets its holder change the directory.
+
+    Rights arrive in two spellings and both are reduced to a mask so that one
+    definition answers for both. A hexadecimal field is taken as it stands; a run
+    of two-letter codes is split into pairs and each looked up.
+
+    Anything that does not parse is reported as write. Guessing "read only"
+    would turn an entry nobody could read into silence, and this function exists
+    to stop the report claiming more than it established, not to start it
+    claiming less."""
+    text = rights.strip()
+    if text.lower().startswith("0x"):
+        try:
+            return bool(int(text, 16) & SDDL_WRITE_MASK)
+        except ValueError:
+            return True
+    # An odd length is malformed and is treated as such, rather than parsed as
+    # far as it goes. Stopping one short of the end was how the pairs were cut,
+    # so a trailing character was dropped in silence: "CCD" read as CC alone and
+    # was called read-only, which is the one direction this function must never
+    # fail in.
+    if len(text) % 2:
+        return True
+    codes = [text[index:index + 2].upper() for index in range(0, len(text), 2)]
+    if not codes or any(code not in SDDL_RIGHT_BITS for code in codes):
+        return True
+    mask = 0
+    for code in codes:
+        mask |= SDDL_RIGHT_BITS[code]
+    return bool(mask & SDDL_WRITE_MASK)
+
+
+def scratch_dacl(path: Path) -> str | None:
+    """The directory's DACL as SDDL, or None when it cannot be read.
+
+    Read rather than assumed, because the two mechanisms that can protect this
+    directory fail in different ways and neither reports it. Asking the
+    filesystem what the ACL actually says is the only answer that covers both,
+    and it is the difference between warning about an exposure and warning about
+    a step that did not run."""
+    # Asked of the kernel directly, which took three attempts to arrive at and is
+    # worth recording, because each rejected route failed for a different reason
+    # and all three reasons are the sort a security check must not carry.
+    #
+    # `icacls /save` needs an interchange file and every location is wrong. The
+    # system temporary directory is the small volume this whole mechanism exists
+    # to keep writes off. The scratch's base is the directory whose permissions
+    # are under suspicion, so on the very base this was written for the file
+    # inherits Authenticated Users and another account can replace it between the
+    # write and the read, forging a descriptor that says the directory is
+    # private. The scratch itself is circular: an account that can write there
+    # can forge the answer saying it cannot.
+    #
+    # PowerShell's Get-Acl returns the descriptor on stdout and needs no file,
+    # but it failed outright here: Windows PowerShell could not autoload its own
+    # Security module under a PSModulePath inherited from PowerShell 7, and
+    # dropping that variable did not fix it. A check that depends on which shell
+    # launched the updater is a check that reports "unknown" for reasons having
+    # nothing to do with the directory.
+    #
+    # GetNamedSecurityInfoW has none of those failure modes: no file to forge, no
+    # process to spawn, no environment to inherit, no PATH entry to hijack and no
+    # locale to translate the answer.
+    import ctypes  # pylint: disable=import-outside-toplevel
+
+    # sys.platform rather than the IS_WINDOWS constant used everywhere else, and
+    # not interchangeable with it here. ctypes.WinDLL does not exist off Windows,
+    # so a type checker running for Linux reports the attribute as missing; it
+    # narrows on sys.platform and treats what follows as unreachable, where
+    # os.name tells it nothing. The caller already returns early off Windows, so
+    # this guard is for the checker rather than for the run — which is exactly
+    # how it was found, by CI failing on Linux and macOS while the same command
+    # passed here.
+    if sys.platform != "win32":
+        return None
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return None
+
+    # Declared rather than left to ctypes' defaults, because a pointer returned
+    # into an undeclared restype is truncated to 32 bits on a 64-bit build, and
+    # the failure is a wild free rather than an error.
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_int, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_ulong
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(ctypes.c_ulong),
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    se_file_object = 1
+    dacl_security_information = 0x00000004
+    sddl_revision_1 = 1
+
+    descriptor = ctypes.c_void_p()
+    if advapi32.GetNamedSecurityInfoW(
+            str(path), se_file_object, dacl_security_information,
+            None, None, None, None, ctypes.byref(descriptor)) != 0:
+        return None
+    try:
+        text = ctypes.c_wchar_p()
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, sddl_revision_1, dacl_security_information,
+                ctypes.byref(text), None):
+            return None
+        try:
+            # Copied out of the ctypes buffer before it is freed, and as a plain
+            # str: c_wchar_p.value carries the ctypes type through to every
+            # caller, so the annotation said str while the object did not.
+            sddl = text.value
+            return str(sddl) if sddl is not None else None
+        finally:
+            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def report_scratch_privacy(path: Path, sid: str | None) -> None:
+    """Say whether the scratch directory is actually private, from its own ACL.
+
+    This exists because the two earlier warnings could not tell the difference
+    between a hardening step that did not run and a directory that is exposed.
+    On any interpreter from 3.12.4 the directory was already protected by
+    `mkdir`, so a failure in the icacls step usually leaves nothing wrong, and
+    saying otherwise raised a security alarm that was false on the common path.
+    A scanner that cries wolf about its own staging is a scanner whose warnings
+    stop being read.
+
+    `sid` is this account, and only this account is exempt. The first version
+    exempted every principal whose SID began S-1-5-21, on the reasoning that a
+    raw SID in the output was this account's. That prefix belongs to every local
+    and domain account, so a DACL granting a different user full control passed
+    without a word: the false alarm had been traded for a false silence, in the
+    one case the whole change exists to catch. Where the SID could not be read
+    there is nothing to exempt and nothing lost, because that is also the case
+    where the icacls step did not run, leaving CPython's own descriptor, which
+    names the creating account as OWNER RIGHTS rather than by SID.
+
+    So nothing is said when the ACL is what it should be. What is said otherwise
+    names the principals actually found, because "somebody else can write here"
+    is only actionable if the operator can see who."""
+    if not IS_WINDOWS:
+        return
+    sddl = scratch_dacl(path)
+    if sddl is None:
+        log(f"WARNING: could not read the permissions on the scratch directory {path}, so "
+            "whether the staged database is private here is unknown rather than confirmed.")
+        return
+    # A NULL DACL is not an empty one. It grants every account full access, and
+    # Windows writes it as this token instead of as entries, so there is nothing
+    # for the parser below to find: `writers` and `readers` both come back empty
+    # and the protected-flag branch is skipped whenever the descriptor also
+    # carries P. The most exposed directory a filesystem can hold would have
+    # produced silence, which is the failure this whole report exists to avoid,
+    # so it is tested for before anything is parsed.
+    if "NO_ACCESS_CONTROL" in sddl:
+        log(f"WARNING: the scratch directory {path} has no access control list at all, which "
+            "grants every account full access rather than none. A local user can substitute a "
+            "database between the ClamAV gate and promotion.")
+        return
+    trusted = set(TRUSTED_SDDL_PRINCIPALS)
+    if sid is not None:
+        trusted.add(sid)
+        alias = SDDL_ALIAS_FOR_SID.get(sid)
+        if alias is not None:
+            trusted.add(alias)
+    # An allow entry is <type>;<flags>;<rights>;<object>;<inherit>;<principal>,
+    # and the type is not only A: SDDL spells an access-allowed entry as OA when
+    # it carries object GUIDs and as XA or ZA when it carries a condition. All
+    # four grant access, so matching only A left a DACL that hands another
+    # account full control through a conditional entry looking empty, which is
+    # the same false silence the S-1-5-21 exemption produced.
+    #
+    # The principal stops at the next separator rather than at the closing
+    # bracket, because a conditional entry continues past it with the condition
+    # itself: (XA;;FA;;;WD;(Title=="PM")).
+    #
+    # A protected DACL is the other half: without the P flag the directory still
+    # inherits, so an entry can arrive after this check.
+    #
+    # The rights are read as well as the principal, because the two lead to
+    # different sentences. Every allow entry used to produce the substitution
+    # warning, so a read-only grant such as (A;OICI;GR;;;BU) was reported as an
+    # account that can replace the database, which it cannot. Overstating what
+    # was established is the same defect as understating it, and this warning
+    # exists precisely because the previous one overstated.
+    entries = [
+        (match.group(2), match.group(1))
+        for match in re.finditer(
+            r"\((?:A|OA|XA|ZA);[^;]*;([^;]*);[^;]*;[^;]*;([^);]+)", sddl)
+        if match.group(2) not in trusted
+    ]
+    writers = sorted({principal for principal, rights in entries if sddl_grants_write(rights)})
+    readers = sorted({principal for principal, rights in entries
+                      if not sddl_grants_write(rights)})
+    if writers:
+        log(f"WARNING: the scratch directory {path} grants write access to {', '.join(writers)} "
+            "as well as this account, SYSTEM and the administrators. A local user with write "
+            "access there can substitute a database between the ClamAV gate and promotion.")
+    if readers:
+        log(f"WARNING: the scratch directory {path} is readable by {', '.join(readers)} as well "
+            "as this account, SYSTEM and the administrators. That does not let them replace the "
+            "staged database, so it is a smaller finding than a write grant, and it is still "
+            "not the private directory this step is meant to produce.")
+    if writers or readers:
+        return
+    if "D:P" not in sddl:
+        log(f"WARNING: the scratch directory {path} still inherits permissions from its base, "
+            "so an entry granted there later reaches the staged database.")
+
+
 @contextlib.contextmanager
 def scratch_dir(label: str, near: Path | None = None):
     """Yield a private scratch directory on a volume with room, and remove it after.
@@ -1080,10 +1568,27 @@ def scratch_dir(label: str, near: Path | None = None):
     The name carries 64 bits from secrets rather than a counter or a timestamp,
     because the base can be a volume root that other things write to, and a
     predictable path there is a symlink-swap target. Creation is exclusive, so a
-    collision or a pre-existing directory raises rather than being adopted, and
-    that half holds on every platform. The mode does not: Windows ignores it and
-    the directory inherits the parent's ACL, so on the host this was written for
-    the unpredictable name and the exclusive creation are the whole defence."""
+    collision or a pre-existing directory raises rather than being adopted.
+
+    The mode is load-bearing on both platforms, for different reasons. Unix
+    applies it directly. Windows applies it too, since the fix for
+    CVE-2024-4030, but only for exactly 0o700, only from 3.12.4, only on a build
+    carrying the API set the special case sits behind, and only on a filesystem
+    that holds ACLs; outside those the directory is created with the base's
+    inherited permissions and nothing says so.
+
+    That distinction is the whole security story, and it is sharper than a
+    fallback. Where the interpreter applies the mode, the directory is created
+    protected by one call and there is no interval in which it is not. Where it
+    does not, restrict_to_owner narrows the interval to a single icacls but
+    cannot remove it, because Windows grants access when a handle is opened and
+    a later DACL does not revoke one already held.
+
+    Which of those happened is not knowable from the version alone, since the
+    build and the filesystem are conditions the interpreter does not report. So
+    the answer is read rather than inferred: report_scratch_privacy asks the
+    filesystem what the ACL says once both mechanisms have had their turn, and
+    the emptiness check above catches the cheap half of the remaining race."""
     # Where the cache really is, because that is the volume sized to hold it and
     # the one a promotion renames within. A cache path is symlinked precisely
     # when the databases have to live somewhere roomier, so the parent of the
@@ -1162,10 +1667,57 @@ def scratch_dir(label: str, near: Path | None = None):
             log(f"falling back to the system temporary directory {base} "
                 f"({describe_free(free_bytes(base))}), which is the volume the Java index "
                 "download ran out of room on")
+    # Before the directory exists, so that the interval between creating it and
+    # restricting it holds one icacls call and not a whoami spawn as well. On a
+    # 3.12.4 or newer interpreter with ACL support this interval does not matter,
+    # because mkdir below creates the directory already protected; it matters on
+    # exactly the builds and filesystems where that does not happen, which are
+    # the ones restrict_to_owner exists for.
+    sid = current_user_sid() if IS_WINDOWS else None
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
     log(f"scratch: {path} ({label})")
     try:
+        # Inside the try, not between the mkdir and it. restrict_to_owner is
+        # written to warn rather than raise, but it is the one step here that
+        # shells out, and a step that only ever warns by construction is a
+        # claim rather than a guarantee. Placed above the try it held that
+        # guarantee for exactly as long as it stayed true: a raise there left
+        # the directory behind with nothing to remove it, which is the leak
+        # this contextmanager exists to prevent. Here the finally runs whatever
+        # happens, so the guarantee is the block's rather than the function's.
+        restrict_to_owner(path, sid)
+        # And it is still the directory mkdir made, rather than a reparse point
+        # standing where that directory was. An account that can delete the
+        # scratch during the window before the step above can leave a junction or
+        # a symbolic link at the same name, and every check after this one would
+        # then describe, and every download would then fill, a directory
+        # somewhere else entirely. mkdir refused to follow one, so anything
+        # bearing the attribute here appeared after it and is not ours.
+        if is_reparse_point(path):
+            raise RuntimeError(
+                f"the scratch directory {path} is a link rather than the directory that was "
+                "just created there, so another account replaced it. Nothing staged through "
+                "it would be under this program's control."
+            )
+        # A directory created exclusively a moment ago has nothing in it. If it
+        # does, another account wrote there while the ACL was still the base's,
+        # and the rewrite did not touch that child because icacls without /T
+        # does not recurse. Refusing is the only safe answer: the staged tree is
+        # adopted with exist_ok=True further on, so a hostile child left here
+        # would be adopted rather than noticed, and it would sit inside the very
+        # window between the ClamAV gate and the promotion that this directory
+        # exists to protect. The finally below removes it either way.
+        intruders = sorted(entry.name for entry in path.iterdir())
+        if intruders:
+            raise RuntimeError(
+                f"the scratch directory {path} was not empty immediately after being created, "
+                f"holding {', '.join(intruders)}. Another account reached it before its "
+                "permissions were restricted, so nothing staged there can be trusted."
+            )
+        # After both mechanisms have had their turn, and after the emptiness
+        # check, so the answer describes the directory the download will use.
+        report_scratch_privacy(path, sid)
         yield path
     finally:
         # Not ignore_errors: this directory can hold a gigabyte, and a removal
