@@ -1047,6 +1047,87 @@ def promote_into(staged: Path, live: Path) -> None:
     shutil.rmtree(previous, ignore_errors=True)
 
 
+def current_user_sid() -> str | None:
+    """Return the SID of the account this process runs as, or None if it cannot be read.
+
+    The SID rather than the name, because a name has to be qualified by a domain
+    to be unambiguous and the environment variables that would supply one are
+    both spoofable and absent under some service accounts. A SID needs no
+    qualification and is what the ACL stores anyway.
+
+    `whoami` is asked rather than the Win32 token API because the answer is one
+    line of CSV and the alternative is forty lines of ctypes around
+    OpenProcessToken and ConvertSidToStringSidW for a value that does not change
+    during a run. The cost is a process; this is called once per scratch."""
+    code, output = run(["whoami", "/user", "/fo", "csv", "/nh"], timeout=30)
+    if code != 0:
+        return None
+    # "DOMAIN\\user","S-1-5-21-...". The SID is the last quoted field, and taking
+    # it from the end rather than by index survives a user name containing a comma.
+    fields = [field.strip().strip('"') for field in output.strip().splitlines()[-1].split(",")]
+    sid = fields[-1] if fields else ""
+    return sid if sid.startswith("S-1-") else None
+
+
+def restrict_to_owner(path: Path) -> None:
+    """Cut a Windows directory's inherited ACL down to this account, SYSTEM and administrators.
+
+    `mkdir(mode=0o700)` is honoured on Unix and ignored on Windows, where the new
+    directory instead inherits whatever the base grants. Measured on the host
+    this was written for, that inversion is real: the Trivy cache carries an
+    explicit non-inherited ACL naming its owner, SYSTEM and the administrators
+    group and nobody else, while the scratch base sits under a general-purpose
+    directory that grants modify to Authenticated Users. So the staged database
+    is least protected exactly while it is least verified, in the window between
+    the ClamAV gate approving it and the promotion installing it, which is a
+    local user's opportunity to substitute a database nothing scanned.
+
+    The three grants mirror the cache's own ACL rather than being minimised
+    further. Dropping the administrators group would buy nothing, since an
+    administrator can take ownership and rewrite the ACL regardless, and it would
+    cost an operator the ability to clear a leaked scratch left by a scheduled
+    task running as another account.
+
+    A failure warns rather than raises. The exposure this closes needs a second
+    local account to exploit, while raising would stop the databases updating at
+    all on any host where `icacls` is unavailable or the account cannot rewrite
+    the ACL, and a stale vulnerability database is the larger everyday risk. The
+    warning names what did not happen so the log says so plainly instead of the
+    docstring quietly promising a privacy the run did not obtain.
+
+    Note the ordering: this runs immediately after an exclusive `mkdir`, so the
+    directory is empty and there are no child objects carrying an ACL of their
+    own for `(OI)(CI)` to miss. The microseconds between the two calls are a
+    window in principle, but the directory name carries 64 bits from `secrets`,
+    so there is no path for anyone to have been waiting on."""
+    if not IS_WINDOWS:
+        return
+    sid = current_user_sid()
+    if sid is None:
+        log(f"WARNING: could not read this account's SID, so the scratch directory {path} "
+            "keeps the permissions it inherited from its parent. A local user with write "
+            "access there can substitute a database between the ClamAV gate and promotion.")
+        return
+    # /inheritance:r drops the inherited entries; /grant:r replaces rather than
+    # adds, so a rerun is idempotent. The leading * marks each principal as a SID
+    # rather than a name. S-1-5-18 is SYSTEM and S-1-5-32-544 is the local
+    # administrators group; both are the same on every install and in every
+    # locale, which a name is not.
+    code, output = run(
+        ["icacls", str(path), "/inheritance:r",
+         "/grant:r", f"*{sid}:(OI)(CI)F",
+         "/grant:r", "*S-1-5-18:(OI)(CI)F",
+         "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
+        timeout=60,
+    )
+    if code != 0:
+        log(f"WARNING: could not restrict the permissions on the scratch directory {path}, "
+            "which therefore keeps the ones it inherited from its parent. A local user with "
+            "write access there can substitute a database between the ClamAV gate and "
+            "promotion.")
+        echo(output, "icacls")
+
+
 @contextlib.contextmanager
 def scratch_dir(label: str, near: Path | None = None):
     """Yield a private scratch directory on a volume with room, and remove it after.
@@ -1082,8 +1163,10 @@ def scratch_dir(label: str, near: Path | None = None):
     predictable path there is a symlink-swap target. Creation is exclusive, so a
     collision or a pre-existing directory raises rather than being adopted, and
     that half holds on every platform. The mode does not: Windows ignores it and
-    the directory inherits the parent's ACL, so on the host this was written for
-    the unpredictable name and the exclusive creation are the whole defence."""
+    the directory would inherit the parent's ACL, which on a general-purpose base
+    grants modify to every authenticated user. restrict_to_owner rewrites it
+    afterwards for that reason, and warns rather than raising when it cannot, so
+    a run that did not obtain a private directory says so."""
     # Where the cache really is, because that is the volume sized to hold it and
     # the one a promotion renames within. A cache path is symlinked precisely
     # when the databases have to live somewhere roomier, so the parent of the
@@ -1164,6 +1247,7 @@ def scratch_dir(label: str, near: Path | None = None):
                 "download ran out of room on")
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
+    restrict_to_owner(path)
     log(f"scratch: {path} ({label})")
     try:
         yield path

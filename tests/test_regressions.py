@@ -300,6 +300,102 @@ def test_the_gate_still_refuses_when_there_is_nothing_to_scan(tmp_path: Path) ->
     assert us.gate(tmp_path / "absent", "a missing artifact", skip=False) is False
 
 
+def test_the_scratch_directory_does_not_keep_the_permissions_it_inherited(
+        tmp_path, monkeypatch) -> None:
+    """mode=0o700 is ignored on Windows, so the staged database inherited a shared ACL.
+
+    The gate scans the staged tree and the promotion installs it, and between
+    those two the bytes sat in a directory that a general-purpose base grants
+    modify on to every authenticated user. A local user could replace an approved
+    database with one nothing scanned, which is a gate passing what it did not
+    read by a route that does not go through the gate at all. Measured on the
+    host this runs on: the cache carried an explicit owner-only ACL while the
+    scratch feeding it did not."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    monkeypatch.setattr(us, "current_user_sid", lambda: "S-1-5-21-1-2-3-1001")
+    issued: list[list[str]] = []
+
+    def record(cmd, **_kwargs):
+        issued.append(cmd)
+        return 0, ""
+
+    monkeypatch.setattr(us, "run", record)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        acl = [cmd for cmd in issued if cmd[0] == "icacls" and cmd[1] == str(scratch)]
+
+    assert acl, f"the scratch directory kept its inherited ACL: {issued}"
+    assert "/inheritance:r" in acl[0], "the inherited entries were left in place"
+    granted = {acl[0][index + 1] for index, arg in enumerate(acl[0]) if arg == "/grant:r"}
+    assert granted == {
+        "*S-1-5-21-1-2-3-1001:(OI)(CI)F",
+        "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F",
+    }, f"the replacement ACL is not this account, SYSTEM and administrators: {granted}"
+
+
+def test_a_scratch_that_cannot_be_locked_down_says_so_and_still_runs(
+        tmp_path, monkeypatch) -> None:
+    """The warning is the deliverable when the ACL cannot be rewritten.
+
+    Raising would stop the databases updating on any host where icacls is
+    unavailable, and a stale vulnerability database is the larger everyday risk
+    than a staging window that needs a second local account to exploit. What must
+    not happen is the silent version, where the run reports success and the
+    docstring's promise of a private directory is the only record of a privacy it
+    did not obtain."""
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "current_user_sid", lambda: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (1, "Access is denied."))
+    said: list[str] = []
+    monkeypatch.setattr(us, "log", said.append)
+
+    us.restrict_to_owner(tmp_path)
+
+    assert any("WARNING" in line for line in said), f"the failure was not reported: {said}"
+    assert any("between the ClamAV gate and promotion" in line for line in said), (
+        f"the warning does not say what the exposure is: {said}")
+
+
+def test_an_unreadable_account_sid_is_not_written_into_an_acl(monkeypatch) -> None:
+    """Whatever whoami printed must not be pasted into a grant unexamined.
+
+    A blank or error line parsed as a principal would either fail the icacls call
+    or, worse, name something other than this account."""
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, '"CORP\\alice","S-1-5-21-9-8-7-500"\n'))
+    assert us.current_user_sid() == "S-1-5-21-9-8-7-500"
+
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (0, "ERROR: something went wrong\n"))
+    assert us.current_user_sid() is None
+
+    monkeypatch.setattr(us, "run", lambda cmd, **_kwargs: (1, ""))
+    assert us.current_user_sid() is None
+
+
+@pytest.mark.skipif(not us.IS_WINDOWS, reason="the ACL this pins exists only on Windows")
+def test_the_real_scratch_acl_excludes_everyone_else(tmp_path, monkeypatch) -> None:
+    """The end-to-end claim, checked against what Windows actually stored.
+
+    The test above pins the command; this one pins the outcome, because an icacls
+    invocation that is well formed and still leaves the directory shared would
+    satisfy the first and none of the point of it."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        code, output = us.run(["icacls", str(scratch)], timeout=60)
+        if code != 0:
+            pytest.skip(f"icacls is not usable here: {output}")
+        assert "Authenticated Users" not in output, f"the scratch is still shared: {output}"
+        assert "BUILTIN\\Users" not in output, f"the scratch is still shared: {output}"
+
+
 # --------------------------------------------------------------------------
 # Fails silently: work reported as done that was never done.
 # --------------------------------------------------------------------------
