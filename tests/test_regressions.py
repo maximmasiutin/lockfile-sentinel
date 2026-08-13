@@ -359,7 +359,7 @@ def test_a_scratch_that_cannot_be_locked_down_says_so_and_still_runs(
     said: list[str] = []
     monkeypatch.setattr(us, "log", said.append)
 
-    us.restrict_to_owner(tmp_path)
+    us.restrict_to_owner(tmp_path, "S-1-5-21-1-2-3-1001")
 
     assert any("WARNING" in line for line in said), f"the failure was not reported: {said}"
     assert any("between the ClamAV gate and promotion" in line for line in said), (
@@ -434,7 +434,7 @@ def test_a_raising_hardening_step_does_not_leak_the_scratch_directory(
     monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
     monkeypatch.setattr(us.secrets, "token_hex", lambda _n: "fixedname")
 
-    def refuse(_path):
+    def refuse(_path, _sid):
         raise RuntimeError("the ACL could not be rewritten")
 
     monkeypatch.setattr(us, "restrict_to_owner", refuse)
@@ -445,6 +445,41 @@ def test_a_raising_hardening_step_does_not_leak_the_scratch_directory(
 
     leaked = cache.parent / "temp-fixedname"
     assert not leaked.exists(), f"the scratch directory was left behind at {leaked}"
+
+
+def test_a_scratch_that_someone_else_reached_first_is_refused(tmp_path, monkeypatch) -> None:
+    """A fresh scratch with anything in it was not fresh, and must not be staged into.
+
+    Where the interpreter does not apply mode 0o700 — older than 3.12.4, an
+    API-set build, a volume without ACLs — the directory exists with the base's
+    permissions until icacls rewrites them. An account watching the base is
+    handed the name by the filesystem the moment it appears, so the random name
+    does not help, and it can create a child inside that interval. icacls
+    without /T does not touch that child, and the staging path adopts what it
+    finds with exist_ok=True, so a hostile file would be carried through the
+    ClamAV gate as though it had been downloaded.
+
+    Refusing is the only safe answer, and it is cheap: nothing else can be in a
+    directory created exclusively a moment earlier. This does not close the race
+    — a handle opened during the interval keeps its access whatever the DACL
+    says afterwards — and the docstrings say so rather than implying otherwise."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "IS_WINDOWS", True)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 10 * 1024 ** 3)
+    monkeypatch.setattr(us, "current_user_sid", lambda: "S-1-5-21-1-2-3-1001")
+
+    # Stand in for the attacker: the lockdown step is where the interval ends, so
+    # a child appearing during it is a child that was created inside it.
+    def plant(path, _sid):
+        (path / "cache").mkdir()
+
+    monkeypatch.setattr(us, "restrict_to_owner", plant)
+
+    with pytest.raises(RuntimeError, match="was not empty immediately after being created"):
+        with us.scratch_dir("test", near=cache):
+            pytest.fail("the body must not run on a scratch someone else reached first")
 
 
 def _sddl_of(path: Path, into: Path) -> str:
@@ -499,7 +534,7 @@ def test_restrict_to_owner_privatises_a_directory_that_was_created_shared(tmp_pa
     before = _sddl_of(shared, tmp_path / "before.sddl")
     assert ";AU)" in before, f"the base did not share, so this proves nothing: {before}"
 
-    us.restrict_to_owner(shared)
+    us.restrict_to_owner(shared, us.current_user_sid())
 
     after = _sddl_of(shared, tmp_path / "after.sddl")
     assert ";AU)" not in after, f"authenticated users can still write it: {after}"

@@ -1086,8 +1086,12 @@ def current_user_sid() -> str | None:
     return sid if re.fullmatch(r"S-1-\d+(?:-\d+)+", sid) else None
 
 
-def restrict_to_owner(path: Path) -> None:
+def restrict_to_owner(path: Path, sid: str | None) -> None:
     """Cut a Windows directory's inherited ACL down to this account, SYSTEM and administrators.
+
+    `sid` is resolved by the caller before the directory exists, deliberately.
+    Resolving it here put a process spawn inside the interval between creating
+    the directory and restricting it, which is the interval an attacker uses.
 
     This is a backstop, not the primary mechanism, and the distinction is the
     whole reason it is worth its two subprocesses. Since the fix for
@@ -1138,14 +1142,26 @@ def restrict_to_owner(path: Path) -> None:
     warning names what did not happen so the log says so plainly instead of the
     docstring quietly promising a privacy the run did not obtain.
 
-    Note the ordering: this runs immediately after an exclusive `mkdir`, so the
-    directory is empty and there are no child objects carrying an ACL of their
-    own for `(OI)(CI)` to miss. The microseconds between the two calls are a
-    window in principle, but the directory name carries 64 bits from `secrets`,
-    so there is no path for anyone to have been waiting on."""
+    What this does not do is close the race, and an earlier version of this
+    docstring said otherwise. It claimed the gap between `mkdir` and the rewrite
+    was microseconds and that the random name left nobody able to wait for it.
+    Both halves were wrong. The gap included a `whoami` process spawn, which is
+    milliseconds rather than microseconds, and the name defeats predicting the
+    path rather than learning it: an account watching the base is handed the name
+    by ReadDirectoryChangesW the moment the directory appears. Worse, Windows
+    checks access when a handle is opened, so tightening the DACL afterwards does
+    not revoke a handle already opened against the permissive one.
+
+    So the ordering is now the caller's job and the window is one `icacls` call
+    rather than two spawns, because the SID is resolved before the directory
+    exists and passed in. That narrows the race; it does not end it. What ends it
+    is the interpreter creating the directory protected in the first place, which
+    is why the supported floor for that guarantee is 3.12.4 rather than 3.12, and
+    why the caller refuses a scratch that is not empty once this returns: a fresh
+    directory with something already in it is one that somebody else reached
+    first."""
     if not IS_WINDOWS:
         return
-    sid = current_user_sid()
     if sid is None:
         log(f"WARNING: could not read this account's SID, so the scratch directory {path} "
             "keeps the permissions it inherited from its parent. A local user with write "
@@ -1211,8 +1227,16 @@ def scratch_dir(label: str, near: Path | None = None):
     CVE-2024-4030, but only for exactly 0o700 and only where the interpreter is
     3.12.4 or newer and the filesystem carries ACLs; outside those the directory
     is created with the base's inherited permissions and nothing says so.
-    restrict_to_owner covers that remainder and warns rather than raising when
-    it cannot, so a run that did not obtain a private directory reports it."""
+
+    That distinction is the whole security story, and it is sharper than a
+    fallback. Where the interpreter applies the mode, the directory is created
+    protected by one call and there is no interval in which it is not. Where it
+    does not, restrict_to_owner narrows the interval to a single icacls but
+    cannot remove it, because Windows grants access when a handle is opened and
+    a later DACL does not revoke one already held. 3.12.4 on an ACL-bearing
+    volume is therefore the configuration in which the scratch is private, and
+    anything older is a configuration in which it is probably private. The
+    emptiness check below is what catches the cheap half of the difference."""
     # Where the cache really is, because that is the volume sized to hold it and
     # the one a promotion renames within. A cache path is symlinked precisely
     # when the databases have to live somewhere roomier, so the parent of the
@@ -1291,6 +1315,13 @@ def scratch_dir(label: str, near: Path | None = None):
             log(f"falling back to the system temporary directory {base} "
                 f"({describe_free(free_bytes(base))}), which is the volume the Java index "
                 "download ran out of room on")
+    # Before the directory exists, so that the interval between creating it and
+    # restricting it holds one icacls call and not a whoami spawn as well. On a
+    # 3.12.4 or newer interpreter with ACL support this interval does not matter,
+    # because mkdir below creates the directory already protected; it matters on
+    # exactly the builds and filesystems where that does not happen, which are
+    # the ones restrict_to_owner exists for.
+    sid = current_user_sid() if IS_WINDOWS else None
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
     log(f"scratch: {path} ({label})")
@@ -1303,7 +1334,22 @@ def scratch_dir(label: str, near: Path | None = None):
         # the directory behind with nothing to remove it, which is the leak
         # this contextmanager exists to prevent. Here the finally runs whatever
         # happens, so the guarantee is the block's rather than the function's.
-        restrict_to_owner(path)
+        restrict_to_owner(path, sid)
+        # A directory created exclusively a moment ago has nothing in it. If it
+        # does, another account wrote there while the ACL was still the base's,
+        # and the rewrite did not touch that child because icacls without /T
+        # does not recurse. Refusing is the only safe answer: the staged tree is
+        # adopted with exist_ok=True further on, so a hostile child left here
+        # would be adopted rather than noticed, and it would sit inside the very
+        # window between the ClamAV gate and the promotion that this directory
+        # exists to protect. The finally below removes it either way.
+        intruders = sorted(entry.name for entry in path.iterdir())
+        if intruders:
+            raise RuntimeError(
+                f"the scratch directory {path} was not empty immediately after being created, "
+                f"holding {', '.join(intruders)}. Another account reached it before its "
+                "permissions were restricted, so nothing staged there can be trusted."
+            )
         yield path
     finally:
         # Not ignore_errors: this directory can hold a gigabyte, and a removal
