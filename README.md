@@ -14,16 +14,16 @@ The code uses syntax that older interpreters reject at parse time, so a 3.11 run
 
 What it relies on: PEP 604 unions written as `X | None` rather than `Optional[X]`, PEP 695 `type` aliases for the shapes the walk passes around, `TypedDict` for the scheduled-job table so a mistyped key is caught before it reaches Task Scheduler, and `tempfile`, `pathlib` and `concurrent.futures` behaviour as of 3.12. There are no third-party dependencies at all, so nothing else constrains the version.
 
-Static analysis is part of the contract rather than an afterthought. All four shipped programs pass `mypy` with no issues and `pylint` at 10.00/10 against the committed `.pylintrc`, and `bandit` reports nothing over the repository outside `tests/`; the `.pylintrc` records why each disabled check is a property of the design instead of a warning being hidden. The test suite is deliberately outside the `mypy` and `pylint` scope, so "all four" means the four named below rather than every Python file in the tree.
+Static analysis is part of the contract rather than an afterthought. All four shipped programs pass `mypy` with no issues, `pylint` scores 10.00/10 over those programs and the test suite together against the committed `.pylintrc`, and `bandit` reports nothing over the repository outside `tests/`; the `.pylintrc` records why each disabled check is a property of the design instead of a warning being hidden, and the two checks the tests disable are recorded in the test files themselves for the same reason. `mypy` covers the four programs rather than the tests, so that scope is narrower than pylint's and the commands below say which is which.
 
 ```bash
 python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
-python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
+python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py --recursive=y tests
 python -m bandit -r . -x ./tests
 python -m pytest -q
 ```
 
-All four run in CI, on Linux, Windows and macOS and on Python 3.12, 3.13 and 3.14, with the same scope each has above: `mypy` and `pylint` over the four named files, `bandit` over the repository except `tests/`, and `pytest` over the suite. Those three interpreters are the tested set, which is a different claim from the requirement: 3.12 is the floor because older ones reject the syntax at parse time, and anything above 3.14 is simply not exercised here until the matrix grows.
+All four run in CI, on Linux, Windows and macOS and on Python 3.12, 3.13 and 3.14, with the same scope each has above: `mypy` over the four named files, `pylint` over those and the tests, `bandit` over the repository except `tests/`, and `pytest` over the suite. Those three interpreters are the tested set, which is a different claim from the requirement: 3.12 is the floor because older ones reject the syntax at parse time, and anything above 3.14 is simply not exercised here until the matrix grows.
 
 A green tick is worth less than it looks, and the two halves of why are worth separating because only one of them lives in this repository. What the workflow file guarantees is that the checks run: on every pull request, and on a push to `master` after the commit has already landed, where a failing run removes nothing. Whether a failing run *blocks* anything is not in this repository at all. That is branch protection, a setting in the GitHub project rather than a file you can read here, and it differs in a fork, so this paragraph cannot state it and stay true. Check it yourself if it matters; a red run stops a merge only where a required status check says so.
 

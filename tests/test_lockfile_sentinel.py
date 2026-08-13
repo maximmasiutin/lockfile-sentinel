@@ -12,6 +12,18 @@ whole chain end to end; these prove the pieces without a network."""
 # The version-pattern table is private and is exactly what these cases pin, so
 # reaching it directly is the test, not a shortcut around one.
 
+# pylint: disable=missing-function-docstring
+# The name of a test that asserts one property is the description of it, and a
+# docstring repeating the name in a sentence is noise a reader learns to skip.
+# tests/test_regressions.py is the deliberate exception and documents every
+# case, because each one names a defect that shipped and the reasoning is the
+# part worth keeping.
+
+# pylint: disable=wrong-import-position
+# The programs under test sit beside this directory rather than in an installed
+# package, so the path is extended before they can be imported and the imports
+# cannot come first.
+
 from __future__ import annotations
 
 import json

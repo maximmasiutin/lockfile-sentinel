@@ -35,9 +35,14 @@ jobs:
 
       - name: Static analysis
         # These three commands must match the README's argument for argument.
-        # It states that the four programs pass mypy and pylint and that bandit
-        # is clean outside tests/, and this step is the only thing keeping those
-        # sentences true.
+        # It states what each of them covers, and this step is the only thing
+        # keeping those sentences true.
+        #
+        # pylint reads the tests as well, and the directory is passed recursively
+        # rather than as a file list so that a test added later is covered
+        # without anybody remembering to add it here. It is passed alongside the
+        # programs rather than on its own because that puts both directories on
+        # the path, which is what lets the tests import what they are testing.
         #
         # --python-version is pinned to the floor rather than following the
         # matrix on purpose: it asks whether the code is valid on the oldest
@@ -45,7 +50,7 @@ jobs:
         run: |
           python -m pip install --upgrade mypy pylint bandit
           python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
-          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py
+          python -m pylint lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py --recursive=y tests
           python -m bandit -r . -x ./tests
 
       - name: Offline self-test

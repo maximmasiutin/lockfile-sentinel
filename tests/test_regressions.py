@@ -34,6 +34,11 @@ from pathlib import Path
 
 import pytest
 
+# pylint: disable=wrong-import-position
+# The three programs under test sit beside this directory rather than in an
+# installed package, so the path has to be extended before they can be imported
+# and the imports cannot come first. Disabled here rather than repository-wide,
+# so that an import genuinely out of place anywhere else still reports.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import lockfile_sentinel as ls  # noqa: E402
@@ -319,6 +324,8 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
     monkeypatch.setattr(us.urllib.request, "urlopen", unreachable)
 
     class Args:
+        """The argparse namespace the target reads, with only the fields it uses."""
+
         output = str(overlay)
         source_url = "https://example.invalid/iocs.csv"
         skip_scan = True
