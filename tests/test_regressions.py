@@ -255,6 +255,45 @@ def test_a_repository_is_covered_only_when_every_lockfile_resolved() -> None:
     assert status.osv_checked is True
 
 
+def test_diagnosis_mode_matches_the_offline_table_without_osv_scanner(
+    tmp_path: Path,
+) -> None:
+    """--lockfile consulted osv-scanner and nothing else.
+
+    It returned 2 the moment the scanner was absent, and where the scanner ran
+    it never matched the offline table or the campaign overlay, so a lockfile
+    pinning a version this program already knows to be poisoned came back as
+    "no malicious-package advisories". The command most likely to be pointed at
+    a lockfile the walk has no name for was the one reporting least."""
+    lockfile = tmp_path / "bun.lock"
+    lockfile.write_text(
+        '"keyv@6.0.0": { "version": "6.0.0" }', encoding="utf-8"
+    )
+
+    # No scanner at all, which used to end the run before anything was read.
+    code = ls.diagnose_lockfiles(None, [str(lockfile)], timeout=5)
+    assert code == 1, "a known poisoned version must not exit 0 or 2"
+
+    was_read, poisoned = ls._diagnose_offline(str(lockfile))
+    assert was_read is True
+    assert "6.0.0" in poisoned.get("keyv", set())
+
+
+def test_diagnosis_mode_without_a_scanner_never_reports_health(tmp_path: Path) -> None:
+    """A clean offline pass is half a check, so it cannot exit 0.
+
+    Exit 0 from this program means nothing was found by the checks that ran, and
+    a caller cannot tell that apart from nothing being found at all unless the
+    partial run says so in its code."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {"node_modules/keyv": {"version": "5.2.3"}},
+    }), encoding="utf-8")
+
+    assert ls.diagnose_lockfiles(None, [str(lockfile)], timeout=5) == 2
+
+
 def test_the_structural_pass_survives_the_file_vanishing_after_the_first_read(
     tmp_path: Path,
 ) -> None:

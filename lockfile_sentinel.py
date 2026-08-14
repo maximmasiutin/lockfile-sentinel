@@ -1421,6 +1421,46 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
     return 1 if stale else 0
 
 
+def _diagnose_offline(path: str) -> tuple[bool, dict[str, set[str]]]:
+    """Match one named lockfile against the offline table.
+
+    Returns whether the file was read, and the poisoned package versions it
+    resolves. The status built here is discarded: diagnosis mode reports per
+    file rather than per repository, and nothing downstream consumes it."""
+    status = RepoStatus(name=path, path=str(Path(path).parent))
+    was_read = scan_lockfile(Path(path), status)
+    return was_read, status.poisoned_versions
+
+
+def _prepare_offline_table(args: argparse.Namespace) -> None:
+    """Refresh and load the campaign overlay into the offline table.
+
+    Refreshing has to precede loading, or the run matches against the previous
+    campaign list and downloads the current one only for the next run.
+
+    Every mode that consults the offline table calls this, which is the point of
+    it being a function: the sweep and diagnosis mode disagreeing about which
+    table they match against is how one of them ends up reporting a version the
+    other already knew as clean."""
+    if not args.no_refresh and not args.no_overlay:
+        refresh_overlay(Path(args.overlay_file), args.min_interval)
+
+    if args.no_overlay:
+        return
+    overlay = load_overlay(Path(args.overlay_file))
+    if overlay:
+        added = apply_overlay(overlay)
+        _progress(
+            f"overlay: {len(overlay)} campaign packages from {args.overlay_file} "
+            f"(+{added} versions over the built-in table)"
+        )
+    else:
+        _progress(
+            f"overlay: none loaded ({args.overlay_file} absent or empty); "
+            "using built-in table. Run: python update_scanners.py malicious-packages"
+        )
+
+
 def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> int:
     """Test named lockfiles one at a time, saying exactly what happened to each.
 
@@ -1430,13 +1470,29 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
     walk is skipped entirely and each file is submitted alone, which also
     removes the binary search: a file that fails is the file that failed.
 
-    Returns 0 when every file extracted, 1 when any did not, 2 when the scanner
-    could not be found."""
+    Both layers run, and each file's line says which of them spoke. The offline
+    table needs no network and no scanner, so it runs even where osv-scanner is
+    absent: this mode used to submit to osv-scanner alone and exit 2 without it,
+    which meant the command most likely to be pointed at a lockfile the walk has
+    no name for reported nothing at all, and reported a version the offline
+    table already knew as clean whenever the live database had not caught up.
+
+    Returns 1 when anything was found or any file could not be read or
+    extracted, 0 when every file was read, extracted and came back clean, and 2
+    when nothing was found but a layer did not run, since a check that did not
+    run cannot report health."""
     if not osv_bin:
-        _progress("FAIL: osv-scanner not found")
-        return 2
-    _progress(f"diagnosing {len(paths)} lockfile(s) with {osv_bin}")
+        _progress(
+            "osv-scanner not found, so the live database is not consulted. "
+            "The offline table still runs; a version it does not name will not "
+            "be reported by this run."
+        )
+    else:
+        _progress(f"diagnosing {len(paths)} lockfile(s) with {osv_bin}")
     failed = 0
+    missing = 0
+    unread = 0
+    found = 0
     for given in paths:
         # Resolve before submitting: osv-scanner reports the absolute path in
         # its results, so a relative path in and an absolute path out never
@@ -1445,12 +1501,33 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
         path = str(Path(given).resolve()) if os.path.exists(given) else given
         if not os.path.exists(path):
             _progress(f"MISSING: {path}")
-            failed += 1
+            missing += 1
+            continue
+
+        # Counted once per file rather than once per layer. Both layers naming
+        # the same lockfile is the expected result for a poisoned file, not two
+        # findings, and a summary that says two for one file overstates the
+        # scale of what was found.
+        hit_here = False
+
+        was_read, poisoned = _diagnose_offline(path)
+        if not was_read:
+            unread += 1
+            _progress(f"UNREAD : {path} -> the offline table could not read this file")
+        elif poisoned:
+            hit_here = True
+            _progress(f"POISON : {path} -> [offline table] {_format_versions(poisoned)}")
+        else:
+            _progress(f"OK     : {path} -> [offline table] no known poisoned version")
+
+        if not osv_bin:
+            found += hit_here
             continue
         result = _run_osv_batch(osv_bin, [path], timeout, debug=True)
         if result is None:
             failed += 1
-            _progress(f"FAILED : {path}")
+            found += hit_here
+            _progress(f"FAILED : {path} -> [osv-scanner] extraction failed")
             _progress(f"    reason: {_describe_lockfile(path)}")
             for line in _verbose_lockfile_dump(path):
                 _progress(line)
@@ -1461,14 +1538,27 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
             # file. Guards against any further path-shape disagreement.
             hits = next(iter(result.values()))
         if hits:
+            hit_here = True
             detail = ", ".join(
                 f"{name}@{version} ({', '.join(sorted(ids))})" for name, version, ids in hits
             )
-            _progress(f"OK     : {path} -> {detail}")
+            _progress(f"POISON : {path} -> [osv-scanner] {detail}")
         else:
-            _progress(f"OK     : {path} -> no malicious-package advisories")
-    _progress(f"diagnosis complete: {len(paths) - failed} extracted, {failed} failed")
-    return 1 if failed else 0
+            _progress(f"OK     : {path} -> [osv-scanner] no malicious-package advisories")
+        found += hit_here
+
+    # "examined" counts a file at least one layer got through, which is not the
+    # same as a file both layers got through: a lockfile osv-scanner cannot
+    # extract is still matched against the offline table, and that combination
+    # is exactly what this mode exists to investigate.
+    _progress(
+        f"diagnosis complete: {len(paths)} named, {len(paths) - missing - unread} examined, "
+        f"{found} with findings, {missing} missing, {unread} unreadable, "
+        f"{failed} extraction failure(s)"
+    )
+    if found or failed or unread or missing:
+        return 1
+    return 0 if osv_bin else 2
 
 
 def run_passthrough(osv_bin: str | None, args: list[str]) -> int:
@@ -2490,6 +2580,11 @@ def main() -> int:
             _progress(f"FAIL: could not read {args.lockfiles_from} ({exc})")
             return 2
     if named:
+        # The offline table is loaded here too. Diagnosis mode used to skip it
+        # and consult osv-scanner alone, so it matched against whatever versions
+        # were compiled into this file and none of the campaign versions the
+        # overlay carries, which is the larger list by an order of magnitude.
+        _prepare_offline_table(args)
         return diagnose_lockfiles(
             find_osv_scanner(args.osv_scanner_bin), named, args.osv_timeout
         )
@@ -2500,24 +2595,7 @@ def main() -> int:
     if args.osv is not None:
         return run_passthrough(find_osv_scanner(args.osv_scanner_bin), args.osv)
 
-    # Refresh before the overlay is loaded below, or the run scans with the
-    # previous campaign list and refreshes only for the next one.
-    if not args.no_refresh and not args.no_overlay:
-        refresh_overlay(Path(args.overlay_file), args.min_interval)
-
-    if not args.no_overlay:
-        overlay = load_overlay(Path(args.overlay_file))
-        if overlay:
-            added = apply_overlay(overlay)
-            _progress(
-                f"overlay: {len(overlay)} campaign packages from {args.overlay_file} "
-                f"(+{added} versions over the built-in table)"
-            )
-        else:
-            _progress(
-                f"overlay: none loaded ({args.overlay_file} absent or empty); "
-                "using built-in table. Run: python update_scanners.py malicious-packages"
-            )
+    _prepare_offline_table(args)
 
     # Default to the current directory rather than to anything guessed: a
     # scanner that silently walks somewhere the caller did not name is a scanner
