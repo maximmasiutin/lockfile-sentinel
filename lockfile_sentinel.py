@@ -1899,6 +1899,50 @@ def _advisory_note(advisory_id: str, lookup: bool = True) -> str:
     return summary
 
 
+_SCANNED_LINE_LIMIT: int = 12
+
+
+def _scanned_line(status: RepoStatus) -> str:
+    """Name the manifests and lockfiles this repository was actually read for.
+
+    The rest of the report says what was found without saying what was opened,
+    and the two differ in the way that matters: a lockfile whose name is absent
+    from LOCKFILE_NAMES is walked past in silence, so a repository reported as
+    not vulnerable may be one whose lockfile nothing ever read. Naming what was
+    read is the only thing in the report that makes that visible.
+
+    Paths are relative to the repository rather than absolute, because the
+    repository is already named on the line above and the part that carries
+    information is where inside it each file sat: a workspace under packages/
+    and the root manifest are different facts. Separators are normalised to
+    forward slashes so the same tree reports identically on every platform.
+
+    A monorepo can carry hundreds, so the list is capped and the remainder is
+    counted rather than dropped, since a truncated list that does not say it was
+    truncated reads as the whole of what was opened. Payload artifacts are
+    matched over every file in the tree regardless, so this line is about the
+    npm layer alone."""
+    if not status.npm_files:
+        return "  read: nothing (no npm manifest or lockfile was opened here)"
+    root = Path(status.path)
+    shown: list[str] = []
+    for entry in status.npm_files:
+        path = Path(entry)
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            # A file charged to a repository it does not sit under should not
+            # silently become a bare name that reads as a root manifest.
+            shown.append(path.as_posix())
+            continue
+        shown.append(relative.as_posix())
+    shown.sort()
+    if len(shown) > _SCANNED_LINE_LIMIT:
+        remainder = len(shown) - _SCANNED_LINE_LIMIT
+        shown = shown[:_SCANNED_LINE_LIMIT] + [f"and {remainder} more"]
+    return f"  read: {', '.join(shown)}"
+
+
 def _coverage_line(status: RepoStatus, osv_bin: str | None) -> str:
     """Say what OSV-Scanner did for this repository, and when it did not, why.
 
@@ -2051,6 +2095,7 @@ def render_human(statuses: list[RepoStatus], osv_bin: str | None, lookup: bool =
             lines.append("")
             continue
         lines.append("  npm: yes")
+        lines.append(_scanned_line(status))
         lines.append(_coverage_line(status, osv_bin))
         if not status.package_present() and not status.vulnerable():
             lines.append("  watched packages present: no")

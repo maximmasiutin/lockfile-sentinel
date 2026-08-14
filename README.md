@@ -76,6 +76,8 @@ Nothing else is read as a lockfile. `npm-shrinkwrap.json` and `bun.lock` in part
 
 It matters because the gap is silent. A Bun or shrinkwrap repository reported as not vulnerable means only that its lockfile was never opened, and the coverage line speaks to the live OSV.dev layer rather than to this. Worth knowing that the Shai-Hulud payload marker `bun_environment.js` *is* found by filename anywhere in the tree, so a Bun repository is not unscanned; its dependency pins are.
 
+Every repository with npm tooling carries a `read:` line naming the manifests and lockfiles that were opened, as paths relative to that repository, so the enumeration can be checked against the tree rather than taken on trust. A repository whose only lockfile is `bun.lock` shows its `package.json` and nothing else, which is what makes the gap above visible in the report itself. Long lists are capped, and the remainder is counted rather than dropped.
+
 `--lockfile` and `--lockfiles-from` bypass the name check entirely and diagnose whatever path they are given, so an unscanned format can still be checked by hand:
 
 ```bash

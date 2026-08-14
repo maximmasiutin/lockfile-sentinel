@@ -118,3 +118,81 @@ def test_overlay_merges_into_the_builtin_table_and_rebuilds_patterns() -> None:
     added = ls.apply_overlay({"totally-made-up-package": ["9.9.9"]})
     assert added == 1
     assert "totally-made-up-package" in ls._VERSION_PATTERNS
+
+
+def test_the_read_line_names_each_file_the_repository_was_opened_for() -> None:
+    """The report otherwise never says which files were read.
+
+    Paths are relative to the repository and slash-separated, so two workspaces
+    carrying the same filename stay distinguishable and the same tree reports
+    identically on Windows and on Linux."""
+    root = Path("/t").resolve()
+    status = ls.RepoStatus(name="t", path=str(root))
+    status.has_npm = True
+    status.npm_files.extend([
+        str(root / "package.json"),
+        str(root / "package-lock.json"),
+        str(root / "web" / "package.json"),
+    ])
+    line = ls._scanned_line(status)
+    assert line == "  read: package-lock.json, package.json, web/package.json"
+
+
+def test_the_read_line_counts_what_it_had_to_leave_out() -> None:
+    """A list cut short without saying so reads as the whole of what was opened,
+    which is the same confident silence the coverage line exists to prevent."""
+    root = Path("/t").resolve()
+    status = ls.RepoStatus(name="t", path=str(root))
+    total = ls._SCANNED_LINE_LIMIT + 3
+    status.npm_files.extend(
+        str(root / f"w{index:03d}" / "package.json") for index in range(total)
+    )
+    line = ls._scanned_line(status)
+    assert "and 3 more" in line
+    assert line.count("package.json") == ls._SCANNED_LINE_LIMIT
+
+
+def test_the_read_line_says_so_when_nothing_was_opened() -> None:
+    """An empty list must not render as an empty enumeration, which reads as a
+    formatting slip rather than as the fact that nothing was opened."""
+    status = ls.RepoStatus(name="t", path="/t")
+    assert "nothing" in ls._scanned_line(status)
+
+
+def test_the_read_line_omits_a_lockfile_format_the_walk_never_opens(tmp_path: Path) -> None:
+    """This is the whole point of the line.
+
+    bun.lock is not in LOCKFILE_NAMES, so a repository pinned entirely by Bun is
+    walked past and reported as not vulnerable. Before this line the report gave
+    the reader nothing to tell that apart from a repository that was read and
+    found clean, and the coverage line does not help: it speaks to whether the
+    live database ran, not to whether a lockfile was ever opened."""
+    repo = tmp_path / "bun-app"
+    repo.mkdir()
+    (repo / "package.json").write_text("{}", encoding="utf-8")
+    (repo / "bun.lock").write_text("{}", encoding="utf-8")
+
+    statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
+    status = statuses[repo]
+    assert status.has_npm is True
+    assert status.lockfiles == []
+
+    line = ls._scanned_line(status)
+    assert "package.json" in line
+    assert "bun.lock" not in line
+
+    report = ls.render_human([status], osv_bin=None, lookup=False)
+    assert line in report
+
+
+def test_the_read_line_names_a_lockfile_the_walk_does_open(tmp_path: Path) -> None:
+    """The negative case above proves nothing on its own: a line that never named
+    a lockfile would pass it too."""
+    repo = tmp_path / "npm-app"
+    repo.mkdir()
+    (repo / "package.json").write_text("{}", encoding="utf-8")
+    (repo / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
+    line = ls._scanned_line(statuses[repo])
+    assert "package-lock.json" in line
