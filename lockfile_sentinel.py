@@ -1786,9 +1786,14 @@ def _verbose_lockfile_dump(path: str) -> list[str]:
         # JSONC rather than JSON: bun writes trailing commas, so failing the
         # strict parser is this format's healthy state, not a defect to report.
         match = re.search(r'"lockfileVersion"\s*:\s*(\d+)', text)
+        # An absent field is not proof of a foreign file: this dump prints for a
+        # file the scanner refused, and a truncated bun.lock has lost exactly
+        # the head this regex looks in, so certainty here would send the reader
+        # away from the corruption that is the actual finding.
         lines.append(
             f"      bun JSONC format, lockfileVersion: {match.group(1)}" if match
-            else "      no lockfileVersion field found, so it is not a bun lockfile"
+            else "      no lockfileVersion field found: truncated, malformed, "
+                 "or not a bun lockfile"
         )
     return lines
 
