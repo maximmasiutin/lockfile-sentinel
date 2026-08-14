@@ -1421,7 +1421,49 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
     return 1 if stale else 0
 
 
-def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> int:
+def _diagnose_offline(path: str) -> tuple[bool, dict[str, set[str]]]:
+    """Match one named lockfile against the offline table.
+
+    Returns whether the file was read, and the poisoned package versions it
+    resolves. The status built here is discarded: diagnosis mode reports per
+    file rather than per repository, and nothing downstream consumes it."""
+    status = RepoStatus(name=path, path=str(Path(path).parent))
+    was_read = scan_lockfile(Path(path), status)
+    return was_read, status.poisoned_versions
+
+
+def _prepare_offline_table(args: argparse.Namespace) -> None:
+    """Refresh and load the campaign overlay into the offline table.
+
+    Refreshing has to precede loading, or the run matches against the previous
+    campaign list and downloads the current one only for the next run.
+
+    Every mode that consults the offline table calls this, which is the point of
+    it being a function: the sweep and diagnosis mode disagreeing about which
+    table they match against is how one of them ends up reporting a version the
+    other already knew as clean."""
+    if not args.no_refresh and not args.no_overlay:
+        refresh_overlay(Path(args.overlay_file), args.min_interval)
+
+    if args.no_overlay:
+        return
+    overlay = load_overlay(Path(args.overlay_file))
+    if overlay:
+        added = apply_overlay(overlay)
+        _progress(
+            f"overlay: {len(overlay)} campaign packages from {args.overlay_file} "
+            f"(+{added} versions over the built-in table)"
+        )
+    else:
+        _progress(
+            f"overlay: none loaded ({args.overlay_file} absent or empty); "
+            "using built-in table. Run: python update_scanners.py malicious-packages"
+        )
+
+
+def diagnose_lockfiles(
+    osv_bin: str | None, paths: list[str], timeout: int, live_requested: bool = True
+) -> int:
     """Test named lockfiles one at a time, saying exactly what happened to each.
 
     This is the fast loop for the failure the batch scanner reports. A full
@@ -1430,13 +1472,48 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
     walk is skipped entirely and each file is submitted alone, which also
     removes the binary search: a file that fails is the file that failed.
 
-    Returns 0 when every file extracted, 1 when any did not, 2 when the scanner
-    could not be found."""
-    if not osv_bin:
-        _progress("FAIL: osv-scanner not found")
-        return 2
-    _progress(f"diagnosing {len(paths)} lockfile(s) with {osv_bin}")
+    Both layers run, and each file's line says which of them spoke. The offline
+    table needs no network and no scanner, so it runs even where osv-scanner is
+    absent: this mode used to submit to osv-scanner alone and exit 2 without it,
+    which meant the command most likely to be pointed at a lockfile the walk has
+    no name for reported nothing at all, and reported a version the offline
+    table already knew as clean whenever the live database had not caught up.
+
+    Returns 1 when anything was found or any file could not be read or
+    extracted, 0 when every file was read, extracted and came back clean, and 2
+    when nothing was found but a layer that should have run did not, since a
+    check that could not run cannot report health. A scanner that times out,
+    fails to spawn or returns unparsable output is a layer that did not run, not
+    a file that failed: it says nothing whatever about the lockfile in front of
+    it.
+
+    live_requested distinguishes a live layer that could not run from one the
+    caller asked to skip. --no-osv scopes the check deliberately, so a clean run
+    under it returns 0 the same way the sweep does: 2 is for a check the caller
+    expected and did not get, not for one they declined."""
+    if not osv_bin and not live_requested:
+        _progress(
+            "--no-osv given, so the live database is not consulted. The offline "
+            "table still runs; a version it does not name will not be reported "
+            "by this run."
+        )
+    elif not osv_bin:
+        _progress(
+            "osv-scanner not found, so the live database is not consulted. "
+            "The offline table still runs; a version it does not name will not "
+            "be reported by this run."
+        )
+    else:
+        _progress(f"diagnosing {len(paths)} lockfile(s) with {osv_bin}")
     failed = 0
+    missing = 0
+    unread = 0
+    found = 0
+    examined = 0
+    # True once the live layer failed to reach a verdict on any file, which is
+    # different from it rejecting one and is what stops a clean run reporting
+    # health it cannot vouch for.
+    unavailable = live_requested and not osv_bin
     for given in paths:
         # Resolve before submitting: osv-scanner reports the absolute path in
         # its results, so a relative path in and an absolute path out never
@@ -1445,15 +1522,46 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
         path = str(Path(given).resolve()) if os.path.exists(given) else given
         if not os.path.exists(path):
             _progress(f"MISSING: {path}")
-            failed += 1
+            missing += 1
             continue
-        result = _run_osv_batch(osv_bin, [path], timeout, debug=True)
+
+        # Counted once per file rather than once per layer. Both layers naming
+        # the same lockfile is the expected result for a poisoned file, not two
+        # findings, and a summary that says two for one file overstates the
+        # scale of what was found.
+        hit_here = False
+
+        was_read, poisoned = _diagnose_offline(path)
+        if not was_read:
+            unread += 1
+            _progress(f"UNREAD : {path} -> the offline table could not read this file")
+        elif poisoned:
+            hit_here = True
+            _progress(f"POISON : {path} -> [offline table] {_format_versions(poisoned)}")
+        else:
+            _progress(f"OK     : {path} -> [offline table] no known poisoned version")
+
+        if not osv_bin:
+            found += hit_here
+            examined += was_read
+            continue
+        failure: dict[str, str] = {}
+        result = _run_osv_batch(osv_bin, [path], timeout, debug=True, failure=failure)
         if result is None:
-            failed += 1
-            _progress(f"FAILED : {path}")
-            _progress(f"    reason: {_describe_lockfile(path)}")
-            for line in _verbose_lockfile_dump(path):
-                _progress(line)
+            found += hit_here
+            examined += was_read
+            if failure.get("cause") == "rejected":
+                failed += 1
+                _progress(f"FAILED : {path} -> [osv-scanner] extraction failed")
+                _progress(f"    reason: {_describe_lockfile(path)}")
+                for line in _verbose_lockfile_dump(path):
+                    _progress(line)
+            else:
+                # The scanner never reached a verdict, so nothing here is known
+                # about the file. Dumping its bytes as though it were the
+                # suspect would send the reader after the wrong thing.
+                unavailable = True
+                _progress(f"SKIPPED: {path} -> [osv-scanner] no verdict, the scanner did not run")
             continue
         hits = result.get(_normalize_path(path), [])
         if not hits and len(result) == 1:
@@ -1461,14 +1569,34 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
             # file. Guards against any further path-shape disagreement.
             hits = next(iter(result.values()))
         if hits:
+            hit_here = True
             detail = ", ".join(
                 f"{name}@{version} ({', '.join(sorted(ids))})" for name, version, ids in hits
             )
-            _progress(f"OK     : {path} -> {detail}")
+            _progress(f"POISON : {path} -> [osv-scanner] {detail}")
         else:
-            _progress(f"OK     : {path} -> no malicious-package advisories")
-    _progress(f"diagnosis complete: {len(paths) - failed} extracted, {failed} failed")
-    return 1 if failed else 0
+            _progress(f"OK     : {path} -> [osv-scanner] no malicious-package advisories")
+        found += hit_here
+        # Extraction succeeded, so this file was examined whatever the offline
+        # read did. The two layers open the file separately and can disagree
+        # about whether it is readable, which is why this counts the layers that
+        # got through rather than deriving the answer from one of them.
+        examined += 1
+
+    # "examined" counts a file at least one layer got through, which is not the
+    # same as a file both layers got through: a lockfile osv-scanner cannot
+    # extract is still matched against the offline table, and one the offline
+    # pass cannot open may still extract. Either combination is exactly what
+    # this mode exists to investigate, so both count as examined and the
+    # per-file lines above say which layer spoke.
+    _progress(
+        f"diagnosis complete: {len(paths)} named, {examined} examined, "
+        f"{found} with findings, {missing} missing, {unread} unreadable, "
+        f"{failed} extraction failure(s)"
+    )
+    if found or failed or unread or missing:
+        return 1
+    return 2 if unavailable else 0
 
 
 def run_passthrough(osv_bin: str | None, args: list[str]) -> int:
@@ -1630,12 +1758,21 @@ def _verbose_lockfile_dump(path: str) -> list[str]:
 
 
 def _run_osv_batch(
-    osv_bin: str, paths: list[str], timeout: int, debug: bool = False
+    osv_bin: str, paths: list[str], timeout: int, debug: bool = False,
+    failure: dict[str, str] | None = None,
 ) -> dict[str, list[tuple[str, str, set[str]]]] | None:
     """Run one osv-scanner invocation over the given lockfiles. Returns None
     on any failure (spawn error, unexpected exit code, unparsable output) so
     the caller can retry at finer granularity instead of losing every result
-    in the batch to one bad file."""
+    in the batch to one bad file.
+
+    A caller that passes `failure` gets the cause recorded in it, because None
+    covers two different things and only one of them is about the file. An
+    unexpected exit code means the scanner ran and rejected this input, which is
+    a fact about the lockfile. A timeout, a spawn error or unparsable output
+    mean the scanner never reached a verdict, which is a fact about the tooling,
+    and reporting the second as the first tells the reader to go and look at a
+    lockfile that may be perfectly sound."""
     cmd = [osv_bin, "scan"]
     for lockfile_path in paths:
         cmd.extend(["--lockfile", lockfile_path])
@@ -1644,8 +1781,15 @@ def _run_osv_batch(
         proc = subprocess.run(  # nosec B603
             cmd, capture_output=True, text=True, timeout=timeout, check=False
         )
+    except subprocess.TimeoutExpired as exc:
+        _progress(f"osv-scanner timed out after {timeout}s: {exc}")
+        if failure is not None:
+            failure["cause"] = "unavailable"
+        return None
     except (OSError, subprocess.SubprocessError) as exc:
         _progress(f"osv-scanner failed to start: {exc}")
+        if failure is not None:
+            failure["cause"] = "unavailable"
         return None
     # 128 is "No package sources found", which is not a failure: the file
     # extracted and simply declared no dependencies, which is what a scaffold
@@ -1681,11 +1825,15 @@ def _run_osv_batch(
                 _progress(f"  in this group: {path}")
         else:
             _progress(f"  group of {len(paths)} not listed; pass --osv-debug to list it")
+        if failure is not None:
+            failure["cause"] = "rejected"
         return None
     try:
         return _extract_malicious_findings(json.loads(proc.stdout or "{}"))
     except json.JSONDecodeError:
         _progress(f"osv-scanner produced non-JSON output on {len(paths)} lockfile(s)")
+        if failure is not None:
+            failure["cause"] = "unavailable"
         return None
 
 
@@ -2490,8 +2638,16 @@ def main() -> int:
             _progress(f"FAIL: could not read {args.lockfiles_from} ({exc})")
             return 2
     if named:
+        # The offline table is loaded here too. Diagnosis mode used to skip it
+        # and consult osv-scanner alone, so it matched against whatever versions
+        # were compiled into this file and none of the campaign versions the
+        # overlay carries, which is the larger list by an order of magnitude.
+        _prepare_offline_table(args)
         return diagnose_lockfiles(
-            find_osv_scanner(args.osv_scanner_bin), named, args.osv_timeout
+            None if args.no_osv else find_osv_scanner(args.osv_scanner_bin),
+            named,
+            args.osv_timeout,
+            live_requested=not args.no_osv,
         )
 
     # Passthrough mode short-circuits the sweep: no walk, no overlay, no report.
@@ -2500,24 +2656,7 @@ def main() -> int:
     if args.osv is not None:
         return run_passthrough(find_osv_scanner(args.osv_scanner_bin), args.osv)
 
-    # Refresh before the overlay is loaded below, or the run scans with the
-    # previous campaign list and refreshes only for the next one.
-    if not args.no_refresh and not args.no_overlay:
-        refresh_overlay(Path(args.overlay_file), args.min_interval)
-
-    if not args.no_overlay:
-        overlay = load_overlay(Path(args.overlay_file))
-        if overlay:
-            added = apply_overlay(overlay)
-            _progress(
-                f"overlay: {len(overlay)} campaign packages from {args.overlay_file} "
-                f"(+{added} versions over the built-in table)"
-            )
-        else:
-            _progress(
-                f"overlay: none loaded ({args.overlay_file} absent or empty); "
-                "using built-in table. Run: python update_scanners.py malicious-packages"
-            )
+    _prepare_offline_table(args)
 
     # Default to the current directory rather than to anything guessed: a
     # scanner that silently walks somewhere the caller did not name is a scanner

@@ -255,6 +255,121 @@ def test_a_repository_is_covered_only_when_every_lockfile_resolved() -> None:
     assert status.osv_checked is True
 
 
+def test_diagnosis_mode_matches_the_offline_table_without_osv_scanner(
+    tmp_path: Path,
+) -> None:
+    """--lockfile consulted osv-scanner and nothing else.
+
+    It returned 2 the moment the scanner was absent, and where the scanner ran
+    it never matched the offline table or the campaign overlay, so a lockfile
+    pinning a version this program already knows to be poisoned came back as
+    "no malicious-package advisories". The command most likely to be pointed at
+    a lockfile the walk has no name for was the one reporting least."""
+    lockfile = tmp_path / "bun.lock"
+    lockfile.write_text(
+        '"keyv@6.0.0": { "version": "6.0.0" }', encoding="utf-8"
+    )
+
+    # No scanner at all, which used to end the run before anything was read.
+    code = ls.diagnose_lockfiles(None, [str(lockfile)], timeout=5)
+    assert code == 1, "a known poisoned version must not exit 0 or 2"
+
+    was_read, poisoned = ls._diagnose_offline(str(lockfile))
+    assert was_read is True
+    assert "6.0.0" in poisoned.get("keyv", set())
+
+
+def test_a_file_only_one_layer_could_open_still_counts_as_examined(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The summary derived "examined" from the offline read alone.
+
+    The two layers open the file separately and can disagree about whether it is
+    readable, so a lockfile osv-scanner extracted while the offline pass could
+    not open it was counted as never examined, and the summary then understated
+    what the run had actually checked."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text("{}", encoding="utf-8")
+
+    # The offline pass cannot read it; osv-scanner extracts it and finds nothing.
+    monkeypatch.setattr(ls, "scan_lockfile", lambda _path, _status: False)
+    monkeypatch.setattr(ls, "_run_osv_batch", lambda *_a, **_k: {})
+
+    ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
+    summary = capsys.readouterr().err
+    assert "1 named, 1 examined" in summary
+    assert "1 unreadable" in summary
+
+
+def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A timed-out scanner was labelled an extraction failure and exited 1.
+
+    _run_osv_batch returns None for a spawn error, a timeout and unparsable
+    output as well as for a lockfile the scanner ran and rejected, and only the
+    last of those is a fact about the file. Calling the others FAILED sends the
+    reader to inspect a lockfile that may be perfectly sound, and exiting 1
+    tells automation a finding exists where the live layer simply never ran."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text("{}", encoding="utf-8")
+
+    def timed_out(*_args, **kwargs):
+        failure = kwargs.get("failure")
+        if failure is not None:
+            failure["cause"] = "unavailable"
+        return None
+
+    monkeypatch.setattr(ls, "_run_osv_batch", timed_out)
+    code = ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
+
+    output = capsys.readouterr().err
+    assert "FAILED" not in output
+    assert "SKIPPED" in output
+    assert code == 2, "a layer that never answered cannot report health, nor a finding"
+
+
+def test_diagnosis_mode_honours_no_osv(tmp_path: Path, monkeypatch) -> None:
+    """--no-osv was ignored by --lockfile and --lockfiles-from.
+
+    The sweep honoured it and the diagnosis branch called find_osv_scanner
+    unconditionally, so a caller who asked for an offline-only check got the
+    live one anyway, with whatever network access and delay that carries.
+
+    A layer declined on purpose is also not a layer that failed, so a clean run
+    under --no-osv exits 0 rather than 2: exit 2 is for a check the caller
+    expected and did not get."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {"node_modules/keyv": {"version": "5.2.3"}},
+    }), encoding="utf-8")
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the live layer ran despite --no-osv")
+
+    monkeypatch.setattr(ls, "_run_osv_batch", refuse)
+    monkeypatch.setattr(sys, "argv", [
+        "lockfile_sentinel.py", "--lockfile", str(lockfile), "--no-osv", "--no-refresh",
+    ])
+    assert ls.main() == 0
+
+
+def test_diagnosis_mode_without_a_scanner_never_reports_health(tmp_path: Path) -> None:
+    """A clean offline pass is half a check, so it cannot exit 0.
+
+    Exit 0 from this program means nothing was found by the checks that ran, and
+    a caller cannot tell that apart from nothing being found at all unless the
+    partial run says so in its code."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {"node_modules/keyv": {"version": "5.2.3"}},
+    }), encoding="utf-8")
+
+    assert ls.diagnose_lockfiles(None, [str(lockfile)], timeout=5) == 2
+
+
 def test_the_structural_pass_survives_the_file_vanishing_after_the_first_read(
     tmp_path: Path,
 ) -> None:
