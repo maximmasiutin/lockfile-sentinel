@@ -204,6 +204,37 @@ def test_a_control_character_in_a_path_cannot_forge_a_report_line() -> None:
     assert "\\x1b" in report
 
 
+def test_a_comma_in_a_directory_name_cannot_forge_a_second_entry() -> None:
+    """The read line is comma-separated and a comma is legal in a name.
+
+    One file under a directory called "pkg, fake" would otherwise print as two
+    entries, so a single unread manifest could pose as two read ones. Escaping
+    only the non-printable characters leaves that open, because a comma is
+    perfectly printable."""
+    root = Path("/t").resolve()
+    status = ls.RepoStatus(name="t", path=str(root))
+    status.read_files.append(str(root / "pkg, fake" / "package.json"))
+
+    line = ls._scanned_lines(status)[0]
+    assert line == "  read: pkg\\x2c fake/package.json"
+    assert line.count(",") == 0
+
+
+def test_an_escape_marker_in_a_name_is_escaped_before_it_can_pose_as_one() -> None:
+    """A file genuinely named with a backslash must not render as the escape
+    sequence for a character it does not contain, or the escaping meant to
+    remove ambiguity would have introduced it."""
+    assert ls._display("a\\x0ab") == "a\\\\x0ab"
+    assert ls._display("a\nb") == "a\\x0ab"
+
+
+def test_a_non_bmp_character_gets_an_escape_that_can_be_read_back() -> None:
+    """A four-digit \\u escape cannot hold a code point above 0xFFFF, so the
+    width has to widen rather than overflow into an unparseable run."""
+    # U+E0001, a language tag character: non-BMP and not printable.
+    assert ls._display("\U000e0001") == "\\U000e0001"
+
+
 def test_a_repository_name_cannot_forge_a_report_line_either() -> None:
     """The label is a directory name, so it is chosen by whoever wrote the tree
     exactly as the paths are. Escaping the paths and printing the heading raw

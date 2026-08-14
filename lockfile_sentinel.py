@@ -276,10 +276,13 @@ class RepoStatus:
     path: str
     has_npm: bool = False
     npm_files: list[str] = field(default_factory=list)
-    # npm_files records what the walk found; these two record what happened when
-    # it was opened. A manifest whose permissions deny access, or one that
-    # disappears between enumeration and scanning, is found and never read, and
-    # a report that cannot tell the two apart claims coverage it does not have.
+    # npm_files records what the walk found; these two record whether it yielded
+    # anything. unreadable_files covers both halves of that: a manifest whose
+    # permissions deny access or which disappeared between enumeration and
+    # scanning was never opened, and one holding invalid JSON, or JSON that is
+    # not an object, was opened and told the scanner nothing. Both contributed
+    # exactly as much to the verdict, and a report that cannot separate either
+    # from a file it actually read claims coverage it does not have.
     read_files: list[str] = field(default_factory=list)
     unreadable_files: list[str] = field(default_factory=list)
     lockfiles: list[str] = field(default_factory=list)
@@ -1940,14 +1943,45 @@ def _display(text: str) -> str:
     let it repaint or hide what the reader sees. Neither is exotic to arrange in
     a repository somebody else controls.
 
+    The backslash is escaped first and for its own sake: without that, a file
+    genuinely named "\\x0a" would render identically to one carrying a real
+    newline, and the escaping meant to remove ambiguity would have introduced
+    it. Escape widths follow the Python convention, two hex digits below 0x100,
+    four below 0x10000 and eight above it, so a non-BMP code point does not
+    produce a \\u run nothing can parse.
+
     Escaping is applied to the display copy alone. The paths handed to
     osv-scanner and written to the JSON output stay exactly as the filesystem
     gave them, because those consumers need the real name."""
-    return "".join(
-        char if char.isprintable() else
-        f"\\x{ord(char):02x}" if ord(char) < 0x100 else f"\\u{ord(char):04x}"
-        for char in text
-    )
+    out: list[str] = []
+    for char in text:
+        code = ord(char)
+        if char == "\\":
+            out.append("\\\\")
+        elif char.isprintable():
+            out.append(char)
+        elif code < 0x100:
+            out.append(f"\\x{code:02x}")
+        elif code < 0x10000:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(f"\\U{code:08x}")
+    return "".join(out)
+
+
+def _display_item(text: str) -> str:
+    """Escape a path that will be joined into a comma-separated list.
+
+    The comma is a delimiter on those lines, and a directory name may contain
+    one. A single file under a directory named "pkg, fake" would otherwise print
+    as two entries, so one unread manifest could pose as two read ones, which is
+    the same overstatement of coverage the line exists to prevent, reached
+    through punctuation instead of through a missing read.
+
+    Lines that print one path each, such as the payload artifact list, use
+    _display directly, since a comma is not a delimiter there and escaping it
+    would obscure a filename for no gain."""
+    return _display(text).replace(",", "\\x2c")
 
 
 def _repo_relative(root: Path, entries: list[str]) -> list[str]:
@@ -1966,9 +2000,9 @@ def _repo_relative(root: Path, entries: list[str]) -> list[str]:
         except ValueError:
             # A file charged to a repository it does not sit under should not
             # silently become a bare name that reads as a root manifest.
-            shown.append(_display(path.as_posix()))
+            shown.append(_display_item(path.as_posix()))
             continue
-        shown.append(_display(relative.as_posix()))
+        shown.append(_display_item(relative.as_posix()))
     shown.sort()
     if len(shown) > _SCANNED_LINE_LIMIT:
         remainder = len(shown) - _SCANNED_LINE_LIMIT
