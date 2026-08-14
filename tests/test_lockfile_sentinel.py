@@ -129,13 +129,14 @@ def test_the_read_line_names_each_file_the_repository_was_opened_for() -> None:
     root = Path("/t").resolve()
     status = ls.RepoStatus(name="t", path=str(root))
     status.has_npm = True
-    status.npm_files.extend([
+    status.read_files.extend([
         str(root / "package.json"),
         str(root / "package-lock.json"),
         str(root / "web" / "package.json"),
     ])
-    line = ls._scanned_line(status)
-    assert line == "  read: package-lock.json, package.json, web/package.json"
+    assert ls._scanned_lines(status) == [
+        "  read: package-lock.json, package.json, web/package.json"
+    ]
 
 
 def test_the_read_line_counts_what_it_had_to_leave_out() -> None:
@@ -144,10 +145,10 @@ def test_the_read_line_counts_what_it_had_to_leave_out() -> None:
     root = Path("/t").resolve()
     status = ls.RepoStatus(name="t", path=str(root))
     total = ls._SCANNED_LINE_LIMIT + 3
-    status.npm_files.extend(
+    status.read_files.extend(
         str(root / f"w{index:03d}" / "package.json") for index in range(total)
     )
-    line = ls._scanned_line(status)
+    line = ls._scanned_lines(status)[0]
     assert "and 3 more" in line
     assert line.count("package.json") == ls._SCANNED_LINE_LIMIT
 
@@ -156,7 +157,51 @@ def test_the_read_line_says_so_when_nothing_was_opened() -> None:
     """An empty list must not render as an empty enumeration, which reads as a
     formatting slip rather than as the fact that nothing was opened."""
     status = ls.RepoStatus(name="t", path="/t")
-    assert "nothing" in ls._scanned_line(status)
+    assert "nothing" in ls._scanned_lines(status)[0]
+
+
+def test_a_file_that_could_not_be_read_is_never_listed_as_read(tmp_path: Path) -> None:
+    """A line that exists to expose an unread file must not print one as read.
+
+    scan_package_json and scan_lockfile both return silently on a read error, and
+    the walk records the name it found before either of them runs, so nothing
+    downstream could tell a manifest that was parsed from one that was not."""
+    repo = tmp_path / "app"
+    repo.mkdir()
+    good = repo / "package.json"
+    good.write_text("{}", encoding="utf-8")
+    # Not valid JSON, so the manifest contributes no dependency data at all.
+    bad = repo / "web"
+    bad.mkdir()
+    (bad / "package.json").write_text("this is not json", encoding="utf-8")
+
+    statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
+    status = statuses[repo]
+    assert status.read_files == [str(good)]
+    assert status.unreadable_files == [str(bad / "package.json")]
+
+    lines = ls._scanned_lines(status)
+    assert lines[0] == "  read: package.json"
+    assert lines[1] == "  found but unreadable: web/package.json"
+
+
+def test_a_control_character_in_a_path_cannot_forge_a_report_line() -> None:
+    """A directory name may hold a newline on Unix, and the tree being scanned is
+    exactly the thing the scanner does not trust. Printed raw, a crafted name
+    emits its own verdict line into the report."""
+    root = Path("/t").resolve()
+    status = ls.RepoStatus(name="t", path=str(root))
+    status.read_files.append(str(root / "w\n  vulnerable: no" / "package.json"))
+    status.payload_files.append("/t/\x1b[2Jbun_environment.js")
+
+    line = ls._scanned_lines(status)[0]
+    assert "\n" not in line
+    assert "\\x0a" in line
+
+    status.poisoned_versions["keyv"] = {"6.0.0"}
+    report = ls.render_human([status], osv_bin=None, lookup=False)
+    assert "\x1b" not in report
+    assert "\\x1b" in report
 
 
 def test_the_read_line_omits_a_lockfile_format_the_walk_never_opens(tmp_path: Path) -> None:
@@ -177,7 +222,7 @@ def test_the_read_line_omits_a_lockfile_format_the_walk_never_opens(tmp_path: Pa
     assert status.has_npm is True
     assert status.lockfiles == []
 
-    line = ls._scanned_line(status)
+    line = ls._scanned_lines(status)[0]
     assert "package.json" in line
     assert "bun.lock" not in line
 
@@ -194,5 +239,5 @@ def test_the_read_line_names_a_lockfile_the_walk_does_open(tmp_path: Path) -> No
     (repo / "package-lock.json").write_text("{}", encoding="utf-8")
 
     statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
-    line = ls._scanned_line(statuses[repo])
+    line = ls._scanned_lines(statuses[repo])[0]
     assert "package-lock.json" in line

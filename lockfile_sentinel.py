@@ -276,6 +276,12 @@ class RepoStatus:
     path: str
     has_npm: bool = False
     npm_files: list[str] = field(default_factory=list)
+    # npm_files records what the walk found; these two record what happened when
+    # it was opened. A manifest whose permissions deny access, or one that
+    # disappears between enumeration and scanning, is found and never read, and
+    # a report that cannot tell the two apart claims coverage it does not have.
+    read_files: list[str] = field(default_factory=list)
+    unreadable_files: list[str] = field(default_factory=list)
     lockfiles: list[str] = field(default_factory=list)
     present_versions: dict[str, set[str]] = field(default_factory=dict)
     range_only: dict[str, set[str]] = field(default_factory=dict)
@@ -472,14 +478,20 @@ def record_declared_range(
         status.poisoned_ranges.setdefault(name, set()).add(spec)
 
 
-def scan_package_json(path: Path, status: RepoStatus) -> None:
-    """Record every watched-package dependency range declared in a package.json."""
+def scan_package_json(path: Path, status: RepoStatus) -> bool:
+    """Record every watched-package dependency range declared in a package.json.
+
+    Returns whether the file yielded dependency data. False covers a file that
+    could not be opened or decoded and one whose JSON is not an object, because
+    the caller's question is whether this manifest contributed to the verdict,
+    and a manifest nothing could parse contributed exactly as much as one
+    nothing could open."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return
+        return False
     if not isinstance(data, dict):
-        return
+        return False
     for field_name in DEPENDENCY_FIELDS:
         deps = data.get(field_name)
         if not isinstance(deps, dict):
@@ -494,6 +506,7 @@ def scan_package_json(path: Path, status: RepoStatus) -> None:
                 if name.startswith(prefix):
                     record_declared_range(status, name, spec, [poisoned_version])
                     break
+    return True
 
 
 def _poison_count(status: RepoStatus) -> int:
@@ -564,7 +577,7 @@ def scan_npm_lockfile_json(path: Path, status: RepoStatus) -> None:
         walk_v1(data.get("dependencies"))
 
 
-def scan_lockfile(path: Path, status: RepoStatus) -> None:
+def scan_lockfile(path: Path, status: RepoStatus) -> bool:
     """Record every watched-package version actually resolved in a lockfile.
 
     Two passes, because neither alone is complete. The text pass covers every
@@ -576,11 +589,15 @@ def scan_lockfile(path: Path, status: RepoStatus) -> None:
 
     A lockfile that contributes a poisoned version is remembered by name, so a
     later re-check can submit that file alone rather than every lockfile the
-    repository happens to contain."""
+    repository happens to contain.
+
+    Returns whether the file was read. Only the text read decides it: the JSON
+    pass is an addition to a lockfile already in hand, so a v3 file with broken
+    JSON was still read and still matched by the patterns."""
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
-        return
+        return False
     before = _poison_count(status)
     if path.name.lower().endswith(".json"):
         scan_npm_lockfile_json(path, status)
@@ -595,6 +612,7 @@ def scan_lockfile(path: Path, status: RepoStatus) -> None:
                 record_resolved_version(status, name, version, [poisoned_version])
     if _poison_count(status) > before:
         status.flagged_lockfiles.add(str(path))
+    return True
 
 
 def scan_payload_filename(path: Path, status: RepoStatus) -> None:
@@ -778,12 +796,18 @@ def _attribute(
             if filename in NPM_MARKER_FILES:
                 status.has_npm = True
                 status.npm_files.append(str(file_path))
+            # None where the file is neither a manifest nor a lockfile, which is
+            # a different thing from a file that was one and failed to read.
+            was_read: bool | None = None
             if filename == "package.json":
-                scan_package_json(file_path, status)
+                was_read = scan_package_json(file_path, status)
             elif filename in LOCKFILE_NAMES:
-                scan_lockfile(file_path, status)
+                was_read = scan_lockfile(file_path, status)
                 status.lockfiles.append(str(file_path))
                 lockfile_index[_normalize_path(str(file_path))] = status
+            if was_read is not None:
+                target = status.read_files if was_read else status.unreadable_files
+                target.append(str(file_path))
             scan_payload_filename(file_path, status)
 
 
@@ -1902,7 +1926,53 @@ def _advisory_note(advisory_id: str, lookup: bool = True) -> str:
 _SCANNED_LINE_LIMIT: int = 12
 
 
-def _scanned_line(status: RepoStatus) -> str:
+def _display(text: str) -> str:
+    """Escape anything in a path that a report line cannot safely print.
+
+    Every path in this report comes from a tree the scanner did not write and
+    may have no reason to trust. A directory name may legally contain a newline
+    on Unix, which would let a crafted tree emit its own "vulnerable: no" line
+    into the report, and it may contain a terminal escape sequence, which would
+    let it repaint or hide what the reader sees. Neither is exotic to arrange in
+    a repository somebody else controls.
+
+    Escaping is applied to the display copy alone. The paths handed to
+    osv-scanner and written to the JSON output stay exactly as the filesystem
+    gave them, because those consumers need the real name."""
+    return "".join(
+        char if char.isprintable() else
+        f"\\x{ord(char):02x}" if ord(char) < 0x100 else f"\\u{ord(char):04x}"
+        for char in text
+    )
+
+
+def _repo_relative(root: Path, entries: list[str]) -> list[str]:
+    """Render each path for display, relative to the repository and sorted.
+
+    Paths are relative rather than absolute because the repository is already
+    named on the line above, and the part that carries information is where
+    inside it each file sat: a workspace manifest under packages/ and the root
+    manifest are different facts. Separators are normalised to forward slashes
+    so the same tree reports identically on every platform."""
+    shown: list[str] = []
+    for entry in entries:
+        path = Path(entry)
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            # A file charged to a repository it does not sit under should not
+            # silently become a bare name that reads as a root manifest.
+            shown.append(_display(path.as_posix()))
+            continue
+        shown.append(_display(relative.as_posix()))
+    shown.sort()
+    if len(shown) > _SCANNED_LINE_LIMIT:
+        remainder = len(shown) - _SCANNED_LINE_LIMIT
+        shown = shown[:_SCANNED_LINE_LIMIT] + [f"and {remainder} more"]
+    return shown
+
+
+def _scanned_lines(status: RepoStatus) -> list[str]:
     """Name the manifests and lockfiles this repository was actually read for.
 
     The rest of the report says what was found without saying what was opened,
@@ -1911,36 +1981,29 @@ def _scanned_line(status: RepoStatus) -> str:
     not vulnerable may be one whose lockfile nothing ever read. Naming what was
     read is the only thing in the report that makes that visible.
 
-    Paths are relative to the repository rather than absolute, because the
-    repository is already named on the line above and the part that carries
-    information is where inside it each file sat: a workspace under packages/
-    and the root manifest are different facts. Separators are normalised to
-    forward slashes so the same tree reports identically on every platform.
+    A file that was found and could not be read gets its own line rather than a
+    place in the first one. Listing it as read would be the very failure this
+    pair of lines exists to expose, and dropping it would be the same failure
+    made quieter, since the reader would then see neither the file nor the
+    reason it contributed nothing.
 
-    A monorepo can carry hundreds, so the list is capped and the remainder is
-    counted rather than dropped, since a truncated list that does not say it was
+    A monorepo can carry hundreds, so each list is capped and the remainder is
+    counted rather than dropped: a truncated list that does not say it was
     truncated reads as the whole of what was opened. Payload artifacts are
-    matched over every file in the tree regardless, so this line is about the
+    matched over every file in the tree regardless, so these lines are about the
     npm layer alone."""
-    if not status.npm_files:
-        return "  read: nothing (no npm manifest or lockfile was opened here)"
     root = Path(status.path)
-    shown: list[str] = []
-    for entry in status.npm_files:
-        path = Path(entry)
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            # A file charged to a repository it does not sit under should not
-            # silently become a bare name that reads as a root manifest.
-            shown.append(path.as_posix())
-            continue
-        shown.append(relative.as_posix())
-    shown.sort()
-    if len(shown) > _SCANNED_LINE_LIMIT:
-        remainder = len(shown) - _SCANNED_LINE_LIMIT
-        shown = shown[:_SCANNED_LINE_LIMIT] + [f"and {remainder} more"]
-    return f"  read: {', '.join(shown)}"
+    lines: list[str] = []
+    if status.read_files:
+        lines.append(f"  read: {', '.join(_repo_relative(root, status.read_files))}")
+    else:
+        lines.append("  read: nothing (no npm manifest or lockfile was opened here)")
+    if status.unreadable_files:
+        lines.append(
+            "  found but unreadable: "
+            f"{', '.join(_repo_relative(root, status.unreadable_files))}"
+        )
+    return lines
 
 
 def _coverage_line(status: RepoStatus, osv_bin: str | None) -> str:
@@ -2029,7 +2092,7 @@ def render_vulnerable_summary(statuses: list[RepoStatus], lookup: bool = True) -
                 f"{_format_versions({k: {'/'.join(sorted(v))} for k, v in status.poisoned_ranges.items()})}"
             )
         for payload_file in status.payload_files:
-            lines.append(f"    [offline table] payload artifact: {payload_file}")
+            lines.append(f"    [offline table] payload artifact: {_display(payload_file)}")
         for key, ids in sorted(status.osv_advisory_ids.items()):
             shai_ids = sorted(i for i in ids if _is_shai_hulud_name(key.rsplit("@", 1)[0]))
             if shai_ids:
@@ -2095,7 +2158,7 @@ def render_human(statuses: list[RepoStatus], osv_bin: str | None, lookup: bool =
             lines.append("")
             continue
         lines.append("  npm: yes")
-        lines.append(_scanned_line(status))
+        lines.extend(_scanned_lines(status))
         lines.append(_coverage_line(status, osv_bin))
         if not status.package_present() and not status.vulnerable():
             lines.append("  watched packages present: no")
@@ -2131,7 +2194,7 @@ def render_human(statuses: list[RepoStatus], osv_bin: str | None, lookup: bool =
                     "    [offline table] file name(s) matching a known worm payload artifact:"
                 )
                 for payload_file in status.payload_files:
-                    lines.append(f"      {payload_file}")
+                    lines.append(f"      {_display(payload_file)}")
             shai_hulud_hits = {
                 k: v for k, v in status.osv_malicious.items() if _is_shai_hulud_name(k)
             }
@@ -2195,6 +2258,11 @@ def render_json(statuses: list[RepoStatus]) -> str:
             "path": status.path,
             "has_npm": status.has_npm,
             "npm_files": status.npm_files,
+            # Unescaped, unlike the human report: a consumer of this file needs
+            # the name the filesystem gave, and JSON escapes a control character
+            # on its own rather than letting it forge a field.
+            "read_files": status.read_files,
+            "unreadable_files": status.unreadable_files,
             "lockfiles": status.lockfiles,
             "present_versions": {k: sorted(v) for k, v in status.present_versions.items()},
             "range_only": {k: sorted(v) for k, v in status.range_only.items()},
