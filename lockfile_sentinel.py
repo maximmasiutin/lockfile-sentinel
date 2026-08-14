@@ -1480,7 +1480,9 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
     Returns 1 when anything was found or any file could not be read or
     extracted, 0 when every file was read, extracted and came back clean, and 2
     when nothing was found but a layer did not run, since a check that did not
-    run cannot report health."""
+    run cannot report health. A scanner that times out, fails to spawn or
+    returns unparsable output is a layer that did not run, not a file that
+    failed: it says nothing whatever about the lockfile in front of it."""
     if not osv_bin:
         _progress(
             "osv-scanner not found, so the live database is not consulted. "
@@ -1493,6 +1495,11 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
     missing = 0
     unread = 0
     found = 0
+    examined = 0
+    # True once the live layer failed to reach a verdict on any file, which is
+    # different from it rejecting one and is what stops a clean run reporting
+    # health it cannot vouch for.
+    unavailable = not osv_bin
     for given in paths:
         # Resolve before submitting: osv-scanner reports the absolute path in
         # its results, so a relative path in and an absolute path out never
@@ -1522,15 +1529,25 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
 
         if not osv_bin:
             found += hit_here
+            examined += was_read
             continue
-        result = _run_osv_batch(osv_bin, [path], timeout, debug=True)
+        failure: dict[str, str] = {}
+        result = _run_osv_batch(osv_bin, [path], timeout, debug=True, failure=failure)
         if result is None:
-            failed += 1
             found += hit_here
-            _progress(f"FAILED : {path} -> [osv-scanner] extraction failed")
-            _progress(f"    reason: {_describe_lockfile(path)}")
-            for line in _verbose_lockfile_dump(path):
-                _progress(line)
+            examined += was_read
+            if failure.get("cause") == "rejected":
+                failed += 1
+                _progress(f"FAILED : {path} -> [osv-scanner] extraction failed")
+                _progress(f"    reason: {_describe_lockfile(path)}")
+                for line in _verbose_lockfile_dump(path):
+                    _progress(line)
+            else:
+                # The scanner never reached a verdict, so nothing here is known
+                # about the file. Dumping its bytes as though it were the
+                # suspect would send the reader after the wrong thing.
+                unavailable = True
+                _progress(f"SKIPPED: {path} -> [osv-scanner] no verdict, the scanner did not run")
             continue
         hits = result.get(_normalize_path(path), [])
         if not hits and len(result) == 1:
@@ -1546,19 +1563,26 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
         else:
             _progress(f"OK     : {path} -> [osv-scanner] no malicious-package advisories")
         found += hit_here
+        # Extraction succeeded, so this file was examined whatever the offline
+        # read did. The two layers open the file separately and can disagree
+        # about whether it is readable, which is why this counts the layers that
+        # got through rather than deriving the answer from one of them.
+        examined += 1
 
     # "examined" counts a file at least one layer got through, which is not the
     # same as a file both layers got through: a lockfile osv-scanner cannot
-    # extract is still matched against the offline table, and that combination
-    # is exactly what this mode exists to investigate.
+    # extract is still matched against the offline table, and one the offline
+    # pass cannot open may still extract. Either combination is exactly what
+    # this mode exists to investigate, so both count as examined and the
+    # per-file lines above say which layer spoke.
     _progress(
-        f"diagnosis complete: {len(paths)} named, {len(paths) - missing - unread} examined, "
+        f"diagnosis complete: {len(paths)} named, {examined} examined, "
         f"{found} with findings, {missing} missing, {unread} unreadable, "
         f"{failed} extraction failure(s)"
     )
     if found or failed or unread or missing:
         return 1
-    return 0 if osv_bin else 2
+    return 2 if unavailable else 0
 
 
 def run_passthrough(osv_bin: str | None, args: list[str]) -> int:
@@ -1720,12 +1744,21 @@ def _verbose_lockfile_dump(path: str) -> list[str]:
 
 
 def _run_osv_batch(
-    osv_bin: str, paths: list[str], timeout: int, debug: bool = False
+    osv_bin: str, paths: list[str], timeout: int, debug: bool = False,
+    failure: dict[str, str] | None = None,
 ) -> dict[str, list[tuple[str, str, set[str]]]] | None:
     """Run one osv-scanner invocation over the given lockfiles. Returns None
     on any failure (spawn error, unexpected exit code, unparsable output) so
     the caller can retry at finer granularity instead of losing every result
-    in the batch to one bad file."""
+    in the batch to one bad file.
+
+    A caller that passes `failure` gets the cause recorded in it, because None
+    covers two different things and only one of them is about the file. An
+    unexpected exit code means the scanner ran and rejected this input, which is
+    a fact about the lockfile. A timeout, a spawn error or unparsable output
+    mean the scanner never reached a verdict, which is a fact about the tooling,
+    and reporting the second as the first tells the reader to go and look at a
+    lockfile that may be perfectly sound."""
     cmd = [osv_bin, "scan"]
     for lockfile_path in paths:
         cmd.extend(["--lockfile", lockfile_path])
@@ -1734,8 +1767,15 @@ def _run_osv_batch(
         proc = subprocess.run(  # nosec B603
             cmd, capture_output=True, text=True, timeout=timeout, check=False
         )
+    except subprocess.TimeoutExpired as exc:
+        _progress(f"osv-scanner timed out after {timeout}s: {exc}")
+        if failure is not None:
+            failure["cause"] = "unavailable"
+        return None
     except (OSError, subprocess.SubprocessError) as exc:
         _progress(f"osv-scanner failed to start: {exc}")
+        if failure is not None:
+            failure["cause"] = "unavailable"
         return None
     # 128 is "No package sources found", which is not a failure: the file
     # extracted and simply declared no dependencies, which is what a scaffold
@@ -1771,11 +1811,15 @@ def _run_osv_batch(
                 _progress(f"  in this group: {path}")
         else:
             _progress(f"  group of {len(paths)} not listed; pass --osv-debug to list it")
+        if failure is not None:
+            failure["cause"] = "rejected"
         return None
     try:
         return _extract_malicious_findings(json.loads(proc.stdout or "{}"))
     except json.JSONDecodeError:
         _progress(f"osv-scanner produced non-JSON output on {len(paths)} lockfile(s)")
+        if failure is not None:
+            failure["cause"] = "unavailable"
         return None
 
 

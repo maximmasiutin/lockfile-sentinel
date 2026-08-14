@@ -279,6 +279,56 @@ def test_diagnosis_mode_matches_the_offline_table_without_osv_scanner(
     assert "6.0.0" in poisoned.get("keyv", set())
 
 
+def test_a_file_only_one_layer_could_open_still_counts_as_examined(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The summary derived "examined" from the offline read alone.
+
+    The two layers open the file separately and can disagree about whether it is
+    readable, so a lockfile osv-scanner extracted while the offline pass could
+    not open it was counted as never examined, and the summary then understated
+    what the run had actually checked."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text("{}", encoding="utf-8")
+
+    # The offline pass cannot read it; osv-scanner extracts it and finds nothing.
+    monkeypatch.setattr(ls, "scan_lockfile", lambda _path, _status: False)
+    monkeypatch.setattr(ls, "_run_osv_batch", lambda *_a, **_k: {})
+
+    ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
+    summary = capsys.readouterr().err
+    assert "1 named, 1 examined" in summary
+    assert "1 unreadable" in summary
+
+
+def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A timed-out scanner was labelled an extraction failure and exited 1.
+
+    _run_osv_batch returns None for a spawn error, a timeout and unparsable
+    output as well as for a lockfile the scanner ran and rejected, and only the
+    last of those is a fact about the file. Calling the others FAILED sends the
+    reader to inspect a lockfile that may be perfectly sound, and exiting 1
+    tells automation a finding exists where the live layer simply never ran."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text("{}", encoding="utf-8")
+
+    def timed_out(*_args, **kwargs):
+        failure = kwargs.get("failure")
+        if failure is not None:
+            failure["cause"] = "unavailable"
+        return None
+
+    monkeypatch.setattr(ls, "_run_osv_batch", timed_out)
+    code = ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
+
+    output = capsys.readouterr().err
+    assert "FAILED" not in output
+    assert "SKIPPED" in output
+    assert code == 2, "a layer that never answered cannot report health, nor a finding"
+
+
 def test_diagnosis_mode_without_a_scanner_never_reports_health(tmp_path: Path) -> None:
     """A clean offline pass is half a check, so it cannot exit 0.
 
