@@ -481,11 +481,13 @@ def record_declared_range(
 def scan_package_json(path: Path, status: RepoStatus) -> bool:
     """Record every watched-package dependency range declared in a package.json.
 
-    Returns whether the file yielded dependency data. False covers a file that
-    could not be opened or decoded and one whose JSON is not an object, because
-    the caller's question is whether this manifest contributed to the verdict,
-    and a manifest nothing could parse contributed exactly as much as one
-    nothing could open."""
+    Returns whether the file was read and parsed as a JSON object, which is a
+    weaker claim than finding anything in it: a manifest declaring no watched
+    dependency at all still returns True, because it was read and it did
+    contribute, by contributing nothing. False covers a file that could not be
+    opened or decoded and one whose JSON is not an object, since a manifest
+    nothing could parse tells the caller exactly as little as one nothing could
+    open."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -986,6 +988,8 @@ def _merge_statuses(into: StatusesByOwner, other: StatusesByOwner) -> None:
             continue
         dst.has_npm = dst.has_npm or src.has_npm
         dst.npm_files.extend(src.npm_files)
+        dst.read_files.extend(src.read_files)
+        dst.unreadable_files.extend(src.unreadable_files)
         dst.lockfiles.extend(src.lockfiles)
         dst.payload_files.extend(src.payload_files)
         dst.flagged_lockfiles |= src.flagged_lockfiles

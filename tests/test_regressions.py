@@ -255,6 +255,32 @@ def test_a_repository_is_covered_only_when_every_lockfile_resolved() -> None:
     assert status.osv_checked is True
 
 
+def test_every_worker_contributes_to_the_list_of_files_that_were_read() -> None:
+    """A parallel scan dropped all but one unit's record of what it opened.
+
+    Each top-level unit is walked by its own worker into its own RepoStatus, and
+    every unit without a .git of its own charges its files to the outer root, so
+    a repository scanned with more than one job arrives as several statuses for
+    one key. _merge_statuses folds them together, and a field it does not know
+    about is silently lost. The line then names one unit's manifests and reads as
+    the whole of what was opened, which is the failure the line exists to
+    prevent, reintroduced by the merge rather than by the walk."""
+    into = {Path("/r"): ls.RepoStatus(name="r", path="/r")}
+    into[Path("/r")].read_files.append("/r/package.json")
+    into[Path("/r")].unreadable_files.append("/r/broken/package.json")
+
+    other = {Path("/r"): ls.RepoStatus(name="r", path="/r")}
+    other[Path("/r")].read_files.append("/r/web/package.json")
+    other[Path("/r")].unreadable_files.append("/r/api/package-lock.json")
+
+    ls._merge_statuses(into, other)
+    merged = into[Path("/r")]
+    assert merged.read_files == ["/r/package.json", "/r/web/package.json"]
+    assert merged.unreadable_files == [
+        "/r/broken/package.json", "/r/api/package-lock.json"
+    ]
+
+
 def test_an_unusable_root_is_refused_rather_than_skipped(tmp_path: Path) -> None:
     """A mistyped root was skipped, leaving an empty report and exit 0.
 
