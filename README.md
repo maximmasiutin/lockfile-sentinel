@@ -78,7 +78,7 @@ It matters because the gap is silent. A Bun or shrinkwrap repository reported as
 
 The sharpest case is a repository whose only npm evidence is an unrecognised lockfile. `bun.lock` is not one of the four names that mark npm tooling, so such a repository is reported as `npm: no` outright rather than as npm tooling with a gap, and a payload artifact found in it appears in the vulnerable summary rather than on the repository's own entry.
 
-`--lockfile` and `--lockfiles-from` bypass the name check entirely and submit whatever path they are given, which is an osv-scanner extraction check rather than a full scan. Diagnosis mode runs neither the offline table nor the campaign overlay, and it exits with code 2 when osv-scanner is absent, so a poisoned version known only to the offline table is missed by it:
+`--lockfile` and `--lockfiles-from` bypass the name check entirely and submit whatever path they are given, which is an osv-scanner extraction check rather than a full scan. Diagnosis mode consults neither the offline table nor the campaign overlay, so a poisoned version known only to those is missed even on a run that succeeds. Separately, it exits with code 2 when osv-scanner is absent, which means the command does nothing at all rather than falling back to the layer that needs no network:
 
 ```bash
 python lockfile_sentinel.py --lockfile path/npm-shrinkwrap.json
