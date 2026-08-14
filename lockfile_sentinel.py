@@ -529,8 +529,8 @@ def _watched(name: str) -> list[str] | None:
     return None
 
 
-def scan_npm_lockfile_json(path: Path, status: RepoStatus) -> None:
-    """Read an npm lockfile as JSON rather than as text.
+def scan_npm_lockfile_json(text: str, status: RepoStatus) -> None:
+    """Parse an npm lockfile as JSON rather than matching it as text.
 
     The text patterns match a registry tarball URL or a name@version token, and
     both are absent from a v2 or v3 entry that carries no `resolved` field,
@@ -538,11 +538,22 @@ def scan_npm_lockfile_json(path: Path, status: RepoStatus) -> None:
     registry omitted. Such an entry pins a version like any other, so matching
     only text would miss a poisoned pin that is plainly stated in the file.
 
+    Takes the text the caller already read rather than opening the file again.
+    A second open is a second chance to fail: a lockfile removed between the two
+    reads left this pass silently skipped while the caller still recorded the
+    file as read, so the report could name a lockfile it had only half examined,
+    and the half that did not run is the only one that sees a versioned entry
+    with no `resolved` field. Reusing the text removes the window rather than
+    reporting it.
+
+    A byte-order mark is stripped here because the caller decodes as plain
+    utf-8, which leaves it in the string, and json.loads rejects it.
+
     Both lockfile shapes are read: `packages`, keyed by path, in v2 and v3, and
     the nested `dependencies` tree in v1."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        data = json.loads(text.lstrip("\ufeff"))
+    except json.JSONDecodeError:
         return
     if not isinstance(data, dict):
         return
@@ -596,16 +607,22 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
     later re-check can submit that file alone rather than every lockfile the
     repository happens to contain.
 
-    Returns whether the file was read. Only the text read decides it: the JSON
-    pass is an addition to a lockfile already in hand, so a v3 file with broken
-    JSON was still read and still matched by the patterns."""
+    Both passes work from a single read, so a file that is opened once is
+    examined twice rather than opened twice and possibly examined once. Reading
+    it again for the JSON pass would have made the structural half depend on the
+    file still being there, and that half is the only one that sees a versioned
+    entry carrying no `resolved` field.
+
+    Returns whether the file was read. The one read decides it: a lockfile whose
+    JSON is malformed was still read and still matched by the patterns, which is
+    a real npm lockfile state rather than a failure to look."""
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
     before = _poison_count(status)
     if path.name.lower().endswith(".json"):
-        scan_npm_lockfile_json(path, status)
+        scan_npm_lockfile_json(text, status)
     for name, (tarball_re, token_re) in _VERSION_PATTERNS.items():
         for pattern in (tarball_re, token_re):
             for version in pattern.findall(text):
