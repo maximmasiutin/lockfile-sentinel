@@ -11,7 +11,7 @@ both reported, and worm payload artifacts are found by name wherever they sit.
 Reports, per repository (a directory containing a .git entry, or a
 top-level directory under a scanned root when no .git is present):
 
-1. Does npm/pnpm/yarn tooling exist at all (package.json or a lockfile)?
+1. Does npm/pnpm/yarn/bun tooling exist at all (package.json or a lockfile)?
 2. If yes, is any watched package (keyv, cacheable, and related) present
    in any version at all, declared or resolved?
 3. If yes, is any version present or reachable the actual poisoned one?
@@ -254,10 +254,31 @@ PAYLOAD_FILENAMES: frozenset[str] = frozenset(
 )
 
 NPM_MARKER_FILES: frozenset[str] = frozenset(
-    {"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+    {
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+    }
 )
+# Every name here is scanned by both passes of scan_lockfile: the text patterns
+# cover all of them with one code path, and the JSON pass reads the .json ones
+# structurally. npm-shrinkwrap.json shares package-lock.json's schema outright,
+# so it takes the same structural path; bun.lock is JSONC, whose trailing commas
+# the JSON pass refuses quietly, and its "name@version" resolution strings are
+# exactly what the token patterns match. The campaign's own payload marker is
+# bun_environment.js, so a scanner that finds the Bun payload by filename had
+# no business walking past Bun's lockfile.
 LOCKFILE_NAMES: frozenset[str] = frozenset(
-    {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+    }
 )
 ALWAYS_SKIP_DIRS: frozenset[str] = frozenset({".git"})
 DEPENDENCY_FIELDS: tuple[str, ...] = (
@@ -597,11 +618,15 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
     """Record every watched-package version actually resolved in a lockfile.
 
     Two passes, because neither alone is complete. The text pass covers every
-    lockfile format with one code path, npm, pnpm and yarn alike, and catches a
-    version wherever it appears. The JSON pass reads npm lockfiles structurally
-    and catches entries the text pass cannot see, such as a v3 entry with no
-    `resolved` URL. Recording the same version twice is harmless, since versions
-    are collected into sets.
+    lockfile format with one code path, npm, pnpm, yarn and bun alike, and
+    catches a version wherever it appears. The JSON pass reads npm-schema
+    lockfiles structurally, package-lock.json and npm-shrinkwrap.json both
+    since shrinkwrap is the same document under another name, and catches
+    entries the text pass cannot see, such as a v3 entry with no `resolved`
+    URL. bun.lock gets the text pass alone: it is JSONC, whose trailing commas
+    the strict parser refuses quietly, and its resolution strings carry the
+    name@version tokens the patterns match. Recording the same version twice
+    is harmless, since versions are collected into sets.
 
     A lockfile that contributes a poisoned version is remembered by name, so a
     later re-check can submit that file alone rather than every lockfile the
@@ -1754,6 +1779,14 @@ def _verbose_lockfile_dump(path: str) -> list[str]:
     elif name == "yarn.lock":
         lines.append("      yarn berry format (__metadata present)" if "__metadata:" in text
                      else "      yarn classic v1 format")
+    elif name == "bun.lock":
+        # JSONC rather than JSON: bun writes trailing commas, so failing the
+        # strict parser is this format's healthy state, not a defect to report.
+        match = re.search(r'"lockfileVersion"\s*:\s*(\d+)', text)
+        lines.append(
+            f"      bun JSONC format, lockfileVersion: {match.group(1)}" if match
+            else "      no lockfileVersion field found, so it is not a bun lockfile"
+        )
     return lines
 
 

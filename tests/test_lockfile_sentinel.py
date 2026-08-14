@@ -251,15 +251,17 @@ def test_a_repository_name_cannot_forge_a_report_line_either() -> None:
 def test_the_read_line_omits_a_lockfile_format_the_walk_never_opens(tmp_path: Path) -> None:
     """This is the whole point of the line.
 
-    bun.lock is not in LOCKFILE_NAMES, so a repository pinned entirely by Bun is
-    walked past and reported as not vulnerable. Before this line the report gave
-    the reader nothing to tell that apart from a repository that was read and
-    found clean, and the coverage line does not help: it speaks to whether the
-    live database ran, not to whether a lockfile was ever opened."""
-    repo = tmp_path / "bun-app"
+    Cargo.lock is not in LOCKFILE_NAMES and never will be, being another
+    ecosystem's pin file, so a repository carrying one beside its package.json
+    shows only the manifest as read. When this case was written it used
+    bun.lock, which was then the gap this line existed to expose; that gap is
+    closed and bun.lock now has its own positive cases below, so the foreign
+    format here is one that is outside the scanner's subject by design rather
+    than by omission."""
+    repo = tmp_path / "mixed-app"
     repo.mkdir()
     (repo / "package.json").write_text("{}", encoding="utf-8")
-    (repo / "bun.lock").write_text("{}", encoding="utf-8")
+    (repo / "Cargo.lock").write_text('[[package]]\nname = "serde"\n', encoding="utf-8")
 
     statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
     status = statuses[repo]
@@ -268,7 +270,7 @@ def test_the_read_line_omits_a_lockfile_format_the_walk_never_opens(tmp_path: Pa
 
     line = ls._scanned_lines(status)[0]
     assert "package.json" in line
-    assert "bun.lock" not in line
+    assert "Cargo.lock" not in line
 
     report = ls.render_human([status], osv_bin=None, lookup=False)
     assert line in report
@@ -285,3 +287,76 @@ def test_the_read_line_names_a_lockfile_the_walk_does_open(tmp_path: Path) -> No
     statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
     line = ls._scanned_lines(statuses[repo])[0]
     assert "package-lock.json" in line
+
+
+# A real bun.lock's shape: JSONC with trailing commas, resolutions as
+# "name@version" strings inside per-package tuples. The trailing commas are
+# deliberate in every case below, because a fixture the strict JSON parser
+# accepts would not prove the text pass carries this format alone.
+BUN_LOCK = """{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": { "dependencies": { "keyv": "^6.0.0" }, },
+  },
+  "packages": {
+    "keyv": ["keyv@6.0.0", "", { "dependencies": {} }, "sha512-fixture"],
+  },
+}
+"""
+
+
+def test_a_bun_lockfile_pinning_a_poisoned_version_is_found(tmp_path: Path) -> None:
+    """The campaign's own payload marker is bun_environment.js, so the scanner
+    found the Bun payload by filename while walking past Bun's lockfile. The
+    text pass is what carries this format: bun.lock is JSONC, whose trailing
+    commas the JSON pass refuses quietly, and the resolution strings carry the
+    name@version tokens the patterns match."""
+    lockfile = tmp_path / "bun.lock"
+    lockfile.write_text(BUN_LOCK, encoding="utf-8")
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    assert ls.scan_lockfile(lockfile, status) is True
+    assert "6.0.0" in status.poisoned_versions.get("keyv", set())
+    assert str(lockfile) in status.flagged_lockfiles
+
+
+def test_a_bun_repository_is_walked_scanned_and_reported_as_npm(tmp_path: Path) -> None:
+    """End to end through the walk: a repository whose only pin file is bun.lock
+    used to be reported npm: no outright, with any payload artifact charged to
+    the summary rather than to the repository's own entry."""
+    repo = tmp_path / "bun-app"
+    repo.mkdir()
+    (repo / "bun.lock").write_text(BUN_LOCK, encoding="utf-8")
+
+    statuses, index = ls.scan_root(tmp_path, include_node_modules=False)
+    status = statuses[repo]
+    assert status.has_npm is True
+    assert status.lockfiles == [str(repo / "bun.lock")]
+    assert any("bun.lock" in key for key in index)
+    assert "6.0.0" in status.poisoned_versions.get("keyv", set())
+
+    line = ls._scanned_lines(status)[0]
+    assert "bun.lock" in line
+
+
+def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Path) -> None:
+    """npm-shrinkwrap.json is package-lock.json under another name, so it must
+    take the structural pass too: an entry pinning a version with no resolved
+    URL is invisible to the text patterns, and a scanner that gave shrinkwrap
+    only the text pass would miss exactly the pin the JSON pass exists for."""
+    repo = tmp_path / "shrinkwrap-app"
+    repo.mkdir()
+    lockfile = repo / "npm-shrinkwrap.json"
+    lockfile.write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {"node_modules/keyv": {"version": "6.0.0"}},
+    }), encoding="utf-8")
+
+    # Through the walk rather than by calling scan_lockfile directly, because
+    # scan_lockfile reads whatever path it is handed and never consults
+    # LOCKFILE_NAMES: a direct call would stay green with the name dropped
+    # from the set, which is the exact regression this case exists to catch.
+    statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
+    status = statuses[repo]
+    assert status.has_npm is True
+    assert status.lockfiles == [str(lockfile)]
+    assert "6.0.0" in status.poisoned_versions.get("keyv", set())
