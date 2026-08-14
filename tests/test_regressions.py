@@ -255,6 +255,75 @@ def test_a_repository_is_covered_only_when_every_lockfile_resolved() -> None:
     assert status.osv_checked is True
 
 
+def test_the_structural_pass_survives_the_file_vanishing_after_the_first_read(
+    tmp_path: Path,
+) -> None:
+    """The JSON pass reopened the lockfile the text pass had already read.
+
+    A lockfile removed between the two opens left the structural pass silently
+    skipped while the caller still recorded the file as read, and that pass is
+    the only one that sees a v2 or v3 entry carrying no `resolved` field. The
+    report could therefore name a lockfile as read and call the repository not
+    vulnerable on the strength of half an examination.
+
+    Deleting the file after the single read is what proves the second open is
+    gone: with one read the finding still lands, with two it disappears."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(json.dumps({
+        "lockfileVersion": 3,
+        # No "resolved" URL, so only the structural pass can see this pin.
+        "packages": {"node_modules/keyv": {"version": "6.0.0"}},
+    }), encoding="utf-8")
+    text = lockfile.read_text(encoding="utf-8")
+    lockfile.unlink()
+
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    ls.scan_npm_lockfile_json(text, status)
+    assert "6.0.0" in status.poisoned_versions.get("keyv", set())
+
+
+def test_a_lockfile_written_with_a_byte_order_mark_still_parses(tmp_path: Path) -> None:
+    """The caller decodes as plain utf-8, which leaves a BOM in the string, and
+    json.loads rejects it. Reading the file directly used utf-8-sig and hid this,
+    so moving to the caller's text would have quietly lost every finding in a
+    lockfile npm wrote with a mark."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {"node_modules/keyv": {"version": "6.0.0"}},
+    }), encoding="utf-8-sig")
+
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    assert ls.scan_lockfile(lockfile, status) is True
+    assert "6.0.0" in status.poisoned_versions.get("keyv", set())
+
+
+def test_every_worker_contributes_to_the_list_of_files_that_were_read() -> None:
+    """A parallel scan dropped all but one unit's record of what it opened.
+
+    Each top-level unit is walked by its own worker into its own RepoStatus, and
+    every unit without a .git of its own charges its files to the outer root, so
+    a repository scanned with more than one job arrives as several statuses for
+    one key. _merge_statuses folds them together, and a field it does not know
+    about is silently lost. The line then names one unit's manifests and reads as
+    the whole of what was opened, which is the failure the line exists to
+    prevent, reintroduced by the merge rather than by the walk."""
+    into = {Path("/r"): ls.RepoStatus(name="r", path="/r")}
+    into[Path("/r")].read_files.append("/r/package.json")
+    into[Path("/r")].unreadable_files.append("/r/broken/package.json")
+
+    other = {Path("/r"): ls.RepoStatus(name="r", path="/r")}
+    other[Path("/r")].read_files.append("/r/web/package.json")
+    other[Path("/r")].unreadable_files.append("/r/api/package-lock.json")
+
+    ls._merge_statuses(into, other)
+    merged = into[Path("/r")]
+    assert merged.read_files == ["/r/package.json", "/r/web/package.json"]
+    assert merged.unreadable_files == [
+        "/r/broken/package.json", "/r/api/package-lock.json"
+    ]
+
+
 def test_an_unusable_root_is_refused_rather_than_skipped(tmp_path: Path) -> None:
     """A mistyped root was skipped, leaving an empty report and exit 0.
 

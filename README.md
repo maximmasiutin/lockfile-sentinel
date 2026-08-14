@@ -78,6 +78,8 @@ It matters because the gap is silent. A Bun or shrinkwrap repository reported as
 
 The sharpest case is a repository whose only npm evidence is an unrecognised lockfile. `bun.lock` is not one of the four names that mark npm tooling, so such a repository is reported as `npm: no` outright rather than as npm tooling with a gap, and a payload artifact found in it appears in the vulnerable summary rather than on the repository's own entry.
 
+Every repository with npm tooling carries a `read:` line naming the manifests and lockfiles that were opened, as paths relative to that repository, so the enumeration can be checked against the tree rather than taken on trust. A repository committing `package.json` beside a `bun.lock` shows the manifest and nothing else, which is what makes the gap above visible in the report itself. A file that was found and could not be read is named separately rather than listed as read, long lists are capped, and the remainder is counted rather than dropped.
+
 `--lockfile` and `--lockfiles-from` bypass the name check entirely and submit whatever path they are given, which is an osv-scanner extraction check rather than a full scan. Diagnosis mode consults neither the offline table nor the campaign overlay, so a poisoned version known only to those is missed even on a run that succeeds. Separately, it exits with code 2 when osv-scanner is absent, which means the command does nothing at all rather than falling back to the layer that needs no network:
 
 ```bash
