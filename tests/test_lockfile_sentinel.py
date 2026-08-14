@@ -204,6 +204,19 @@ def test_a_control_character_in_a_path_cannot_forge_a_report_line() -> None:
     assert "\\x1b" in report
 
 
+def test_a_repository_name_cannot_forge_a_report_line_either() -> None:
+    """The label is a directory name, so it is chosen by whoever wrote the tree
+    exactly as the paths are. Escaping the paths and printing the heading raw
+    would leave the vector open at the one line that opens every entry."""
+    status = ls.RepoStatus(name="app\n  vulnerable: no\n[other]", path="/t")
+    status.has_npm = True
+    status.poisoned_versions["keyv"] = {"6.0.0"}
+
+    report = ls.render_human([status], osv_bin=None, lookup=False)
+    assert "\n  vulnerable: no\n" not in report
+    assert "\\x0a" in report
+
+
 def test_the_read_line_omits_a_lockfile_format_the_walk_never_opens(tmp_path: Path) -> None:
     """This is the whole point of the line.
 

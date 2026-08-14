@@ -2085,7 +2085,7 @@ def render_vulnerable_summary(statuses: list[RepoStatus], lookup: bool = True) -
     if not shai:
         lines.append("  none")
     for status in sorted(shai, key=lambda s: s.name.lower()):
-        lines.append(f"  [{status.name}]")
+        lines.append(f"  [{_display(status.name)}]")
         if status.poisoned_versions:
             lines.append(
                 f"    [offline table] resolved poisoned: {_format_versions(status.poisoned_versions)}"
@@ -2114,7 +2114,7 @@ def render_vulnerable_summary(statuses: list[RepoStatus], lookup: bool = True) -
         for key, ids in sorted(status.osv_advisory_ids.items()):
             hit_parts.append(f"{key} ({', '.join(sorted(ids))})")
             seen_advisories.update(ids)
-        lines.append(f"  [{status.name}]  [osv-scanner] {'; '.join(hit_parts)}")
+        lines.append(f"  [{_display(status.name)}]  [osv-scanner] {'; '.join(hit_parts)}")
         for advisory in sorted({a for ids in status.osv_advisory_ids.values() for a in ids}):
             campaign = campaign_of(advisory, lookup)
             if campaign:
@@ -2156,7 +2156,7 @@ def render_human(statuses: list[RepoStatus], osv_bin: str | None, lookup: bool =
     ]
 
     for status in sorted(statuses, key=lambda s: s.name.lower()):
-        lines.append(f"[{status.name}]")
+        lines.append(f"[{_display(status.name)}]")
         if not status.has_npm:
             lines.append("  npm: no")
             lines.append("")
