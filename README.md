@@ -29,7 +29,7 @@ A green tick is worth less than it looks, and the two halves of why are worth se
 
 Two more are run by hand against changed files before a merge: `semgrep`, with the `p/python` and `p/security-audit` rule sets, and SonarQube Community Build, whose quality gate has to come back clean. Nothing in the repository enforces either, so they are a practice rather than a gate. That is worth stating because nothing a reader can inspect tells the two apart. They sit outside CI because one needs a rule download and the other a server, and putting them in the workflow would trade a check that always runs for one that fails whenever a network does. If that stops being true they belong in the workflow.
 
-Three of the six can raise a security finding — `bandit`, `semgrep` and SonarQube — and the other three speak to consistency and behaviour rather than to security. CI runs exactly one of those three. So a green run means `mypy` and `pylint` found no inconsistency in the four programs, the `pytest` suite passed, and `bandit` reported nothing in the scan it is configured for; it says nothing whatever about `semgrep` or SonarQube.
+Three of the six can raise a security finding, namely `bandit`, `semgrep` and SonarQube, and the other three speak to consistency and behaviour rather than to security. CI runs exactly one of those three. So a green run means `mypy` and `pylint` found no inconsistency in the four programs, the `pytest` suite passed, and `bandit` reported nothing in the scan it is configured for; it says nothing whatever about `semgrep` or SonarQube.
 
 Two optional companions keep its inputs current and are not needed to scan: `update_scanners.py` builds or updates osv-scanner, refreshes the campaign overlay and the OSV offline database, and refreshes the Trivy databases; `schedule_tasks.py` installs those four jobs on a daily schedule through Windows Task Scheduler or cron, idempotently. Each is standalone too.
 
@@ -67,6 +67,22 @@ python lockfile_sentinel.py --osv source -r ./app         # pass through to osv-
 ```
 
 Exit codes are 0 when nothing was found, 1 when something was, and 2 when the scan could not be performed. A check that could not run never reports health.
+
+## Which Lockfiles Are Scanned
+
+Three filenames, matched exactly: `package-lock.json`, `pnpm-lock.yaml` and `yarn.lock`. Any of those three, or a `package.json`, marks a repository as having npm tooling at all, which is what separates "no npm here" from "npm, but no lockfile" in the report; a repository holding a lockfile and no manifest still counts.
+
+Nothing else is read as a lockfile. `npm-shrinkwrap.json` and `bun.lock` in particular are not scanned, and neither is any lockfile from a non-npm ecosystem. This is a coverage gap rather than a design position: the text pass is format-agnostic, so those two would work if their names were added.
+
+It matters because the gap is silent. A Bun or shrinkwrap repository reported as not vulnerable means only that its lockfile pins were never read, and the coverage line speaks to the live OSV.dev layer rather than to this. What still runs on such a repository is the payload artifact match by filename, which is applied to every file the walk visits, whatever else that file is. It reaches only as far as the walk does: `.git` is always skipped, `node_modules` unless `--include-node-modules` is given, and a symlinked directory or one that cannot be read is skipped too. That default matters more here than it looks, because `bun_environment.js` is written on install, which puts it inside `node_modules`, so the marker most likely to be present is the one a default sweep does not reach. Pass `--include-node-modules` when the question is whether the payload landed. The declared range check against the offline table needs a `package.json`, so a repository committing none does not get it. So a Bun repository is not unscanned; its resolved dependency versions are.
+
+The sharpest case is a repository whose only npm evidence is an unrecognised lockfile. `bun.lock` is not one of the four names that mark npm tooling, so such a repository is reported as `npm: no` outright rather than as npm tooling with a gap, and a payload artifact found in it appears in the vulnerable summary rather than on the repository's own entry.
+
+`--lockfile` and `--lockfiles-from` bypass the name check entirely and submit whatever path they are given, which is an osv-scanner extraction check rather than a full scan. Diagnosis mode consults neither the offline table nor the campaign overlay, so a poisoned version known only to those is missed even on a run that succeeds. Separately, it exits with code 2 when osv-scanner is absent, which means the command does nothing at all rather than falling back to the layer that needs no network:
+
+```bash
+python lockfile_sentinel.py --lockfile path/npm-shrinkwrap.json
+```
 
 ## A Repository With No Lockfile
 
