@@ -70,13 +70,13 @@ Exit codes are 0 when nothing was found, 1 when something was, and 2 when the sc
 
 ## Which Lockfiles Are Scanned
 
-Three filenames, matched exactly: `package-lock.json`, `pnpm-lock.yaml` and `yarn.lock`. A tree walk also treats `package.json` as the marker that npm tooling is present at all, which is what separates "no npm here" from "npm, but no lockfile" in the report.
+Three filenames, matched exactly: `package-lock.json`, `pnpm-lock.yaml` and `yarn.lock`. Any of those three, or a `package.json`, marks a repository as having npm tooling at all, which is what separates "no npm here" from "npm, but no lockfile" in the report; a repository holding a lockfile and no manifest still counts.
 
 Nothing else is read as a lockfile. `npm-shrinkwrap.json` and `bun.lock` in particular are not scanned, and neither is any lockfile from a non-npm ecosystem. This is a coverage gap rather than a design position: the text pass is format-agnostic, so those two would work if their names were added.
 
-It matters because the gap is silent. A Bun or shrinkwrap repository reported as not vulnerable means only that its lockfile was never opened, and the coverage line speaks to the live OSV.dev layer rather than to this. Worth knowing that the Shai-Hulud payload marker `bun_environment.js` *is* found by filename anywhere in the tree, so a Bun repository is not unscanned; its dependency pins are.
+It matters because the gap is silent. A Bun or shrinkwrap repository reported as not vulnerable means only that its lockfile pins were never read, and the coverage line speaks to the live OSV.dev layer rather than to this. What still runs on such a repository is the `package.json` range check against the offline table, and the payload artifact match by filename over every file in the tree, which finds the Shai-Hulud marker `bun_environment.js` wherever it sits. So a Bun repository is not unscanned; its resolved dependency versions are.
 
-`--lockfile` and `--lockfiles-from` bypass the name check entirely and diagnose whatever path they are given, so an unscanned format can still be checked by hand:
+`--lockfile` and `--lockfiles-from` bypass the name check entirely and submit whatever path they are given, which is an osv-scanner extraction check rather than a full scan. Diagnosis mode runs neither the offline table nor the campaign overlay, and it exits with code 2 when osv-scanner is absent, so a poisoned version known only to the offline table is missed by it:
 
 ```bash
 python lockfile_sentinel.py --lockfile path/npm-shrinkwrap.json
