@@ -263,14 +263,15 @@ NPM_MARKER_FILES: frozenset[str] = frozenset(
         "bun.lock",
     }
 )
-# Every name here is scanned by both passes of scan_lockfile: the text patterns
-# cover all of them with one code path, and the JSON pass reads the .json ones
-# structurally. npm-shrinkwrap.json shares package-lock.json's schema outright,
-# so it takes the same structural path; bun.lock is JSONC, whose trailing commas
-# the JSON pass refuses quietly, and its "name@version" resolution strings are
-# exactly what the token patterns match. The campaign's own payload marker is
-# bun_environment.js, so a scanner that finds the Bun payload by filename had
-# no business walking past Bun's lockfile.
+# Every name here gets scan_lockfile's text pass, one code path for all five,
+# and the names ending .json get the structural JSON pass on top of it.
+# npm-shrinkwrap.json shares package-lock.json's schema outright, so it takes
+# the same structural path; bun.lock does not end .json, so the JSON pass is
+# never dispatched to it, and extending that pass to it would need a JSONC
+# parser since bun writes trailing commas. Its "name@version" resolution
+# strings are exactly what the token patterns match. The campaign's own
+# payload marker is bun_environment.js, so a scanner that finds the Bun
+# payload by filename had no business walking past Bun's lockfile.
 LOCKFILE_NAMES: frozenset[str] = frozenset(
     {
         "package-lock.json",
@@ -619,14 +620,16 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
 
     Two passes, because neither alone is complete. The text pass covers every
     lockfile format with one code path, npm, pnpm, yarn and bun alike, and
-    catches a version wherever it appears. The JSON pass reads npm-schema
-    lockfiles structurally, package-lock.json and npm-shrinkwrap.json both
-    since shrinkwrap is the same document under another name, and catches
-    entries the text pass cannot see, such as a v3 entry with no `resolved`
-    URL. bun.lock gets the text pass alone: it is JSONC, whose trailing commas
-    the strict parser refuses quietly, and its resolution strings carry the
-    name@version tokens the patterns match. Recording the same version twice
-    is harmless, since versions are collected into sets.
+    catches a version wherever it appears. The JSON pass is dispatched on the
+    .json suffix and reads npm-schema lockfiles structurally,
+    package-lock.json and npm-shrinkwrap.json both since shrinkwrap is the
+    same document under another name, and catches entries the text pass
+    cannot see, such as a v3 entry with no `resolved` URL. bun.lock does not
+    carry that suffix, so it gets the text pass alone, which suffices: its
+    resolution strings carry the name@version tokens the patterns match, and
+    the strict JSON pass could not read it anyway, bun writing JSONC with
+    trailing commas. Recording the same version twice is harmless, since
+    versions are collected into sets.
 
     A lockfile that contributes a poisoned version is remembered by name, so a
     later re-check can submit that file alone rather than every lockfile the

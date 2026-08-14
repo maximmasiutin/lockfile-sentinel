@@ -291,8 +291,11 @@ def test_the_read_line_names_a_lockfile_the_walk_does_open(tmp_path: Path) -> No
 
 # A real bun.lock's shape: JSONC with trailing commas, resolutions as
 # "name@version" strings inside per-package tuples. The trailing commas are
-# deliberate in every case below, because a fixture the strict JSON parser
-# accepts would not prove the text pass carries this format alone.
+# deliberate: they keep the fixture true to what bun writes, and they pin the
+# fact that the text pass alone carries this format, since a strict JSON
+# parser cannot accept this document if some later change tries to hand it
+# one. The JSON pass is dispatched on the .json suffix and never sees this
+# file at all.
 BUN_LOCK = """{
   "lockfileVersion": 1,
   "workspaces": {
@@ -308,8 +311,8 @@ BUN_LOCK = """{
 def test_a_bun_lockfile_pinning_a_poisoned_version_is_found(tmp_path: Path) -> None:
     """The campaign's own payload marker is bun_environment.js, so the scanner
     found the Bun payload by filename while walking past Bun's lockfile. The
-    text pass is what carries this format: bun.lock is JSONC, whose trailing
-    commas the JSON pass refuses quietly, and the resolution strings carry the
+    text pass is what carries this format: the JSON pass is dispatched on the
+    .json suffix and never sees bun.lock, and the resolution strings carry the
     name@version tokens the patterns match."""
     lockfile = tmp_path / "bun.lock"
     lockfile.write_text(BUN_LOCK, encoding="utf-8")
