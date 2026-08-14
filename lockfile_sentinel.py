@@ -1461,7 +1461,9 @@ def _prepare_offline_table(args: argparse.Namespace) -> None:
         )
 
 
-def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> int:
+def diagnose_lockfiles(
+    osv_bin: str | None, paths: list[str], timeout: int, live_requested: bool = True
+) -> int:
     """Test named lockfiles one at a time, saying exactly what happened to each.
 
     This is the fast loop for the failure the batch scanner reports. A full
@@ -1479,11 +1481,23 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
 
     Returns 1 when anything was found or any file could not be read or
     extracted, 0 when every file was read, extracted and came back clean, and 2
-    when nothing was found but a layer did not run, since a check that did not
-    run cannot report health. A scanner that times out, fails to spawn or
-    returns unparsable output is a layer that did not run, not a file that
-    failed: it says nothing whatever about the lockfile in front of it."""
-    if not osv_bin:
+    when nothing was found but a layer that should have run did not, since a
+    check that could not run cannot report health. A scanner that times out,
+    fails to spawn or returns unparsable output is a layer that did not run, not
+    a file that failed: it says nothing whatever about the lockfile in front of
+    it.
+
+    live_requested distinguishes a live layer that could not run from one the
+    caller asked to skip. --no-osv scopes the check deliberately, so a clean run
+    under it returns 0 the same way the sweep does: 2 is for a check the caller
+    expected and did not get, not for one they declined."""
+    if not osv_bin and not live_requested:
+        _progress(
+            "--no-osv given, so the live database is not consulted. The offline "
+            "table still runs; a version it does not name will not be reported "
+            "by this run."
+        )
+    elif not osv_bin:
         _progress(
             "osv-scanner not found, so the live database is not consulted. "
             "The offline table still runs; a version it does not name will not "
@@ -1499,7 +1513,7 @@ def diagnose_lockfiles(osv_bin: str | None, paths: list[str], timeout: int) -> i
     # True once the live layer failed to reach a verdict on any file, which is
     # different from it rejecting one and is what stops a clean run reporting
     # health it cannot vouch for.
-    unavailable = not osv_bin
+    unavailable = live_requested and not osv_bin
     for given in paths:
         # Resolve before submitting: osv-scanner reports the absolute path in
         # its results, so a relative path in and an absolute path out never
@@ -2630,7 +2644,10 @@ def main() -> int:
         # overlay carries, which is the larger list by an order of magnitude.
         _prepare_offline_table(args)
         return diagnose_lockfiles(
-            find_osv_scanner(args.osv_scanner_bin), named, args.osv_timeout
+            None if args.no_osv else find_osv_scanner(args.osv_scanner_bin),
+            named,
+            args.osv_timeout,
+            live_requested=not args.no_osv,
         )
 
     # Passthrough mode short-circuits the sweep: no walk, no overlay, no report.

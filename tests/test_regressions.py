@@ -329,6 +329,32 @@ def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
     assert code == 2, "a layer that never answered cannot report health, nor a finding"
 
 
+def test_diagnosis_mode_honours_no_osv(tmp_path: Path, monkeypatch) -> None:
+    """--no-osv was ignored by --lockfile and --lockfiles-from.
+
+    The sweep honoured it and the diagnosis branch called find_osv_scanner
+    unconditionally, so a caller who asked for an offline-only check got the
+    live one anyway, with whatever network access and delay that carries.
+
+    A layer declined on purpose is also not a layer that failed, so a clean run
+    under --no-osv exits 0 rather than 2: exit 2 is for a check the caller
+    expected and did not get."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {"node_modules/keyv": {"version": "5.2.3"}},
+    }), encoding="utf-8")
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the live layer ran despite --no-osv")
+
+    monkeypatch.setattr(ls, "_run_osv_batch", refuse)
+    monkeypatch.setattr(sys, "argv", [
+        "lockfile_sentinel.py", "--lockfile", str(lockfile), "--no-osv", "--no-refresh",
+    ])
+    assert ls.main() == 0
+
+
 def test_diagnosis_mode_without_a_scanner_never_reports_health(tmp_path: Path) -> None:
     """A clean offline pass is half a check, so it cannot exit 0.
 
