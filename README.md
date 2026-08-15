@@ -62,6 +62,7 @@ python lockfile_sentinel.py --root .                      # sweep one tree
 python lockfile_sentinel.py --root a --root b --jobs 16   # several, in parallel
 python lockfile_sentinel.py --status                      # what is current, scan nothing
 python lockfile_sentinel.py --json -o findings.json       # machine-readable
+python lockfile_sentinel.py --json -o findings.json --source-revision "$GITHUB_SHA"
 python lockfile_sentinel.py --lockfile path/package-lock.json   # one file, verbosely
 python lockfile_sentinel.py --osv source -r ./app         # pass through to osv-scanner
 ```
@@ -70,7 +71,7 @@ Exit codes state coverage, not just findings: 0 means complete requested coverag
 
 ## Machine-Readable Output
 
-`--json` writes a versioned envelope rather than a bare list. `schema` names the format, `lockfile-sentinel-report` version 1, and a consumer rejects a name or version it does not know rather than guessing; field additions within version 1 are non-breaking. `tool` names the producer and its version. `invocation` records the run's id, start and finish stamps, resolved roots, `--include-node-modules`, and the layers the caller requested, so a layer declined by a `--no-*` flag reads as policy rather than as a layer that broke.
+`--json` writes a versioned envelope rather than a bare list. `schema` names the format, `lockfile-sentinel-report` version 1, and a consumer rejects a name or version it does not know rather than guessing; field additions within version 1 are non-breaking. `tool` names the producer and its version. `invocation` records the run's id, start and finish stamps, resolved roots, `--include-node-modules`, and the layers the caller requested, so a layer declined by a `--no-*` flag reads as policy rather than as a layer that broke. A pipeline should pass its checked-out commit with `--source-revision`; the report records the normalized SHA-1 or SHA-256 commit ID, and a consumer should reject a report whose revision differs from the workflow revision. The scanner does not guess from ambient Git state because one invocation may cover multiple roots.
 
 Coverage is data, not prose and not a boolean. `layers` carries one state object per detection layer, `builtin`, `overlay`, `osv` and `trivy`, each with `requested`, a `state` from `completed`, `partial`, `not_requested`, `unavailable` or `failed`, a stable `reason_code`, and the counts and provenance behind it, binary paths and versions, the overlay's digest and generation stamp, submitted and resolved counts, and duration. Each repository carries the same model in `coverage`, with `not_applicable` for a repository the layer had nothing to do in, so non-applicability and failure never share a value and a consumer never reconstructs coverage from other fields. `inputs` and `totals` reconcile the discovered, read, submitted and resolved counts at the top level.
 

@@ -14,6 +14,8 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ### Added
 
+- `--source-revision` records the pipeline-supplied SHA-1 or SHA-256 commit ID in the report invocation, so a consumer can reject a report associated with the wrong checkout. The scanner never guesses from ambient Git state.
+
 - Per-layer state objects under `layers` (`builtin`, `overlay`, `osv`, `trivy`), each with `requested`, `state` (`completed`, `partial`, `not_requested`, `unavailable`, `failed`), a stable `reason_code`, counts, binary paths and versions, the overlay digest, and durations; per-repository `coverage` objects with the same vocabulary plus `not_applicable`, carrying discovered, readable, submitted, resolved and failed counts, so a consumer never reconstructs coverage from booleans or prose.
 - A canonical `findings` array: one entry per fact with a stable derived id, kind (`malicious_resolved`, `malicious_range`, `payload_artifact`), package, version or range, evidencing files relative to the repository, advisory ids, Trivy confirmations, campaign tag, and every detection layer that saw it, so the same version flagged by the offline table and OSV is one finding with two layers.
 - A bounded structured `errors` array with stable codes (`manifest_unreadable`, `lockfile_unreadable`, `osv_submission_failed`, `binary_not_found`, `trivy_failed`, and others), scope, and a retryable flag; a truncated list says so in its last entry.
