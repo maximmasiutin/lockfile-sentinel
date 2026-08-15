@@ -20,10 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# pylint: disable=wrong-import-position  # the path insert above must run first
 import lockfile_sentinel as ls  # noqa: E402
 
 
 def test_exact_and_caret_ranges_resolve_to_a_poisoned_version() -> None:
+    """The range forms npm writes must all reach the version they cover."""
     assert ls.range_may_resolve_to("6.0.0", "6.0.0")
     assert ls.range_may_resolve_to("^6.0.0", "6.0.0")
     assert ls.range_may_resolve_to("~6.0.0", "6.0.0")
@@ -32,6 +34,8 @@ def test_exact_and_caret_ranges_resolve_to_a_poisoned_version() -> None:
 
 
 def test_ranges_that_cannot_reach_the_version_are_not_flagged() -> None:
+    """A range that excludes the version, and the forms that install no
+    registry package at all, must not produce a finding."""
     assert not ls.range_may_resolve_to("^5.0.0", "6.0.0")
     assert not ls.range_may_resolve_to("~6.1.0", "6.0.0")
     assert not ls.range_may_resolve_to("workspace:*", "6.0.0")
@@ -49,6 +53,8 @@ def test_unsupported_range_forms_under_report_rather_than_guess() -> None:
 
 
 def test_lockfile_matching_finds_both_tarball_and_bare_token_forms(tmp_path: Path) -> None:
+    """The two shapes a resolved version takes in lockfile text, the tarball
+    URL and the bare name@version token, must both be matched."""
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text(json.dumps({
         "lockfileVersion": 3,
@@ -66,6 +72,7 @@ def test_lockfile_matching_finds_both_tarball_and_bare_token_forms(tmp_path: Pat
 
 
 def test_a_clean_lockfile_produces_no_finding(tmp_path: Path) -> None:
+    """A watched package at an unaffected version is present, not poisoned."""
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text(json.dumps({
         "lockfileVersion": 3,
@@ -78,6 +85,7 @@ def test_a_clean_lockfile_produces_no_finding(tmp_path: Path) -> None:
 
 
 def test_payload_artifacts_are_flagged_by_name(tmp_path: Path) -> None:
+    """A known payload filename is a finding wherever in the tree it sits."""
     artifact = tmp_path / "bun_environment.js"
     artifact.write_text("", encoding="utf-8")
     status = ls.RepoStatus(name="t", path=str(tmp_path))
@@ -492,6 +500,48 @@ def test_stripping_a_comment_never_joins_two_lines() -> None:
     assert "keyv@6.0.0" not in stripped
 
 
+def test_an_apostrophe_in_a_bare_scalar_does_not_shield_the_comment() -> None:
+    """A quote opens a string only where a value may start. Read as an opening
+    quote, a mid-word apostrophe makes the rest of its line string content and
+    the comment behind it survives, which is the false pin this strip removes.
+    Both formats reach here: a hand-written note is where an apostrophe in a
+    bare scalar comes from, and a hand-written note is what carries a
+    commented-out entry in the first place."""
+    text = "  note: don't reinstate # keyv@6.0.0\n"
+    assert "keyv@6.0.0" not in ls._strip_hash_comments(text)
+
+
+def test_punctuation_inside_a_bare_scalar_does_not_open_a_string() -> None:
+    """`-` and `:` indicate only when whitespace follows them, and that
+    whitespace already admits the quote, so a quote directly behind either is
+    scalar content. Read as an opening quote it shields the comment behind it
+    and the commented-out pin survives, which is this strip's own defect."""
+    for text in (
+        "  note: pre-'90s # keyv@6.0.0\n",
+        "  note: ratio 3:'1 # keyv@6.0.0\n",
+    ):
+        assert "keyv@6.0.0" not in ls._strip_hash_comments(text), text
+
+
+def test_an_unclosed_quote_after_whitespace_is_an_apostrophe() -> None:
+    """Whitespace alone does not make a value start: mid plain scalar an
+    apostrophe follows a space too, and a scalar opened there never closes on
+    its line. An unclosed quote is therefore an apostrophe, not an opener,
+    and the comment behind it is still stripped."""
+    for text in (
+        "  note: remember the '90s # keyv@6.0.0\n",
+        "  note: 'til next time # keyv@6.0.0\n",
+    ):
+        assert "keyv@6.0.0" not in ls._strip_hash_comments(text), text
+
+
+def test_an_apostrophe_before_a_quoted_value_still_opens_that_value() -> None:
+    """The narrowing must not cost the quoting it exists beside: a quote that
+    does start a value keeps protecting the `#` inside it."""
+    text = "  key: 'keyv@6.0.0 # inside a value'\n"
+    assert "keyv@6.0.0 # inside a value" in ls._strip_hash_comments(text)
+
+
 def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Path) -> None:
     """npm-shrinkwrap.json is package-lock.json under another name, so it must
     take the structural pass too: an entry pinning a version with no resolved
@@ -514,4 +564,3 @@ def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Pat
     assert status.has_npm is True
     assert status.lockfiles == [str(lockfile)]
     assert "6.0.0" in status.poisoned_versions.get("keyv", set())
-
