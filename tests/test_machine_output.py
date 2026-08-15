@@ -821,6 +821,39 @@ def test_an_unrepresentable_timestamp_reads_as_unknown_not_fresh(
         assert ls.render_status_human(doc)
 
 
+def test_a_recent_check_stamp_cannot_call_a_missing_scanner_fresh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A check stamp survives the binary it described: deleted or off PATH,
+    the scanner source must read unknown, or --status exits 0 while the very
+    next sweep marks the OSV layer unavailable and exits 2."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    state = tmp_path / "logs" / "update-osv-scanner.state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({"lastCheckUnix": 253370764800}), encoding="utf-8")
+    doc = ls.gather_status(tmp_path / "missing.json", osv_bin=None)
+    assert doc["sources"]["osv_scanner"]["state"] == "unknown"
+    assert doc["overall"]["exit_code"] == 2
+
+
+def test_an_overlay_the_sweep_would_reject_is_not_reported_fresh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Presence means what load_overlay validates: a current stamp over an
+    empty or unusable packages map is a document the sweep falls back from,
+    and a status that called it fresh would vouch for inputs the scan itself
+    reports unavailable."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    overlay = tmp_path / "compromised-npm-packages.json"
+    overlay.write_text(json.dumps({
+        "generated_utc": "2026-08-15T00:00:00Z", "packages": {},
+    }), encoding="utf-8")
+    doc = ls.gather_status(overlay, osv_bin=None)
+    assert doc["sources"]["overlay"]["state"] == "absent"
+    assert doc["sources"]["overlay"]["present"] is False
+    assert doc["overall"]["exit_code"] == 2
+
+
 def test_overlay_counts_are_recomputed_never_trusted(
     tmp_path: Path, monkeypatch
 ) -> None:

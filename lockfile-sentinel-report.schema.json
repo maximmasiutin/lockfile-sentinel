@@ -53,7 +53,18 @@
           "items": { "enum": ["builtin", "overlay", "osv", "trivy"] },
           "description": "The layers the caller asked for. A layer absent from this list was declined by a --no-* flag, which is policy, not failure."
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "complete": { "const": true } },
+            "required": ["complete"]
+          },
+          "then": {
+            "properties": { "finished_utc": { "type": "string" } }
+          }
+        }
+      ]
     },
     "layers": {
       "type": "object",

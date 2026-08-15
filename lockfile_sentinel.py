@@ -1786,14 +1786,20 @@ def _status_engine(osv_bin: str | None) -> dict[str, Any]:
     engine_state = _read_json(cache_dir() / "logs" / "update-osv-scanner.state.json")
     checked_unix = _as_unix_time(engine_state.get("lastCheckUnix"))
     engine_stale = checked_unix is not None and time.time() - checked_unix > 24 * 3600
+    version = _osv_version(osv_bin) if osv_bin else None
+    # The binary itself joins the unknown predicate: a recent check stamp
+    # left behind after the binary was removed, or a PATH that no longer
+    # resolves it, would otherwise report fresh here while the very next
+    # sweep marks the OSV layer unavailable and exits 2.
+    unknown = checked_unix is None or osv_bin is None or version is None
     return {
         "path": osv_bin,
-        "version": _osv_version(osv_bin) if osv_bin else None,
+        "version": version,
         "built_from_commit": (str(engine_state["lastCommit"])[:12]
                               if engine_state.get("lastCommit") else None),
         "version_checked_unix": checked_unix,
         "stale_after_seconds": 24 * 3600,
-        "state": _freshness(checked_unix is None, engine_stale),
+        "state": _freshness(unknown, engine_stale),
     }
 
 
@@ -1858,8 +1864,15 @@ def _as_unix_time(value: Any) -> float | None:
 
 
 def _status_overlay(overlay_file: Path) -> dict[str, Any]:
-    """The campaign overlay's freshness facts, by its stamp and its refresh."""
-    overlay = _read_json(overlay_file)
+    """The campaign overlay's freshness facts, by its stamp and its refresh.
+
+    Presence means the same thing here as in the sweep: what load_overlay
+    validates and would actually apply. A document that parses but carries no
+    usable packages map is one the sweep rejects and falls back from, so a
+    status that called it fresh would tell a pipeline the inputs are
+    trustworthy while the scan itself reports the layer unavailable."""
+    packages = load_overlay(overlay_file)
+    overlay = _read_json(overlay_file) if packages else {}
     generated_unix = _overlay_generated_unix(overlay) if overlay else None
     generated = overlay.get("generated_utc") if overlay else None
     last_refresh = _overlay_refresh_unix(overlay_file)
@@ -1872,21 +1885,15 @@ def _status_overlay(overlay_file: Path) -> dict[str, Any]:
                            generated_stale or refresh_stale)
     else:
         state = "absent"
-    # Counted from the packages map rather than read from the document's own
+    # Counted from the validated map rather than read from the document's own
     # count fields, which a corrupted or hand-edited overlay can carry as
     # NaN, booleans or strings: those would flow straight into the status
     # JSON, where the schema promises an integer or null and NaN is not JSON.
-    packages = overlay.get("packages") if overlay else None
-    if isinstance(packages, dict):
-        package_count: int | None = len(packages)
-        version_count: int | None = sum(
-            len(v) for v in packages.values() if isinstance(v, list))
-    else:
-        package_count = None
-        version_count = None
+    package_count = len(packages) if packages else None
+    version_count = sum(len(v) for v in packages.values()) if packages else None
     return {
         "path": str(overlay_file),
-        "present": bool(overlay),
+        "present": bool(packages),
         "package_count": package_count,
         "version_count": version_count,
         "generated_utc": generated if isinstance(generated, str) else None,
