@@ -520,9 +520,10 @@ def latest_osv_version(timeout: int = 30) -> str | None:
             request = urllib.request.Request(
                 url, headers={"User-Agent": "update-scanners", "Accept": "application/json"}
             )
-            # The URL is one of two module-level https constants, so the
-            # file:// scheme the audit rule worries about cannot be reached.
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+            # The URL is one of two module-level https constants, and the
+            # https-only opener keeps a redirect from carrying the connection
+            # somewhere those constants do not name.
+            with open_https(request, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
             value = data.get(key)
             if value:
@@ -820,8 +821,14 @@ def target_malicious_packages(args) -> int:
     # The feed URL is operator-supplied, and urlopen would happily read a
     # file:// or http:// source. A local file is not a feed, and a cleartext
     # fetch invites the substitution this overlay exists to catch, so anything
-    # but https is refused before a request is built.
-    if urllib.parse.urlsplit(args.source_url).scheme != "https":
+    # but https is refused before a request is built. urlsplit itself raises on
+    # a malformed authority such as an unmatched bracket, and a mistyped URL
+    # deserves the same one-line refusal as a wrong scheme, not a traceback.
+    try:
+        scheme = urllib.parse.urlsplit(args.source_url).scheme
+    except ValueError:
+        scheme = ""
+    if scheme != "https":
         log(f"refusing a non-https IOC feed URL: {args.source_url}")
         return 1
 

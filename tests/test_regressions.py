@@ -1224,7 +1224,11 @@ def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monk
         min_interval = 0
         force = True
 
-    for url in ("file:///C:/Windows/win.ini", "http://example.invalid/iocs.csv"):
+    # The unmatched bracket is the case urlsplit itself raises on, so it pins
+    # that a mistyped URL earns the same one-line refusal as a wrong scheme
+    # rather than a traceback.
+    for url in ("file:///C:/Windows/win.ini", "http://example.invalid/iocs.csv",
+                "https://["):
         Args.source_url = url
         assert us.target_malicious_packages(Args()) == 1, f"accepted {url}"
 
