@@ -612,6 +612,57 @@ def scan_npm_lockfile_json(text: str, status: RepoStatus) -> None:
         walk_v1(data.get("dependencies"))
 
 
+def _strip_jsonc_comments(text: str) -> str:
+    """Remove // and /* */ comments from JSONC, leaving string contents alone.
+
+    String awareness is the whole job. Every registry URL carries the line
+    comment marker inside a string, `https://` and all, so a stripper that did
+    not track string state would truncate the exact lines the tarball patterns
+    match and silently lose every finding in the file. Escapes are honoured so
+    a quote written as \\" inside a string cannot end it early.
+
+    Newlines inside a block comment are kept, so removing one never joins two
+    lines into a token that neither line carried."""
+    out: list[str] = []
+    position = 0
+    length = len(text)
+    in_string = False
+    while position < length:
+        char = text[position]
+        if in_string:
+            out.append(char)
+            if char == "\\" and position + 1 < length:
+                out.append(text[position + 1])
+                position += 2
+                continue
+            if char == '"':
+                in_string = False
+            position += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            position += 1
+            continue
+        if char == "/" and position + 1 < length and text[position + 1] == "/":
+            while position < length and text[position] != "\n":
+                position += 1
+            continue
+        if char == "/" and position + 1 < length and text[position + 1] == "*":
+            position += 2
+            while position + 1 < length and not (
+                text[position] == "*" and text[position + 1] == "/"
+            ):
+                if text[position] == "\n":
+                    out.append("\n")
+                position += 1
+            position += 2
+            continue
+        out.append(char)
+        position += 1
+    return "".join(out)
+
+
 def scan_lockfile(path: Path, status: RepoStatus) -> bool:
     """Record every watched-package version actually resolved in a lockfile.
 
@@ -645,6 +696,12 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
+    if path.name.lower() == "bun.lock":
+        # JSONC admits comments, and the token patterns match raw text, so a
+        # commented-out entry naming a poisoned version would otherwise be
+        # recorded as a resolved pin the effective tree does not contain. A
+        # comment installs nothing, so stripping it loses no real pin.
+        text = _strip_jsonc_comments(text)
     before = _poison_count(status)
     if path.name.lower().endswith(".json"):
         scan_npm_lockfile_json(text, status)

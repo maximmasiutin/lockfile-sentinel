@@ -349,6 +349,64 @@ def test_a_bun_repository_is_walked_scanned_and_reported_as_npm(tmp_path: Path) 
     assert "bun.lock" in line
 
 
+def test_a_commented_out_bun_entry_is_not_reported_as_a_resolved_pin(tmp_path: Path) -> None:
+    """bun.lock is JSONC and admits comments, and the token patterns match raw
+    text, so a commented-out poisoned entry produced vulnerable: YES for a pin
+    the effective tree does not contain. A comment installs nothing, so
+    stripping it loses no real pin and opens no evasion channel."""
+    lockfile = tmp_path / "bun.lock"
+    lockfile.write_text(
+        '{\n'
+        '  "lockfileVersion": 1,\n'
+        '  // "keyv": ["keyv@6.0.0", "", {}, "sha512-dead"],\n'
+        '  /* "cacheable": ["cacheable@2.5.1", "", {}, "sha512-dead"], */\n'
+        '  "packages": {\n'
+        '    "left-pad": ["left-pad@1.3.0", "", {}, "sha512-live"],\n'
+        '  },\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    assert ls.scan_lockfile(lockfile, status) is True
+    assert not status.poisoned_versions
+
+
+def test_comment_markers_inside_strings_do_not_end_the_scan_of_a_line() -> None:
+    """Every registry URL carries the line comment marker inside a string, so a
+    stripper without string awareness would truncate the exact lines the
+    tarball patterns match. The live pin beside the comments must survive."""
+    text = (
+        '{\n'
+        '  // dead: "keyv@6.0.0"\n'
+        '  "resolved": "https://registry.npmjs.org/keyv/-/keyv-6.0.0.tgz",\n'
+        '  "escaped": "a\\"quote//not-a-comment",\n'
+        '}\n'
+    )
+    stripped = ls._strip_jsonc_comments(text)
+    assert "https://registry.npmjs.org/keyv/-/keyv-6.0.0.tgz" in stripped
+    assert 'dead: "keyv@6.0.0"' not in stripped
+    assert "quote//not-a-comment" in stripped
+
+
+def test_a_live_bun_pin_still_matches_after_the_comments_go(tmp_path: Path) -> None:
+    """The negative case proves nothing alone: a stripper that emptied the file
+    would pass it too."""
+    lockfile = tmp_path / "bun.lock"
+    lockfile.write_text(
+        '{\n'
+        '  "lockfileVersion": 1,\n'
+        '  // a comment above a live entry\n'
+        '  "packages": {\n'
+        '    "keyv": ["keyv@6.0.0", "", {}, "sha512-live"],\n'
+        '  },\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    ls.scan_lockfile(lockfile, status)
+    assert "6.0.0" in status.poisoned_versions.get("keyv", set())
+
+
 def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Path) -> None:
     """npm-shrinkwrap.json is package-lock.json under another name, so it must
     take the structural pass too: an entry pinning a version with no resolved
