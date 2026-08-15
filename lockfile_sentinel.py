@@ -1968,7 +1968,8 @@ def render_status_human(doc: dict[str, Any]) -> list[str]:
 
 
 def report_status(overlay_file: Path, osv_bin: str | None,
-                  as_json: bool = False, check_live: bool = False) -> int:
+                  as_json: bool = False, check_live: bool = False,
+                  output: str | None = None) -> int:
     """Report when each thing the scanner relies on was last updated.
 
     A scanner is only as current as its inputs, and every one of them is
@@ -1984,10 +1985,19 @@ def report_status(overlay_file: Path, osv_bin: str | None,
     different question."""
     doc = gather_status(overlay_file, osv_bin, check_live=check_live)
     if as_json:
-        print(json.dumps(doc, indent=2))
+        text = json.dumps(doc, indent=2) + "\n"
     else:
-        for line in render_status_human(doc):
-            print(line)
+        text = "\n".join(render_status_human(doc)) + "\n"
+    if output:
+        # The advertised -o option applies here too: a status pipeline that
+        # asked for a file and got stdout has silently lost its document.
+        try:
+            _write_atomic(Path(output), text)
+        except OSError as exc:
+            _progress(f"FAIL: could not write the status to {output} ({exc})")
+            return 2
+    else:
+        sys.stdout.write(text)
     overall = doc["overall"]
     return int(overall["exit_code"])
 
@@ -4069,7 +4079,7 @@ def _dispatch_special_modes(args: argparse.Namespace) -> int | None:
     if args.status:
         return report_status(
             Path(args.overlay_file), find_osv_scanner(args.osv_scanner_bin),
-            as_json=args.json, check_live=args.check_live,
+            as_json=args.json, check_live=args.check_live, output=args.output,
         )
 
     if args.selftest:

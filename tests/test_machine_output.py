@@ -753,6 +753,19 @@ def test_the_status_schema_matches_what_gather_status_writes(
     assert doc["overall"]["state"] in schema["properties"]["overall"]["properties"]["state"]["enum"]
 
 
+def test_status_honours_the_output_option(tmp_path: Path, monkeypatch) -> None:
+    """A status pipeline that asked for a file and got stdout has silently
+    lost its document, so -o writes the status there, atomically, in either
+    format."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    target = tmp_path / "status.json"
+    code = ls.report_status(tmp_path / "missing.json", osv_bin=None,
+                            as_json=True, output=str(target))
+    assert code == 2
+    document = json.loads(target.read_text(encoding="utf-8"))
+    assert document["schema"]["name"] == "lockfile-sentinel-status"
+
+
 def test_status_without_an_overlay_reports_absent_and_exit_2(
     tmp_path: Path, monkeypatch
 ) -> None:
