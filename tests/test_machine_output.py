@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -830,10 +831,19 @@ def test_a_recent_check_stamp_cannot_call_a_missing_scanner_fresh(
     monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
     state = tmp_path / "logs" / "update-osv-scanner.state.json"
     state.parent.mkdir(parents=True)
-    state.write_text(json.dumps({"lastCheckUnix": 253370764800}), encoding="utf-8")
+    state.write_text(json.dumps({"lastCheckUnix": time.time()}), encoding="utf-8")
     doc = ls.gather_status(tmp_path / "missing.json", osv_bin=None)
     assert doc["sources"]["osv_scanner"]["state"] == "unknown"
     assert doc["overall"]["exit_code"] == 2
+
+
+def test_a_timestamp_materially_in_the_future_reads_as_unknown() -> None:
+    """A future stamp would read as fresh forever, so anything beyond a day
+    of clock skew is refused; the skew a real machine pair can show is
+    accepted."""
+    assert ls._as_unix_time(time.time() + 7 * 86400) is None
+    assert ls._as_unix_time(4102444800) is None
+    assert ls._as_unix_time(time.time() + 60) is not None
 
 
 def test_an_overlay_the_sweep_would_reject_is_not_reported_fresh(
