@@ -3512,6 +3512,11 @@ def _repo_trivy_coverage(
     elif status.trivy_failed_count:
         state = "partial"
         reasons.append("trivy_scan_failed")
+    elif status.trivy_submitted_count < flagged:
+        # Mirrors the layer-level rule: a snapshot written before the Trivy
+        # pass must not report a repository's corroboration as done.
+        state = "partial"
+        reasons.append("corroboration_pending")
     else:
         state = "completed"
     return {

@@ -704,6 +704,19 @@ def test_trivy_stays_pending_in_snapshots_until_every_flagged_file_was_submitted
     assert done["state"] == "completed"
 
 
+def test_repository_trivy_coverage_also_stays_pending_before_submission() -> None:
+    """The repository-level object obeys the same rule as the layer, so a
+    snapshot cannot show a partial layer over completed repositories."""
+    flagged = ls.RepoStatus(name="t", path="/t")
+    flagged.flagged_lockfiles = {"/t/package-lock.json"}
+    pending = ls._repo_trivy_coverage(flagged, requested=True, available=True)
+    assert pending["state"] == "partial"
+    assert pending["reason_codes"] == ["corroboration_pending"]
+    flagged.trivy_submitted_count = 1
+    done = ls._repo_trivy_coverage(flagged, requested=True, available=True)
+    assert done["state"] == "completed"
+
+
 def test_refused_roots_invalidate_a_stale_report_on_disk(
     tmp_path: Path,
 ) -> None:
