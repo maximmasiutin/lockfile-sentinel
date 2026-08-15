@@ -20,10 +20,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import lockfile_sentinel as ls  # noqa: E402
+import lockfile_sentinel as ls  # noqa: E402  # pylint: disable=wrong-import-position
 
 
 def test_exact_and_caret_ranges_resolve_to_a_poisoned_version() -> None:
+    """Every supported range form that can reach the poisoned version flags."""
     assert ls.range_may_resolve_to("6.0.0", "6.0.0")
     assert ls.range_may_resolve_to("^6.0.0", "6.0.0")
     assert ls.range_may_resolve_to("~6.0.0", "6.0.0")
@@ -32,6 +33,7 @@ def test_exact_and_caret_ranges_resolve_to_a_poisoned_version() -> None:
 
 
 def test_ranges_that_cannot_reach_the_version_are_not_flagged() -> None:
+    """A range the poisoned version cannot satisfy stays quiet."""
     assert not ls.range_may_resolve_to("^5.0.0", "6.0.0")
     assert not ls.range_may_resolve_to("~6.1.0", "6.0.0")
     assert not ls.range_may_resolve_to("workspace:*", "6.0.0")
@@ -49,6 +51,7 @@ def test_unsupported_range_forms_under_report_rather_than_guess() -> None:
 
 
 def test_lockfile_matching_finds_both_tarball_and_bare_token_forms(tmp_path: Path) -> None:
+    """Both textual shapes a resolved pin takes are matched and flagged."""
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text(json.dumps({
         "lockfileVersion": 3,
@@ -66,6 +69,7 @@ def test_lockfile_matching_finds_both_tarball_and_bare_token_forms(tmp_path: Pat
 
 
 def test_a_clean_lockfile_produces_no_finding(tmp_path: Path) -> None:
+    """A watched package at a clean version is recorded, never flagged."""
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text(json.dumps({
         "lockfileVersion": 3,
@@ -78,6 +82,7 @@ def test_a_clean_lockfile_produces_no_finding(tmp_path: Path) -> None:
 
 
 def test_payload_artifacts_are_flagged_by_name(tmp_path: Path) -> None:
+    """A known worm payload filename is flagged wherever it sits."""
     artifact = tmp_path / "bun_environment.js"
     artifact.write_text("", encoding="utf-8")
     status = ls.RepoStatus(name="t", path=str(tmp_path))
@@ -407,6 +412,64 @@ def test_a_live_bun_pin_still_matches_after_the_comments_go(tmp_path: Path) -> N
     assert "6.0.0" in status.poisoned_versions.get("keyv", set())
 
 
+def test_a_commented_out_yarn_entry_is_not_reported_as_a_resolved_pin(tmp_path: Path) -> None:
+    """yarn.lock admits # line comments, so a commented-out poisoned entry
+    produced vulnerable: YES for a pin the effective tree does not contain,
+    the same defect the bun.lock stripper closed for JSONC. The live pin
+    beside it must survive, or the negative half proves nothing."""
+    lockfile = tmp_path / "yarn.lock"
+    lockfile.write_text(
+        "# yarn lockfile v1\n"
+        '# keyv@6.0.0:\n'
+        '#   version "6.0.0"\n'
+        'left-pad@1.3.0:\n'
+        '  version "1.3.0"\n'
+        'cacheable@2.5.1: # a trailing comment must not hide the line before it\n'
+        '  version "2.5.1"\n',
+        encoding="utf-8",
+    )
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    assert ls.scan_lockfile(lockfile, status) is True
+    assert "6.0.0" not in status.poisoned_versions.get("keyv", set())
+    assert "2.5.1" in status.poisoned_versions.get("cacheable", set())
+
+
+def test_a_commented_out_pnpm_entry_is_not_reported_as_a_resolved_pin(tmp_path: Path) -> None:
+    """pnpm-lock.yaml is YAML, whose # comments follow the same rule."""
+    lockfile = tmp_path / "pnpm-lock.yaml"
+    lockfile.write_text(
+        "lockfileVersion: '9.0'\n"
+        "packages:\n"
+        "  # keyv@6.0.0:\n"
+        "  #   resolution: {tarball: https://registry.npmjs.org/keyv/-/keyv-6.0.0.tgz}\n"
+        "  left-pad@1.3.0:\n"
+        "    resolution: {integrity: sha512-live}\n",
+        encoding="utf-8",
+    )
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    assert ls.scan_lockfile(lockfile, status) is True
+    assert not status.poisoned_versions
+
+
+def test_a_hash_inside_a_quoted_resolved_url_survives_the_stripping() -> None:
+    """A yarn resolved field carries the tarball URL with a #<hash> fragment
+    inside its quotes, which is exactly the line the tarball patterns match:
+    a string-blind stripper would truncate every line that can prove a pin.
+    A # glued to an unquoted scalar is YAML content too, not a comment."""
+    text = (
+        'keyv@^6.0.0:\n'
+        '  version "6.0.0"\n'
+        '  resolved "https://registry.yarnpkg.com/keyv/-/keyv-6.0.0.tgz#00c04fed" # trailing\n'
+        "  anchor: value#fragment\n"
+        '  note: "spaced # stays inside quotes"\n'
+    )
+    stripped = ls._strip_hash_comments(text)
+    assert "keyv-6.0.0.tgz#00c04fed" in stripped
+    assert "trailing" not in stripped
+    assert "value#fragment" in stripped
+    assert "spaced # stays inside quotes" in stripped
+
+
 def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Path) -> None:
     """npm-shrinkwrap.json is package-lock.json under another name, so it must
     take the structural pass too: an entry pinning a version with no resolved
@@ -429,4 +492,3 @@ def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Pat
     assert status.has_npm is True
     assert status.lockfiles == [str(lockfile)]
     assert "6.0.0" in status.poisoned_versions.get("keyv", set())
-

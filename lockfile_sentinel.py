@@ -324,6 +324,8 @@ PAYLOAD_FILENAMES: frozenset[str] = frozenset(
 # each tested in several places, and a scanner whose dispatch literals can
 # drift apart is a scanner whose passes can disagree about which file is which.
 BUN_LOCKFILE_NAME = "bun.lock"
+YARN_LOCKFILE_NAME = "yarn.lock"
+PNPM_LOCKFILE_NAME = "pnpm-lock.yaml"
 JSON_SUFFIX = ".json"
 MANIFEST_NAME = "package.json"
 
@@ -336,8 +338,8 @@ LOCKFILE_NAMES: frozenset[str] = frozenset(
     {
         "package-lock.json",
         "npm-shrinkwrap.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
+        PNPM_LOCKFILE_NAME,
+        YARN_LOCKFILE_NAME,
         BUN_LOCKFILE_NAME,
     }
 )
@@ -802,6 +804,43 @@ def _skip_block_comment(text: str, position: int, out: list[str]) -> int:
     return position + 2
 
 
+def _strip_hash_comments(text: str) -> str:
+    """Remove # comments from the YAML-family lockfiles, leaving strings alone.
+
+    String awareness is the whole job here too: a yarn.lock `resolved` field
+    carries the tarball URL with a `#<hash>` fragment inside its quotes, which
+    is exactly the line the tarball patterns match, so a stripper blind to
+    quoting would truncate every line that can prove a resolved pin. Both
+    single and double quotes are honoured, with backslash escapes inside
+    double quotes, which covers the two formats' actual output.
+
+    A `#` only opens a comment at the start of a line or after whitespace,
+    which is YAML's own rule and keeps a fragment or anchor glued to a scalar
+    (`foo#bar`) out of the definition of a comment."""
+    return "\n".join(_strip_hash_from_line(line) for line in text.split("\n"))
+
+
+def _strip_hash_from_line(line: str) -> str:
+    """Cut one line at its first unquoted, whitespace-preceded # marker."""
+    quote: str | None = None
+    position = 0
+    length = len(line)
+    while position < length:
+        char = line[position]
+        if quote:
+            if char == "\\" and quote == '"':
+                position += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "#" and (position == 0 or line[position - 1] in (" ", "\t")):
+            return line[:position]
+        position += 1
+    return line
+
+
 def scan_lockfile(path: Path, status: RepoStatus) -> bool:
     """Record every watched-package version actually resolved in a lockfile.
 
@@ -841,6 +880,12 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
         # recorded as a resolved pin the effective tree does not contain. A
         # comment installs nothing, so stripping it loses no real pin.
         text = _strip_jsonc_comments(text)
+    elif path.name.lower() in (YARN_LOCKFILE_NAME, PNPM_LOCKFILE_NAME):
+        # The same defect in the sibling formats: both admit # line comments,
+        # so a commented-out name@version would register as a resolved pin.
+        # Fixing bun.lock alone left the text pass inconsistent about what a
+        # comment is.
+        text = _strip_hash_comments(text)
     # Matched into a probe of this file alone, then merged, so a poisoned pair
     # already known from an earlier lockfile is still attributed to this one:
     # diffing against the repository-wide state credited only the first file
@@ -2466,7 +2511,7 @@ def _dump_format_hints(name: str, path: str, text: str, lines: list[str]) -> Non
     """The format-specific shape checks, dispatched on the lockfile's name."""
     if name.endswith(JSON_SUFFIX):
         _dump_json_hints(path, lines)
-    elif name == "pnpm-lock.yaml":
+    elif name == PNPM_LOCKFILE_NAME:
         head = [line for line in text.splitlines()[:6] if line.strip()]
         lines.append(f"      first lines: {head}")
         match = re.search(r"lockfileVersion:\s*'?([\d.]+)'?", text)
@@ -2474,7 +2519,7 @@ def _dump_format_hints(name: str, path: str, text: str, lines: list[str]) -> Non
             f"      lockfileVersion: {match.group(1)}" if match
             else "      no lockfileVersion line found"
         )
-    elif name == "yarn.lock":
+    elif name == YARN_LOCKFILE_NAME:
         lines.append("      yarn berry format (__metadata present)" if "__metadata:" in text
                      else "      yarn classic v1 format")
     elif name == BUN_LOCKFILE_NAME:
