@@ -6,7 +6,7 @@ A fast, zero-dependency npm supply-chain scanner. Originally built to detect the
 
 Inputs are lockfiles, `package.json` ranges and repository trees by filename, so a poisoning that has already been installed and one that the next install would pull are both reported, and known worm payload artifacts are found by name wherever they sit.
 
-The scanner is one file, the standard library only, and needs Python 3.12 or newer. CI tests 3.12, the floor, on Linux, Windows and macOS; a later release is untested here rather than known to work. Download it and run it.
+The scanner is one file, the standard library only, and needs Python 3.12 or newer. CI tests 3.12, the floor, on Linux, Windows and macOS, plus Python 3.14 on Linux. Download it and run it.
 
 ## Python 3.12 Is a Requirement, Not a Preference
 
@@ -23,7 +23,7 @@ python -m bandit -r . -x ./tests
 python -m pytest -q
 ```
 
-All four run in CI, on Linux, Windows and macOS, each on Python 3.12, with the same scope each has above: `mypy` and `pylint` over the four named files, `bandit` over the repository except `tests/`, and `pytest` over the suite. That one interpreter is the tested set, which is a different claim from the requirement: 3.12 is the floor because older ones reject the syntax at parse time, and anything above it is simply not exercised here until the matrix grows.
+All four run in CI on Python 3.12 across Linux, Windows and macOS, with an additional Python 3.14 Linux job. The scope matches the commands above: `mypy` and `pylint` cover the four named files, `bandit` covers the repository except `tests/`, and `pytest` covers the suite. The floor catches accidental newer syntax on every supported OS; the newest interpreter catches removals and stricter runtime behaviour without multiplying every intermediate version across the OS matrix.
 
 A green tick is worth less than it looks, and the two halves of why are worth separating because only one of them lives in this repository. What the workflow file guarantees is that the checks run: on every pull request, and on a push to `master` after the commit has already landed, where a failing run removes nothing. Whether a failing run *blocks* anything is not in this repository at all. That is branch protection, a setting in the GitHub project rather than a file you can read here, and it differs in a fork, so this paragraph cannot state it and stay true. Check it yourself if it matters; a red run stops a merge only where a required status check says so.
 
