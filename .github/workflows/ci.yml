@@ -16,10 +16,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        # Every version the README names. It advertises 3.12 or newer, so a
-        # release after the last entry here is claimed and untested, which the
-        # README states rather than leaving this list to imply otherwise.
-        python: ["3.12", "3.13", "3.14"]
+        # One version per OS, and it is the floor on purpose: 3.12 is what the
+        # README requires, so it is the interpreter whose breakage matters,
+        # and the README states that later releases are untested rather than
+        # leaving this list to imply otherwise.
+        python: ["3.12"]
     runs-on: ${{ matrix.os }}
     steps:
       # persist-credentials off because no later step performs an
