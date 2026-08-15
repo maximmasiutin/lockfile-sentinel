@@ -590,6 +590,17 @@ def test_a_stale_lock_is_broken_by_exactly_one_taker(tmp_path: Path) -> None:
     assert ls._acquire_overlay_lock(overlay, lock) is False
 
 
+def test_a_late_breaker_hands_back_a_lock_that_turned_out_fresh(tmp_path: Path) -> None:
+    """The interleaving the rename alone leaves open: a taker that observed
+    the stale lock renames only after the winner has recreated a fresh one.
+    The claim is re-checked after the rename, handed back as a restored
+    placeholder, and the late taker defers, so the winner's hold survives."""
+    lock = tmp_path / "compromised-npm-packages.json.lock"
+    lock.write_text("", encoding="utf-8")
+    assert ls._break_stale_lock(lock) is False
+    assert lock.exists()
+
+
 # --------------------------------------------------------------------------
 # The status document.
 # --------------------------------------------------------------------------

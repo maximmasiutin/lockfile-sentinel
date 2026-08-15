@@ -1487,20 +1487,44 @@ def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> bool:
         _progress("another refresh holds the overlay lock; using what is on disk")
         return False
     _progress("breaking an overlay lock older than fifteen minutes")
-    # The break is an atomic rename rather than an unlink, because two
-    # processes can both observe the same stale lock: with unlink, the loser
-    # would remove the winner's fresh lock and both would refresh at once.
-    # Only one rename of the same file can succeed, and the winner still has
-    # to win the exclusive create afterwards.
+    return _break_stale_lock(lock_file)
+
+
+def _break_stale_lock(lock_file: Path) -> bool:
+    """Take over a lock believed stale, without ever removing a live one.
+
+    The break is an atomic rename rather than an unlink, because two
+    processes can both observe the same stale lock: with unlink, the loser
+    would remove the winner's fresh lock and both would refresh at once.
+    Only one rename of the same file can succeed, and the winner still has
+    to win the exclusive create afterwards.
+
+    The rename alone still leaves one interleaving open: a taker that
+    observed the stale lock, lost the race, and renames only after the winner
+    has already recreated a fresh lock at the same path. So what was claimed
+    is checked again after the rename, and a claim that turns out fresh is
+    handed back: a placeholder is restored at the lock path so the winner's
+    hold stays visible, and this caller defers."""
     claimed = lock_file.with_name(f"{lock_file.name}.stale-{os.getpid()}")
     try:
         os.replace(lock_file, claimed)
     except OSError:
         return False
+    claim_was_stale = True
+    try:
+        claim_was_stale = time.time() - claimed.stat().st_mtime > 15 * 60
+    except OSError:
+        pass
     try:
         claimed.unlink()
     except OSError:
         pass
+    if not claim_was_stale:
+        try:
+            os.close(os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except OSError:
+            pass
+        return False
     try:
         os.close(os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         return True
