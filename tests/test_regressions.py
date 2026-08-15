@@ -318,14 +318,14 @@ def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text("{}", encoding="utf-8")
 
-    def timed_out(*_args, **kwargs):
+    # The stub stands in for a function whose None answer is the case under
+    # test, so the return is the point rather than an accident of falling
+    # off the end.
+    def timed_out(*_args, **kwargs):  # pylint: disable=useless-return
         failure = kwargs.get("failure")
         if failure is not None:
             failure["cause"] = "unavailable"
-        # The stub stands in for a function whose None answer is the case under
-        # test, so the return is the point rather than an accident of falling
-        # off the end.
-        return None  # pylint: disable=useless-return
+        return None
 
     monkeypatch.setattr(ls, "_run_osv_batch", timed_out)
     code = ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
@@ -1519,6 +1519,123 @@ def test_the_space_requirement_follows_what_is_staged(tmp_path, monkeypatch) -> 
 
     with us.scratch_dir("test", near=cache, need=small_need) as scratch:
         assert scratch.parent == tmp_path, f"fell through to the fallback: {scratch}"
+
+
+def test_a_missing_cache_parent_is_created_rather_than_rejected(tmp_path, monkeypatch) -> None:
+    """Refusing to stage in a directory the run is about to create was absurd.
+
+    On a first run against a host with no cache yet, the availability check
+    rejected the cache parent and the download fell through to the system
+    temporary volume, the small one, in the one case the mechanism was most
+    needed. Promotion creates the parent moments later anyway."""
+    cache = tmp_path / "brand-new" / "trivy-cache"
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 100 * 1024 ** 3)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert scratch.parent == cache.parent, f"fell through to the fallback: {scratch}"
+        assert cache.parent.is_dir()
+
+
+def test_no_volume_with_room_refuses_before_downloading(tmp_path, monkeypatch) -> None:
+    """Deciding during the download costs a gigabyte to report the wrong symptom.
+
+    When every candidate and the last-resort system temporary directory are all
+    measurably short, the run used to proceed anyway and die inside Trivy with
+    an obscure write error. The refusal happens before a byte is spent and
+    names each base with its figure."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us.tempfile, "gettempdir", lambda: str(tmp_path / "small-temp"))
+    (tmp_path / "small-temp").mkdir()
+    monkeypatch.setattr(us, "free_bytes", lambda path: 1024)
+
+    with pytest.raises(us.ScratchUnavailableError) as refusal:
+        with us.scratch_dir("test", near=cache):
+            pytest.fail("a scratch was yielded despite no volume having room")
+    assert "GB" in str(refusal.value)
+    assert str(cache.parent) in str(refusal.value)
+
+
+def test_an_unmeasurable_last_resort_still_proceeds(tmp_path, monkeypatch) -> None:
+    """Unknown is not known-short, and refusing on it would refuse blind.
+
+    free_bytes answers None where the filesystem will not say. A refusal is a
+    claim that no volume has room, which cannot be made about a volume whose
+    room could not be read."""
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(us, "free_bytes", lambda path: None)
+
+    with us.scratch_dir("test") as scratch:
+        assert scratch.parent == tmp_path
+
+
+def test_a_cleanup_failure_reaches_the_callers_list(tmp_path, monkeypatch) -> None:
+    """The WARNING in the log is not enough for a scheduled run to turn amber.
+
+    The finally cannot raise without masking an exception already in flight,
+    so the leaked path is appended to the caller's list, which is how the exit
+    code learns the work succeeded but a gigabyte was left behind."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 100 * 1024 ** 3)
+    real_rmtree = us.shutil.rmtree
+
+    def refuse_scratch_removal(path, *args, **kwargs):
+        if Path(str(path)).name.startswith("temp-"):
+            raise OSError(32, "held open by another process")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(us.shutil, "rmtree", refuse_scratch_removal)
+
+    leaks: list[Path] = []
+    with us.scratch_dir("test", near=cache, leaks=leaks) as scratch:
+        kept = scratch
+    assert leaks == [kept], "the failed cleanup did not reach the caller"
+
+    with pytest.raises(ValueError, match="in flight"):
+        with us.scratch_dir("test", near=cache, leaks=leaks):
+            raise ValueError("the failure already in flight")
+    assert len(leaks) == 2, "the cleanup failure went unrecorded on the failure path"
+
+
+def test_a_leaked_scratch_turns_the_exit_amber_but_not_red(tmp_path, monkeypatch) -> None:
+    """Exit 0 with a leak looks identical to a clean run, and nothing else looks.
+
+    A refresh that downloaded, gated and promoted correctly and then could not
+    remove its scratch exits 3: distinct from success, and distinct from a
+    failed refresh, so a scheduler can tell the databases are fine while the
+    disk is quietly filling."""
+    cache = tmp_path / "trivy-cache"
+    soon = datetime.now(timezone.utc) + timedelta(days=1)
+    fresh = {"vulnerability": {"updated": soon, "next_update": soon},
+             "java": {"updated": soon, "next_update": soon}}
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "resolve_trivy", lambda: "trivy")
+    monkeypatch.setattr(us, "trivy_freshness", lambda _trivy, env=None: dict(fresh))
+    monkeypatch.setattr(us, "run", lambda *args, **kwargs: (0, ""))
+    monkeypatch.setattr(us, "trivy_cache_dir_default", lambda: cache)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 100 * 1024 ** 3)
+    real_rmtree = us.shutil.rmtree
+
+    def refuse_scratch_removal(path, *args, **kwargs):
+        if Path(str(path)).name.startswith("temp-"):
+            raise OSError(32, "held open by another process")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(us.shutil, "rmtree", refuse_scratch_removal)
+
+    class Args:
+        """The argparse namespace target_trivy_db expects, pinned."""
+        force = True
+        skip_java_db = False
+        skip_scan = True
+
+    assert us.target_trivy_db(Args()) == 3
+    assert cache.is_dir(), "the leak verdict displaced the promotion itself"
 
 
 def test_a_symlinked_cache_stages_on_the_volume_it_points_at(tmp_path, monkeypatch) -> None:

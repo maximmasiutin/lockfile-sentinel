@@ -1667,9 +1667,113 @@ def report_scratch_privacy(path: Path, sid: str | None) -> None:
             "so an entry granted there later reaches the staged database.")
 
 
+class ScratchUnavailableError(RuntimeError):
+    """No scratch base can hold the download, stated before a byte is spent.
+
+    A distinct type rather than a bare RuntimeError so the caller can tell a
+    missing prerequisite, which is worth its own exit code, from a genuine
+    malfunction, which deserves a traceback."""
+
+
+def _pick_scratch_base(candidates: list[tuple[str, str]], near: Path | None,
+                       need: int, passed_over: list[str]) -> Path | None:
+    """The first candidate that is a directory, outside the cache, with room.
+
+    Every rejection is logged where it happens and summarised into
+    `passed_over`, so a later refusal can name each base and why it lost
+    without re-measuring anything."""
+    for value, origin in candidates:
+        if not value:
+            continue
+        path = Path(value)
+        if not path.is_dir():
+            log(f"scratch base {value} from {origin} is not available")
+            passed_over.append(f"{value} from {origin} (not a directory)")
+            continue
+        if near is not None and is_inside(path, near):
+            # Promotion renames the live cache aside before moving the staged
+            # tree in. A scratch under the cache travels with that rename, so
+            # the move then names a path that no longer exists and the run ends
+            # with no live cache and the databases stranded in the .previous
+            # tree. Refusing here is the point: a base configured to sit inside
+            # the directory it is staging for is a mistake worth naming rather
+            # than one worth quietly relocating.
+            log(f"scratch base {value} from {origin} is inside the cache {near} that the "
+                "download is promoted into, where it would be carried away by the "
+                "promotion and leave no live cache; passing over it")
+            passed_over.append(f"{value} from {origin} (inside the cache)")
+            continue
+        free = free_bytes(path)
+        if free is not None and free < need:
+            log(f"scratch base {value} from {origin} has {describe_free(free)}, under the "
+                f"{need / 1024 ** 3:.1f} GB this refresh needs; "
+                "passing over it")
+            passed_over.append(f"{value} from {origin} ({describe_free(free)})")
+            continue
+        return path
+    return None
+
+
+def _fallback_scratch_base(near: Path | None, real_near: Path | None,
+                           need: int, passed_over: list[str]) -> Path:
+    """The last resort when every candidate lost, or the refusal to have one.
+
+    Raises ScratchUnavailableError rather than returning a base that is
+    measurably short or certainly fatal, since deciding here is what spares
+    the run from finding out a gigabyte later."""
+    system = Path(tempfile.gettempdir())
+    if near is not None and is_inside(system, near):
+        # The containment rule has to hold on the last resort too, or the
+        # failure it exists to prevent simply moves here: a scratch under the
+        # cache is carried off by the promotion rename, and the run ends with
+        # no live cache at all. Low free space only makes the download likely
+        # to fail, which is why this branch tolerates it; containment makes
+        # the promotion certain to destroy the cache, and the two are not
+        # comparable.
+        #
+        # The parent of the cache is an ancestor rather than a descendant, so
+        # it satisfies the rule by construction. It was passed over above, but
+        # only for room, and a volume that is probably too small is a better
+        # answer than one that is certainly fatal.
+        base = real_near.parent if real_near else system
+        if not base.is_dir():
+            raise ScratchUnavailableError(
+                f"no scratch base is usable: the system temporary directory {system} sits "
+                f"inside the cache {near}, where a scratch would be carried away by the "
+                f"promotion, and the cache parent {base} is not a directory. Set "
+                "LOCKFILE_SENTINEL_SCRATCH to a directory outside the cache."
+            )
+        log(f"the system temporary directory {system} is inside the cache {near}, where a "
+            f"scratch would be carried away by the promotion; using {base} instead "
+            f"({describe_free(free_bytes(base))}), short of room though it may be")
+        return base
+    # The last resort is size-checked like any other base, because it is the
+    # volume the Java index download actually ran out of room on. Proceeding
+    # anyway spent the transfer to reach the original failure and reported it
+    # as an obscure write error from inside a child process; refusing here
+    # states the cause before a byte is spent, naming every base that was
+    # considered and why it lost. An unmeasurable figure still proceeds,
+    # since unknown is not known-short and every alternative was already
+    # passed over.
+    system_free = free_bytes(system)
+    if system_free is not None and system_free < need:
+        considered = "; ".join(passed_over) if passed_over else "none was configured"
+        raise ScratchUnavailableError(
+            f"no volume has the {need / 1024 ** 3:.1f} GB this refresh needs: "
+            f"candidates passed over: {considered}; the system temporary "
+            f"directory {system} has {describe_free(system_free)}. Free space "
+            "or set LOCKFILE_SENTINEL_SCRATCH to a volume with room."
+        )
+    log(f"falling back to the system temporary directory {system} "
+        f"({describe_free(system_free)}), which is the volume the Java index "
+        "download ran out of room on")
+    return system
+
+
 @contextlib.contextmanager
 def scratch_dir(label: str, near: Path | None = None,
-                need: int = SCRATCH_MIN_FREE_BYTES):
+                need: int = SCRATCH_MIN_FREE_BYTES,
+                leaks: list[Path] | None = None):
     """Yield a private scratch directory on a volume with room, and remove it after.
 
     Trivy stages the Java index database, roughly 900 MB compressed and larger
@@ -1691,6 +1795,19 @@ def scratch_dir(label: str, near: Path | None = None,
     since a run that downloads less needs less; the default is the full-refresh
     figure. A base whose free space cannot be read is still used, since the
     alternative is falling back to the volume already known to be too small.
+    When every base including the last-resort system temporary directory is
+    measurably short, ScratchUnavailableError is raised before a byte is
+    downloaded, naming each candidate and its figure: proceeding anyway spent
+    the transfer to reach the original disk-full failure and reported it as an
+    obscure write error from inside a child process. The cache parent is
+    created first when it does not exist, since promotion creates it moments
+    later anyway and refusing to stage in it sent a first run on a fresh host
+    to the small system volume, the one case this mechanism exists for.
+
+    `leaks` is how a cleanup failure reaches the caller's exit code: the
+    finally that removes the scratch cannot raise without masking whatever
+    exception is already propagating, so a directory it could not remove is
+    appended to the caller's list instead, beside the WARNING in the log.
 
     No drive letter appears anywhere in this resolution. LOCKFILE_SENTINEL_SCRATCH
     wins when set; otherwise the scratch goes beside `near`, the directory the
@@ -1739,75 +1856,46 @@ def scratch_dir(label: str, near: Path | None = None,
         except (OSError, RuntimeError) as exc:
             log(f"could not resolve the cache {near} ({exc}); "
                 "using the path as spelled to choose a scratch base")
+    if real_near is not None:
+        # The cache parent is a candidate below and promotion creates it
+        # without hesitating a few dozen lines later, so refusing to stage in
+        # a directory this run is about to create anyway was an inconsistency:
+        # on a first run against a host with no cache yet, it sent the
+        # download to the small system temporary volume, the one case the
+        # whole mechanism exists for. A configured LOCKFILE_SENTINEL_SCRATCH
+        # that does not exist is still passed over rather than created, since
+        # a path someone typed wrong is a mistake worth reporting.
+        try:
+            real_near.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log(f"could not create the cache parent {real_near.parent} ({exc}); "
+                "it stays out of the running as a scratch base")
     candidates = [
         (SCRATCH_BASE, "LOCKFILE_SENTINEL_SCRATCH"),
         (str(real_near.parent) if real_near else "", "the cache volume"),
     ]
-    base = None
-    for value, origin in candidates:
-        if not value:
-            continue
-        path = Path(value)
-        if not path.is_dir():
-            log(f"scratch base {value} from {origin} is not available")
-            continue
-        if near is not None and is_inside(path, near):
-            # Promotion renames the live cache aside before moving the staged
-            # tree in. A scratch under the cache travels with that rename, so
-            # the move then names a path that no longer exists and the run ends
-            # with no live cache and the databases stranded in the .previous
-            # tree. Refusing here is the point: a base configured to sit inside
-            # the directory it is staging for is a mistake worth naming rather
-            # than one worth quietly relocating.
-            log(f"scratch base {value} from {origin} is inside the cache {near} that the "
-                "download is promoted into, where it would be carried away by the "
-                "promotion and leave no live cache; passing over it")
-            continue
-        free = free_bytes(path)
-        if free is not None and free < need:
-            log(f"scratch base {value} from {origin} has {describe_free(free)}, under the "
-                f"{need / 1024 ** 3:.1f} GB this refresh needs; "
-                "passing over it")
-            continue
-        base = path
-        break
+    passed_over: list[str] = []
+    base = _pick_scratch_base(candidates, near, need, passed_over)
     if base is None:
-        system = Path(tempfile.gettempdir())
-        if near is not None and is_inside(system, near):
-            # The containment rule has to hold on the last resort too, or the
-            # failure it exists to prevent simply moves here: a scratch under the
-            # cache is carried off by the promotion rename, and the run ends with
-            # no live cache at all. Low free space only makes the download likely
-            # to fail, which is why the fallback tolerates it; containment makes
-            # the promotion certain to destroy the cache, and the two are not
-            # comparable.
-            #
-            # The parent of the cache is an ancestor rather than a descendant, so
-            # it satisfies the rule by construction. It was passed over above, but
-            # only for room, and a volume that is probably too small is a better
-            # answer than one that is certainly fatal.
-            base = real_near.parent if real_near else system
-            if not base.is_dir():
-                raise RuntimeError(
-                    f"no scratch base is usable: the system temporary directory {system} sits "
-                    f"inside the cache {near}, where a scratch would be carried away by the "
-                    f"promotion, and the cache parent {base} is not a directory. Set "
-                    "LOCKFILE_SENTINEL_SCRATCH to a directory outside the cache."
-                )
-            log(f"the system temporary directory {system} is inside the cache {near}, where a "
-                f"scratch would be carried away by the promotion; using {base} instead "
-                f"({describe_free(free_bytes(base))}), short of room though it may be")
-        else:
-            base = system
-            log(f"falling back to the system temporary directory {base} "
-                f"({describe_free(free_bytes(base))}), which is the volume the Java index "
-                "download ran out of room on")
+        base = _fallback_scratch_base(near, real_near, need, passed_over)
     # Before the directory exists, so that the interval between creating it and
     # restricting it holds one icacls call and not a whoami spawn as well. On a
     # 3.12.4 or newer interpreter with ACL support this interval does not matter,
     # because mkdir below creates the directory already protected; it matters on
     # exactly the builds and filesystems where that does not happen, which are
     # the ones restrict_to_owner exists for.
+    # A temp-* sibling already in the base is evidence of a cleanup that
+    # failed on an earlier run, which is exactly the leak the finally below
+    # reports: the names are random by design, so nothing else ever
+    # recognises one as garbage. Reported rather than deleted, because a
+    # directory that could not be removed may be one something still holds
+    # open, and one of these may belong to a run happening right now.
+    leftovers = sorted(entry.name for entry in base.glob("temp-*") if entry.is_dir())
+    if leftovers:
+        log(f"NOTE: {base} already holds {len(leftovers)} temp-* "
+            f"director{'y' if len(leftovers) == 1 else 'ies'} "
+            f"({', '.join(leftovers)}); each is either a concurrent run's scratch "
+            "or a leak from a cleanup that failed, and nothing removes the latter")
     sid = current_user_sid() if IS_WINDOWS else None
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
@@ -1864,6 +1952,32 @@ def scratch_dir(label: str, near: Path | None = None,
         except OSError as exc:
             log(f"WARNING: could not remove the scratch directory {path} ({exc}). It holds "
                 "whatever the download left behind, and nothing else will clean it up.")
+            # The caller that passed a list gets the fact as well as the log
+            # line, so the run's exit code can say a gigabyte leaked without
+            # this finally raising over an exception already in flight.
+            if leaks is not None:
+                leaks.append(path)
+
+
+def _download_into_staging(trivy: str, skip_java_db: bool,
+                           child_env: dict[str, str]) -> int:
+    """Fetch each required database into the staging cache, 0 on success.
+
+    A non-zero download exit stops the run before the gate, with the live
+    cache untouched, since a partial staging cache is exactly what the
+    staging design exists to keep away from promotion."""
+    for flag, label in (("--download-db-only", "vulnerability"),
+                        ("--download-java-db-only", "Java index")):
+        if flag == "--download-java-db-only" and skip_java_db:
+            continue
+        log(f"downloading the {label} database into the staging cache ...")
+        code, out = run([trivy, "image", flag], env=child_env)
+        echo(out, "trivy")
+        if code != 0:
+            log(f"FAIL: {label} database download exited {code}; "
+                "the live cache is untouched")
+            return 1
+    return 0
 
 
 def target_trivy_db(args) -> int:
@@ -1944,7 +2058,12 @@ def target_trivy_db(args) -> int:
     # from `required` keeps it correct if that set ever changes for another
     # reason.
     need = sum(SCRATCH_NEED_BYTES[name] for name in required)
-    with scratch_dir("trivy databases", near=live, need=need) as staging:
+    # The list outlives the scratch on purpose: the finally that removes the
+    # directory runs as the block exits, so a cleanup failure lands here in
+    # time for the exit code below to say the work succeeded but a scratch
+    # was left behind.
+    leaked: list[Path] = []
+    with scratch_dir("trivy databases", near=live, need=need, leaks=leaked) as staging:
         staged = staging / "cache"
         staged.mkdir(parents=True, exist_ok=True)
         # The temporary directory goes to the same scratch as the staging cache.
@@ -1959,17 +2078,8 @@ def target_trivy_db(args) -> int:
         # left this fix doing nothing at all on Linux.
         child_env = dict(os.environ, TRIVY_CACHE_DIR=str(staged),
                          TMPDIR=str(staging), TMP=str(staging), TEMP=str(staging))
-        for flag, label in (("--download-db-only", "vulnerability"),
-                            ("--download-java-db-only", "Java index")):
-            if flag == "--download-java-db-only" and args.skip_java_db:
-                continue
-            log(f"downloading the {label} database into the staging cache ...")
-            code, out = run([trivy, "image", flag], env=child_env)
-            echo(out, "trivy")
-            if code != 0:
-                log(f"FAIL: {label} database download exited {code}; "
-                    "the live cache is untouched")
-                return 1
+        if _download_into_staging(trivy, args.skip_java_db, child_env) != 0:
+            return 1
 
         if not gate(staged, "the downloaded Trivy databases", args.skip_scan):
             log("the rejected download was discarded; the live cache is untouched")
@@ -1998,6 +2108,16 @@ def target_trivy_db(args) -> int:
             return 1
 
     log(f"Trivy databases current, promoted into {live}")
+    if leaked:
+        # The two outcomes are genuinely different and the exit code says
+        # which happened: the databases are correctly promoted, and a scratch
+        # directory that can hold a gigabyte could not be removed. A scheduled
+        # run turns amber rather than green, instead of a leak per night
+        # accumulating behind an exit 0 that looked identical to a clean one.
+        log(f"WARNING: the refresh succeeded but {len(leaked)} scratch "
+            f"director{'y' if len(leaked) == 1 else 'ies'} could not be removed; "
+            "exiting 3 so the leak is visible to whatever scheduled this run")
+        return 3
     return 0
 
 
@@ -2123,15 +2243,27 @@ def main() -> int:
     rotate_log()
     log(f"run start: {args.target}")
 
+    def dispatch(name: str) -> int:
+        # A refusal to stage is a prerequisite that is missing, not work that
+        # failed: the run decided before downloading rather than during, so
+        # it exits 2 with the refusal's own accounting of every base and its
+        # free space, instead of an obscure write error from inside a child
+        # process after the transfer was already spent.
+        try:
+            return TARGETS[name](args)
+        except ScratchUnavailableError as exc:
+            log(f"FAIL: {exc}")
+            return 2
+
     if args.target == "all":
         worst = 0
         for name in ("osv-scanner", "malicious-packages", "offline-db", "trivy-db"):
             log(f"--- {name} ---")
-            worst = max(worst, TARGETS[name](args))
+            worst = max(worst, dispatch(name))
         log(f"run end: all targets, worst exit {worst}")
         return worst
 
-    code = TARGETS[args.target](args)
+    code = dispatch(args.target)
     log(f"run end: {args.target}, exit {code}")
     return code
 
