@@ -136,6 +136,8 @@ _CHILD_STDOUT_LIMIT = 128 * 1024 * 1024
 _CHILD_STDERR_LIMIT = 1024 * 1024
 _CHILD_READ_SIZE = 64 * 1024
 _CHILD_STOP_GRACE = 2.0
+_CHILD_READ_POLL = 0.01
+_CHILD_DRAIN_GRACE = 0.1
 
 
 class ChildOutputTooLarge(subprocess.SubprocessError):
@@ -155,31 +157,65 @@ def _read_child_stream(
     overflow: threading.Event,
     truncated: threading.Event,
     read_failed: threading.Event,
+    stop_reading: threading.Event,
     process: subprocess.Popen[bytes],
 ) -> None:
     """Drain one pipe while retaining no more than its declared byte limit."""
+    stopped_at: float | None = None
     try:
-        while chunk := stream.read(_CHILD_READ_SIZE):
-            if limit.retain_tail:
-                capture.extend(chunk)
-                if len(capture) > limit.size:
-                    del capture[:len(capture) - limit.size]
-                    truncated.set()
+        while True:
+            chunk = stream.read(_CHILD_READ_SIZE)
+            if chunk is None:
+                should_stop, stopped_at = _reader_idle(stop_reading, stopped_at)
+                if should_stop:
+                    return
                 continue
-            available = limit.size - len(capture)
-            if available > 0:
-                capture.extend(chunk[:available])
-            if len(chunk) > available:
-                overflow.set()
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
+            if not chunk:
+                return
+            stopped_at = None
+            _retain_child_chunk(
+                chunk, capture, limit, overflow, truncated, process
+            )
     except (OSError, ValueError):
-        # The coordinator closes a pipe only when a child or descendant kept it
-        # open after termination. The process result remains the authoritative
-        # failure; a close used to unblock this reader is not a second one.
         read_failed.set()
+
+
+def _reader_idle(
+    stop_reading: threading.Event, stopped_at: float | None,
+) -> tuple[bool, float | None]:
+    """Wait for data, or finish after the direct child has stopped."""
+    if not stop_reading.is_set():
+        stop_reading.wait(_CHILD_READ_POLL)
+        return False, None
+    stopped_at = stopped_at or time.monotonic()
+    if time.monotonic() - stopped_at >= _CHILD_DRAIN_GRACE:
+        return True, stopped_at
+    time.sleep(_CHILD_READ_POLL)
+    return False, stopped_at
+
+
+def _retain_child_chunk(
+    chunk: bytes, capture: bytearray, limit: _CaptureLimit,
+    overflow: threading.Event, truncated: threading.Event,
+    process: subprocess.Popen[bytes],
+) -> None:
+    """Retain one bounded chunk, as a tail or as complete machine output."""
+    if limit.retain_tail:
+        capture.extend(chunk)
+        if len(capture) > limit.size:
+            del capture[:len(capture) - limit.size]
+            truncated.set()
+        return
+    available = limit.size - len(capture)
+    if available > 0:
+        capture.extend(chunk[:available])
+    if len(chunk) <= available:
+        return
+    overflow.set()
+    try:
+        process.terminate()
+    except OSError:
+        pass
 
 
 def _stop_child(process: subprocess.Popen[bytes]) -> None:
@@ -205,7 +241,7 @@ def _run_bounded(
     """Run a child with concurrent, explicitly bounded output retention."""
     process = subprocess.Popen(  # nosec B603  # pylint: disable=consider-using-with
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, bufsize=0,
     )
     if process.stdout is None or process.stderr is None:  # pragma: no cover
         _stop_child(process)
@@ -216,17 +252,26 @@ def _run_bounded(
     overflow = threading.Event()
     stderr_truncated = threading.Event()
     read_failed = threading.Event()
+    stop_reading = threading.Event()
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        os.set_blocking(process.stderr.fileno(), False)
+    except OSError:
+        _stop_child(process)
+        process.stdout.close()
+        process.stderr.close()
+        raise
     readers = (
         threading.Thread(
             target=_read_child_stream,
             args=(process.stdout, stdout, _CaptureLimit(stdout_limit), overflow,
-                  threading.Event(), read_failed, process),
+                  threading.Event(), read_failed, stop_reading, process),
             daemon=True,
         ),
         threading.Thread(
             target=_read_child_stream,
             args=(process.stderr, stderr, _CaptureLimit(stderr_limit, True),
-                  threading.Event(), stderr_truncated, read_failed, process),
+                  threading.Event(), stderr_truncated, read_failed, stop_reading, process),
             daemon=True,
         ),
     )
@@ -238,13 +283,11 @@ def _run_bounded(
         _stop_child(process)
         raise subprocess.TimeoutExpired(command, timeout) from exc
     finally:
+        stop_reading.set()
         for reader in readers:
             reader.join(_CHILD_STOP_GRACE)
         for stream, reader in zip((process.stdout, process.stderr), readers, strict=True):
-            if reader.is_alive():
-                stream.close()
-                reader.join(_CHILD_STOP_GRACE)
-            else:
+            if not reader.is_alive():
                 stream.close()
         _stop_child(process)
 

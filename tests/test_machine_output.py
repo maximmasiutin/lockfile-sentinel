@@ -384,6 +384,19 @@ def test_bounded_child_timeout_reaps_the_process() -> None:
     assert time.monotonic() - started < 5
 
 
+def test_bounded_child_does_not_wait_for_an_inherited_pipe() -> None:
+    """A background descendant holding the pipe cannot strand its reader."""
+    script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)']); "
+        "print('parent done')"
+    )
+    started = time.monotonic()
+    result = ls._run_bounded([sys.executable, "-c", script], timeout=2)
+    assert result.stdout.splitlines() == ["parent done"]
+    assert time.monotonic() - started < 2
+
+
 def test_osv_output_overflow_is_a_structured_retryable_failure(monkeypatch) -> None:
     """Oversized JSON is an outage, never a clean scanner response."""
     def overflow(*_args, **_kwargs):
