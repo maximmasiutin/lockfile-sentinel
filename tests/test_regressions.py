@@ -1672,6 +1672,99 @@ def test_a_leaked_scratch_turns_the_exit_amber_but_not_red(tmp_path, monkeypatch
     assert cache.is_dir(), "the leak verdict displaced the promotion itself"
 
 
+def _trivy_target_harness(tmp_path, monkeypatch, downloads: list[str]) -> Path:
+    """Wire target_trivy_db to run against stubs, returning the cache path.
+
+    The freshness stamps are all in the future, so nothing is due by date and
+    only --force or the binary-version check can start a download. Download
+    commands land in `downloads` so a test can assert whether the run skipped."""
+    cache = tmp_path / "trivy-cache"
+    soon = datetime.now(timezone.utc) + timedelta(days=1)
+    fresh = {"vulnerability": {"updated": soon, "next_update": soon, "schema": 2},
+             "java": {"updated": soon, "next_update": soon, "schema": 1}}
+
+    def record_download(cmd, *_args, **_kwargs):
+        downloads.append(" ".join(str(part) for part in cmd))
+        return (0, "")
+
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "resolve_trivy", lambda: "trivy")
+    monkeypatch.setattr(us, "trivy_freshness", lambda _trivy, env=None: dict(fresh))
+    monkeypatch.setattr(us, "run", record_download)
+    monkeypatch.setattr(us, "trivy_cache_dir_default", lambda: cache)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 100 * 1024 ** 3)
+    monkeypatch.setattr(us, "TRIVY_STATE", tmp_path / "trivy.state.json")
+    return cache
+
+
+def test_a_new_binary_makes_a_dated_cache_due(tmp_path, monkeypatch) -> None:
+    """Future NextUpdate stamps with a changed binary must report due, not skip.
+
+    The due check read NextUpdate and nothing else, so a Trivy upgrade was
+    invisible to it: the updater reported success over a cache the new binary
+    cannot read, and the failure surfaced later, in a scan, as an obscure
+    error. The skip is what made the schema worth checking."""
+    downloads: list[str] = []
+    cache = _trivy_target_harness(tmp_path, monkeypatch, downloads)
+    (tmp_path / "trivy.state.json").write_text(
+        json.dumps({"trivyVersion": "0.55.0"}), encoding="utf-8")
+    monkeypatch.setattr(us, "trivy_binary_version", lambda _trivy: "0.61.0")
+
+    class Args:
+        """The argparse namespace target_trivy_db expects, pinned."""
+        force = False
+        skip_java_db = False
+        skip_scan = True
+
+    assert us.target_trivy_db(Args()) == 0
+    assert downloads, "the changed binary did not start a refresh"
+    assert cache.is_dir()
+    state = json.loads((tmp_path / "trivy.state.json").read_text(encoding="utf-8"))
+    assert state["trivyVersion"] == "0.61.0", "the new baseline was not recorded"
+
+
+def test_an_unchanged_binary_still_skips_a_dated_cache(tmp_path, monkeypatch) -> None:
+    """The version check must not cost the skip its savings.
+
+    The skip exists because a nightly run fetched a gigabyte it threw away as
+    identical. A recorded version equal to the installed one adds no reason to
+    download."""
+    downloads: list[str] = []
+    _trivy_target_harness(tmp_path, monkeypatch, downloads)
+    (tmp_path / "trivy.state.json").write_text(
+        json.dumps({"trivyVersion": "0.61.0"}), encoding="utf-8")
+    monkeypatch.setattr(us, "trivy_binary_version", lambda _trivy: "0.61.0")
+
+    class Args:
+        """The argparse namespace target_trivy_db expects, pinned."""
+        force = False
+        skip_java_db = False
+        skip_scan = True
+
+    assert us.target_trivy_db(Args()) == 0
+    assert not downloads, "a matching binary version started a needless refresh"
+
+
+def test_the_metadata_schema_version_is_carried_not_discarded(monkeypatch) -> None:
+    """status cannot report a mismatch it never reads.
+
+    The metadata carries a schema Version beside NextUpdate, and
+    trivy_freshness used to discard it."""
+    body = json.dumps({
+        "Version": "0.61.0",
+        "VulnerabilityDB": {"Version": 2, "UpdatedAt": "2026-08-14T06:00:00Z",
+                            "NextUpdate": "2026-08-15T06:00:00Z"},
+        "JavaDB": {"Version": 1, "UpdatedAt": "2026-08-01T06:00:00Z",
+                   "NextUpdate": "2026-08-04T06:00:00Z"},
+    })
+    monkeypatch.setattr(us, "run", lambda *args, **kwargs: (0, body))
+
+    freshness = us.trivy_freshness("trivy")
+    assert freshness["vulnerability"]["schema"] == 2
+    assert freshness["java"]["schema"] == 1
+    assert us.trivy_binary_version("trivy") == "0.61.0"
+
+
 def test_a_symlinked_cache_stages_on_the_volume_it_points_at(tmp_path, monkeypatch) -> None:
     """The scratch has to land where the databases are, not where the name is.
 
