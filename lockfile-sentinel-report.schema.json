@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/master/lockfile-sentinel-report.schema.json",
+  "title": "lockfile-sentinel-report",
+  "description": "Scan report written by lockfile-sentinel --json. Fields may be added within schema version 1 without notice; a consumer rejects a schema name or version it does not know rather than guessing, and must not treat unknown fields as an error. A consumer that meets an unknown applicable coverage or layer state fails loudly rather than reading an unfamiliar condition as clean.",
+  "type": "object",
+  "required": ["schema", "tool", "invocation", "layers", "inputs", "totals", "repositories", "findings", "errors"],
+  "properties": {
+    "schema": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "lockfile-sentinel-report" },
+        "version": { "const": 1 }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "lockfile-sentinel" },
+        "version": { "type": "string" }
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "required": [
+        "id",
+        "started_utc",
+        "finished_utc",
+        "complete",
+        "roots",
+        "include_node_modules",
+        "requested_layers"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "started_utc": { "type": "string", "format": "date-time" },
+        "finished_utc": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "string", "format": "date-time" }
+          ]
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "True only when the run finished AND every requested layer completed over every input. A snapshot an interrupted run leaves behind has complete false and finished_utc null; a finished run with a coverage gap has complete false and finished_utc set, and exits 2. A consumer treats complete false as a scan whose absence of findings proves nothing."
+        },
+        "roots": { "type": "array", "items": { "type": "string" } },
+        "include_node_modules": { "type": "boolean" },
+        "requested_layers": {
+          "type": "array",
+          "items": { "enum": ["builtin", "overlay", "osv", "trivy"] },
+          "description": "The layers the caller asked for. A layer absent from this list was declined by a --no-* flag, which is policy, not failure."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "complete": { "const": true } },
+            "required": ["complete"]
+          },
+          "then": {
+            "properties": { "finished_utc": { "type": "string" } }
+          }
+        }
+      ]
+    },
+    "layers": {
+      "type": "object",
+      "required": ["builtin", "overlay", "osv", "trivy"],
+      "description": "One state object per detection layer. Exit codes 0 and 1 both assert that every requested layer completed; anything short of that exits 2, findings or not.",
+      "properties": {
+        "builtin": { "$ref": "#/$defs/layer" },
+        "overlay": { "$ref": "#/$defs/layer" },
+        "osv": { "$ref": "#/$defs/layer" },
+        "trivy": { "$ref": "#/$defs/layer" }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": [
+        "manifests_discovered",
+        "lockfiles_discovered",
+        "lockfiles_submitted",
+        "lockfiles_resolved",
+        "lockfiles_failed",
+        "files_read",
+        "files_unreadable",
+        "dirs_unreadable"
+      ],
+      "additionalProperties": { "type": "integer" }
+    },
+    "totals": {
+      "type": "object",
+      "required": [
+        "repositories",
+        "with_npm_tooling",
+        "with_watched_packages",
+        "vulnerable",
+        "findings"
+      ],
+      "additionalProperties": { "type": "integer" }
+    },
+    "repositories": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repository" }
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/error" }
+    }
+  },
+  "$defs": {
+    "package_versions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "layer_state": {
+      "enum": ["completed", "partial", "not_requested", "unavailable", "failed"]
+    },
+    "coverage_state": {
+      "enum": ["completed", "partial", "not_requested", "unavailable", "failed", "not_applicable"]
+    },
+    "layer": {
+      "type": "object",
+      "required": ["requested", "state", "reason_code", "message"],
+      "properties": {
+        "requested": { "type": "boolean" },
+        "state": { "$ref": "#/$defs/layer_state" },
+        "reason_code": { "type": ["string", "null"] },
+        "message": { "type": ["string", "null"] }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "required": [
+        "name",
+        "path",
+        "has_npm",
+        "npm_files",
+        "read_files",
+        "unreadable_files",
+        "unreadable_dirs",
+        "lockfiles",
+        "counts",
+        "present_versions",
+        "range_only",
+        "poisoned_versions",
+        "poisoned_ranges",
+        "payload_files",
+        "osv_checked",
+        "osv_malicious",
+        "osv_advisory_ids",
+        "trivy_confirmed",
+        "coverage",
+        "package_present",
+        "vulnerable"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "path": { "type": "string" },
+        "has_npm": { "type": "boolean" },
+        "npm_files": { "type": "array", "items": { "type": "string" } },
+        "read_files": { "type": "array", "items": { "type": "string" } },
+        "unreadable_files": { "type": "array", "items": { "type": "string" } },
+        "unreadable_dirs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Directories the walk could not enumerate, as a bounded preview of at most 100 paths; counts.dirs_unreadable carries the full total. Anything beneath one was never seen, so a non-zero total is incomplete coverage and the scan exits 2."
+        },
+        "lockfiles": { "type": "array", "items": { "type": "string" } },
+        "counts": {
+          "type": "object",
+          "required": [
+            "manifests_discovered",
+            "lockfiles_discovered",
+            "files_read",
+            "files_unreadable",
+            "lockfiles_unreadable",
+            "dirs_unreadable"
+          ],
+          "additionalProperties": { "type": "integer" }
+        },
+        "present_versions": { "$ref": "#/$defs/package_versions" },
+        "range_only": { "$ref": "#/$defs/package_versions" },
+        "poisoned_versions": { "$ref": "#/$defs/package_versions" },
+        "poisoned_ranges": { "$ref": "#/$defs/package_versions" },
+        "payload_files": { "type": "array", "items": { "type": "string" } },
+        "osv_checked": { "type": "boolean" },
+        "osv_malicious": { "$ref": "#/$defs/package_versions" },
+        "osv_advisory_ids": { "$ref": "#/$defs/package_versions" },
+        "trivy_confirmed": { "$ref": "#/$defs/package_versions" },
+        "coverage": {
+          "type": "object",
+          "required": ["osv", "trivy"],
+          "properties": {
+            "osv": {
+              "type": "object",
+              "required": ["state", "reason_codes", "discovered", "readable", "submitted", "resolved", "empty", "failed", "unavailable"],
+              "properties": {
+                "state": { "$ref": "#/$defs/coverage_state" },
+                "reason_codes": { "type": "array", "items": { "type": "string" } },
+                "discovered": { "type": "integer" },
+                "readable": { "type": "integer" },
+                "submitted": {
+                  "type": "integer",
+                  "description": "What was actually handed to the scanner: resolved minus vacuously-resolved empty lockfiles, plus rejected and unanswered ones. Reconciles with the run-level submitted count."
+                },
+                "resolved": { "type": "integer" },
+                "empty": {
+                  "type": "integer",
+                  "description": "Lockfiles resolved vacuously without a submission, because a file with nothing in it has nothing to resolve."
+                },
+                "failed": { "type": "integer" },
+                "unavailable": {
+                  "type": "integer",
+                  "description": "Lockfiles the scanner never answered on: a timeout, spawn failure or unparsable output, which is a retryable fact about the tooling and never about the file."
+                }
+              }
+            },
+            "trivy": {
+              "type": "object",
+              "required": ["state", "reason_codes", "flagged_lockfiles", "submitted", "failed", "confirmed_packages"],
+              "properties": {
+                "state": { "$ref": "#/$defs/coverage_state" },
+                "reason_codes": { "type": "array", "items": { "type": "string" } },
+                "flagged_lockfiles": { "type": "integer" },
+                "submitted": { "type": "integer" },
+                "failed": { "type": "integer" },
+                "confirmed_packages": { "type": "integer" }
+              }
+            }
+          }
+        },
+        "package_present": { "type": "boolean" },
+        "vulnerable": { "type": "boolean" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "ecosystem",
+        "package",
+        "version",
+        "range",
+        "repository",
+        "repository_path",
+        "source_files",
+        "advisories",
+        "detection_layers",
+        "campaign",
+        "trivy_confirmed"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+        "kind": { "enum": ["malicious_resolved", "malicious_range", "payload_artifact"] },
+        "ecosystem": { "const": "npm" },
+        "package": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] },
+        "range": { "type": ["string", "null"] },
+        "artifact": { "type": "string" },
+        "repository": { "type": "string" },
+        "repository_path": { "type": "string" },
+        "source_files": { "type": "array", "items": { "type": "string" } },
+        "advisories": { "type": "array", "items": { "type": "string" } },
+        "detection_layers": {
+          "type": "array",
+          "items": { "enum": ["offline_table", "osv"] },
+          "minItems": 1,
+          "description": "Every layer that saw this finding. The offline table and OSV flagging the same resolved version is one finding with two layers, never two findings."
+        },
+        "campaign": { "type": ["string", "null"] },
+        "trivy_confirmed": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "scope", "repository", "file", "retryable", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "scope": { "enum": ["invocation", "layer", "repository", "file"] },
+        "repository": { "type": ["string", "null"] },
+        "file": { "type": ["string", "null"] },
+        "retryable": { "type": "boolean" },
+        "message": { "type": "string", "maxLength": 300 }
+      }
+    }
+  }
+}

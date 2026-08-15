@@ -1,4 +1,4 @@
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 """Tests for the detection logic that a reader cannot verify by inspection.
@@ -407,6 +407,91 @@ def test_a_live_bun_pin_still_matches_after_the_comments_go(tmp_path: Path) -> N
     assert "6.0.0" in status.poisoned_versions.get("keyv", set())
 
 
+def test_a_commented_out_yarn_entry_is_not_reported_as_a_resolved_pin(
+    tmp_path: Path,
+) -> None:
+    """yarn.lock takes `#` comments, and the same defect fixed for bun applies
+    to it unchanged: a commented-out poisoned descriptor read as a resolved
+    pin the effective tree does not contain."""
+    lockfile = tmp_path / "yarn.lock"
+    lockfile.write_text(
+        "# yarn lockfile v1\n"
+        '# keyv@6.0.0:\n'
+        '#   resolved "https://registry.yarnpkg.com/keyv/-/keyv-6.0.0.tgz#dead"\n'
+        "\n"
+        'left-pad@^1.3.0:\n'
+        '  version "1.3.0"\n'
+        '  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#live"\n',
+        encoding="utf-8",
+    )
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    assert ls.scan_lockfile(lockfile, status) is True
+    assert not status.poisoned_versions
+
+
+def test_a_commented_out_pnpm_entry_is_not_reported_as_a_resolved_pin(
+    tmp_path: Path,
+) -> None:
+    """pnpm-lock.yaml is the other `#` format, fixed in the same pass."""
+    lockfile = tmp_path / "pnpm-lock.yaml"
+    lockfile.write_text(
+        "lockfileVersion: '9.0'\n"
+        "packages:\n"
+        "  # keyv@6.0.0:\n"
+        "  #   resolution: {integrity: sha512-dead}\n"
+        "  left-pad@1.3.0:\n"
+        "    resolution: {integrity: sha512-live}\n",
+        encoding="utf-8",
+    )
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    assert ls.scan_lockfile(lockfile, status) is True
+    assert not status.poisoned_versions
+
+
+def test_a_hash_inside_a_tarball_url_does_not_start_a_comment() -> None:
+    """The reason this stripper is not a split on `#`. Every yarn resolved
+    line ends in `#<sha>`, and a marker with a non-space character before it
+    is part of the token; cutting there would truncate the exact lines the
+    tarball patterns match. A `#` inside either quote style is data too."""
+    text = (
+        "# a real comment\n"
+        '  resolved "https://registry.yarnpkg.com/keyv/-/keyv-6.0.0.tgz#abc123"\n'
+        "  single: 'not # a comment'\n"
+        '  double: "also # not one"\n'
+    )
+    stripped = ls._strip_hash_comments(text)
+    assert "keyv-6.0.0.tgz#abc123" in stripped
+    assert "a real comment" not in stripped
+    assert "not # a comment" in stripped
+    assert "also # not one" in stripped
+
+
+def test_a_live_yarn_pin_still_matches_after_the_comments_go(tmp_path: Path) -> None:
+    """The negative cases prove nothing alone: a stripper that emptied the
+    file would pass all of them."""
+    lockfile = tmp_path / "yarn.lock"
+    lockfile.write_text(
+        "# yarn lockfile v1\n"
+        "\n"
+        'keyv@^6.0.0:\n'
+        '  version "6.0.0"\n'
+        '  resolved "https://registry.yarnpkg.com/keyv/-/keyv-6.0.0.tgz#live"\n',
+        encoding="utf-8",
+    )
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    ls.scan_lockfile(lockfile, status)
+    assert "6.0.0" in status.poisoned_versions.get("keyv", set())
+
+
+def test_stripping_a_comment_never_joins_two_lines() -> None:
+    """A stripped comment leaves its newline behind. Swallowing it would join
+    a package name on one line to a version on the next and manufacture a
+    coordinate neither line carried."""
+    stripped = ls._strip_hash_comments("keyv@  # comment\n6.0.0\n")
+    assert stripped.count("\n") == 2
+    assert "keyv@6.0.0" not in stripped
+
+
 def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Path) -> None:
     """npm-shrinkwrap.json is package-lock.json under another name, so it must
     take the structural pass too: an entry pinning a version with no resolved
@@ -429,3 +514,4 @@ def test_a_shrinkwrap_entry_without_a_resolved_url_is_still_caught(tmp_path: Pat
     assert status.has_npm is True
     assert status.lockfiles == [str(lockfile)]
     assert "6.0.0" in status.poisoned_versions.get("keyv", set())
+

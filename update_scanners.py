@@ -42,7 +42,7 @@ Usage:
     python update_scanners.py all
 """
 
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel
@@ -84,7 +84,7 @@ from pathlib import Path
 # Carried per file rather than imported, because each of these three runs on its
 # own and an imported version would tie a standalone copy back to a checkout it
 # may not have. tests/test_headers.py is what keeps the three from drifting.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 IS_WINDOWS = os.name == "nt"
 
@@ -108,14 +108,24 @@ TRIVY_EXE = "trivy.exe" if IS_WINDOWS else "trivy"
 # See scratch_dir for why this is not simply TEMP.
 SCRATCH_BASE = os.environ.get("LOCKFILE_SENTINEL_SCRATCH", "")
 
-# How much room a scratch base has to have before it is worth using. The Java
-# index database is roughly 900 MB compressed and is unpacked beside the archive
-# it arrived in, so the peak is a multiple of the download rather than the
-# download. The figure is measured rather than guessed: the failure this whole
-# mechanism exists for had 2.74 GB free and that was not enough. A base below
-# this is passed over with its figure logged, because finding out by running out
-# of disk costs the download and reports it as an obscure write error.
-SCRATCH_MIN_FREE_BYTES = 5 * 1024 ** 3
+# How much room a scratch base has to have before it is worth using, expressed
+# per database so a run that stages less can require less. The Java index is
+# roughly 900 MB compressed and is unpacked beside the archive it arrived in,
+# so its peak is a multiple of the download rather than the download; the
+# vulnerability database is roughly a tenth its size. The total for a full
+# refresh is measured rather than guessed: the failure this whole mechanism
+# exists for had 2.74 GB free and that was not enough, and the two figures
+# below sum to the 5 GB margin that has proved sufficient since. A base below
+# the requirement is passed over with its figure logged, because finding out by
+# running out of disk costs the download and reports it as an obscure write
+# error. The requirement is derived from what staging will actually hold, not
+# from which flags were passed, so it stays correct if the set of staged
+# databases ever changes for another reason.
+SCRATCH_NEED_BYTES = {
+    "vulnerability": 512 * 1024 ** 2,
+    "java": 4608 * 1024 ** 2,
+}
+SCRATCH_MIN_FREE_BYTES = sum(SCRATCH_NEED_BYTES.values())
 
 
 def cache_dir() -> Path:
@@ -138,6 +148,11 @@ MAX_LOG_BYTES = 1024 * 1024
 # and the scanner reports the input as never refreshed.
 OSV_STATE = LOG_DIR / "update-osv-scanner.state.json"
 OVERLAY_STATE = LOG_DIR / "update-malicious-packages.state.json"
+# Which Trivy binary last wrote the promoted databases. NextUpdate stamps know
+# nothing about binaries, so without this record an upgraded Trivy expecting a
+# schema the cache does not carry reads "nothing due" over a cache it cannot
+# use, and the failure surfaces later, in a scan, as an obscure error.
+TRIVY_STATE = LOG_DIR / "update-trivy-db.state.json"
 
 MODULE_PATH = "github.com/google/osv-scanner/v2/cmd/osv-scanner"
 PROXY_LATEST = "https://proxy.golang.org/github.com/google/osv-scanner/v2/@latest"
@@ -288,8 +303,12 @@ def resolve_system_tool(name: str) -> str:
     The bare name is kept as the fallback when the file is not there, so a host
     with an unusual layout still runs and fails with the tool's own message
     rather than a fabricated one. `name` therefore needs its extension, since
-    the file test sees no PATHEXT."""
-    root = os.environ.get("SystemRoot", r"C:\Windows")
+    the file test sees no PATHEXT. With SystemRoot unset, the usual Unix case,
+    the bare name is returned at once: a hardcoded default would be a relative
+    path there, reopening the current-directory vector."""
+    root = os.environ.get("SystemRoot")
+    if not root:
+        return name
     candidate = Path(root) / "System32" / name
     return str(candidate) if candidate.is_file() else name
 
@@ -1056,12 +1075,19 @@ def parse_stamp(text: str | None) -> datetime | None:
     return parsed
 
 
+TrivyFreshness = dict[str, dict[str, "datetime | int | None"]]
+
+
 def trivy_freshness(trivy: str, env: dict[str, str] | None = None
-                    ) -> dict[str, dict[str, datetime | None]]:
-    """Return {database: {updated, next_update}} as Trivy reports it.
+                    ) -> TrivyFreshness:
+    """Return {database: {updated, next_update, schema}} as Trivy reports it.
 
     An empty result means the state could not be determined, not that the
-    databases are fine; every caller has to treat it that way."""
+    databases are fine; every caller has to treat it that way. `schema` is the
+    metadata's own Version integer, carried through so status can report a
+    cache whose schema the installed binary does not expect; it was read and
+    discarded before, which left status unable to describe the one mismatch
+    the offline, air-gapped case cannot repair by scanning."""
     # The exit code is deliberately ignored: Trivy reports a non-zero code for
     # conditions that still print usable version JSON, and an unparseable body
     # is handled below, so the output is the only thing worth testing.
@@ -1070,15 +1096,33 @@ def trivy_freshness(trivy: str, env: dict[str, str] | None = None
         data = json.loads(out or "{}")
     except json.JSONDecodeError:
         return {}
-    result: dict[str, dict[str, datetime | None]] = {}
+    result: TrivyFreshness = {}
     for key, label in (("VulnerabilityDB", "vulnerability"), ("JavaDB", "java")):
         entry = data.get(key)
         if isinstance(entry, dict):
+            schema = entry.get("Version")
             result[label] = {
                 "updated": parse_stamp(entry.get("UpdatedAt")),
                 "next_update": parse_stamp(entry.get("NextUpdate")),
+                "schema": schema if isinstance(schema, int) else None,
             }
     return result
+
+
+def trivy_binary_version(trivy: str) -> str | None:
+    """The installed Trivy's own version string, or None when it will not say.
+
+    Read from the same `version --format json` answer the freshness comes
+    from, but as a separate call on purpose: freshness is asked about a
+    specific cache through TRIVY_CACHE_DIR, while the binary version is a
+    property of the executable alone."""
+    _code, out = run([trivy, "version", "--format", "json"], timeout=120)
+    try:
+        data = json.loads(out or "{}")
+    except json.JSONDecodeError:
+        return None
+    version = data.get("Version")
+    return version if isinstance(version, str) and version else None
 
 
 def describe_age(when: datetime | None) -> str:
@@ -1095,17 +1139,17 @@ def describe_age(when: datetime | None) -> str:
     return f"{stamp} ({hours / 24:.1f} days ago)"
 
 
-def overdue(freshness: dict[str, dict[str, datetime | None]]) -> list[str]:
+def overdue(freshness: TrivyFreshness) -> list[str]:
     """Return the databases whose NextUpdate is already in the past."""
     now = datetime.now(timezone.utc)
     return [
         label for label, entry in freshness.items()
-        if entry.get("next_update") is not None
-        and entry["next_update"].astimezone(timezone.utc) < now  # type: ignore[union-attr]
+        if isinstance(stamp := entry.get("next_update"), datetime)
+        and stamp.astimezone(timezone.utc) < now
     ]
 
 
-def report_trivy(freshness: dict[str, dict[str, datetime | None]], when: str) -> None:
+def report_trivy(freshness: TrivyFreshness, when: str) -> None:
     """Log the state of each Trivy database."""
     if not freshness:
         log(f"{when}: Trivy reported no database metadata")
@@ -1113,8 +1157,14 @@ def report_trivy(freshness: dict[str, dict[str, datetime | None]], when: str) ->
     stale = set(overdue(freshness))
     for label, entry in freshness.items():
         state = "OVERDUE" if label in stale else "current"
-        log(f"{when}: {label} db {state}, updated {describe_age(entry.get('updated'))}, "
-            f"next due {describe_age(entry.get('next_update'))}")
+        schema = entry.get("schema")
+        suffix = f", schema v{schema}" if schema is not None else ""
+        updated = entry.get("updated")
+        next_due = entry.get("next_update")
+        log(f"{when}: {label} db {state}, "
+            f"updated {describe_age(updated if isinstance(updated, datetime) else None)}, "
+            f"next due {describe_age(next_due if isinstance(next_due, datetime) else None)}"
+            f"{suffix}")
 
 
 def free_bytes(path: Path) -> int | None:
@@ -1163,18 +1213,34 @@ def is_inside(path: Path, container: Path) -> bool:
         return True
 
 
-def promote_into(staged: Path, live: Path) -> None:
+def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
     """Replace the live cache with the staged one, keeping the old copy until it lands.
 
     The order matters and is the reason this is a function rather than four lines
-    inline. The live tree is renamed aside first so that a failure leaves a
-    complete cache under `.previous` instead of a half-populated one at `live`,
-    and the old copy is removed only after the staged tree has arrived.
+    inline. The staged tree is brought onto the destination volume first, as an
+    `.incoming` sibling of the cache, because that is the one step that can be a
+    copy rather than a rename: when the scratch sits on another filesystem a
+    move is a file-by-file copy that can fail part-way, and the staging design
+    exists precisely so that a partial tree never stands where Trivy reads. With
+    the copy done while `live` is untouched, everything after it is a rename
+    within one volume, cheap and atomic. The live tree is renamed aside next, so
+    that a failure leaves a complete cache under `.previous` instead of a
+    half-populated one at `live`, and if the final rename into place fails the
+    `.previous` copy is renamed straight back, so `live` is never left absent.
+
+    `keep` names child directories to carry forward from the outgoing cache
+    when the staged tree does not hold them: a run that deliberately skipped a
+    database must not delete the copy the cache already has. The carry is a
+    rename out of `.previous` after the swap, within one volume, so it moves no
+    data; a failure there is logged rather than raised, because the promotion
+    itself has already succeeded and the carried database is re-downloadable.
 
     This assumes the caller has established that `staged` is not inside `live`.
-    If it is, the first rename carries the staged tree away with the cache, the
-    move then names a path that no longer exists, and the run ends with no live
-    cache at all. That is what `is_inside` exists to prevent, at the call site,
+    The `.incoming` step happens to move such a tree out before the cache is
+    renamed aside, but that is an accident of ordering, not a contract: a
+    staged tree inside the cache still means the scratch base was configured
+    into the very directory being replaced, which is a mistake worth refusing.
+    That is what `is_inside` exists to prevent, at the call site,
     where the answer is still useful: a caller that gets True there picks a
     different scratch base and proceeds. Repeating the check here would run
     before the rename and so would prevent the damage, but `is_inside` answers
@@ -1196,12 +1262,62 @@ def promote_into(staged: Path, live: Path) -> None:
     live = live.resolve()
     live.parent.mkdir(parents=True, exist_ok=True)
     previous = live.with_name(live.name + ".previous")
+    incoming = live.with_name(live.name + ".incoming")
+    # A promotion killed between its two renames leaves the only good cache
+    # at .previous and nothing at live. Restore it before any cleanup below,
+    # because the .previous clearing a few lines down would otherwise delete
+    # the only copy while live is absent, and a second failure of the swap
+    # would then leave no cache at all.
+    if not live.exists() and previous.exists():
+        log(f"an interrupted promotion left the cache renamed aside at {previous}; "
+            "restoring it before promoting")
+        os.replace(previous, live)
+    # A leftover .incoming is a promotion that died between the copy and the
+    # swap on an earlier run; it was never trusted, so it is cleared rather
+    # than adopted.
+    if incoming.exists():
+        shutil.rmtree(incoming)
+    try:
+        # Same volume: a rename, and the except clause never runs. Another
+        # volume: rename fails (EXDEV on POSIX, a not-same-device error on
+        # Windows), and the copy happens here, while the live cache is still
+        # complete and still in place.
+        os.replace(staged, incoming)
+    except OSError:
+        shutil.copytree(staged, incoming)
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():
         os.replace(live, previous)
-    shutil.move(str(staged), str(live))
+    try:
+        os.replace(incoming, live)
+    except OSError:
+        # Put the outgoing cache back before reporting, so a failed swap
+        # leaves the previous good databases where Trivy reads rather than
+        # nothing at all.
+        if previous.exists() and not live.exists():
+            os.replace(previous, live)
+        raise
+    _carry_kept_forward(previous, live, keep)
     shutil.rmtree(previous, ignore_errors=True)
+
+
+def _carry_kept_forward(previous: Path, live: Path, keep: tuple[str, ...]) -> None:
+    """Rename each kept database out of the outgoing cache into the new one.
+
+    Same volume by construction, so this moves no data. A failure is logged
+    rather than raised, because the promotion has already succeeded and the
+    carried database is re-downloadable; a name the staged tree already holds
+    is left alone, since the download is fresher than the carry."""
+    for name in keep:
+        held = previous / name
+        if not held.is_dir() or (live / name).exists():
+            continue
+        try:
+            os.replace(held, live / name)
+        except OSError as exc:
+            log(f"WARNING: could not carry {name} forward from the previous cache "
+                f"({exc}); it will be downloaded again on the next run that needs it")
 
 
 def current_user_sid() -> str | None:
@@ -1690,8 +1806,43 @@ def report_scratch_privacy(path: Path, sid: str | None) -> None:
             "so an entry granted there later reaches the staged database.")
 
 
-def _pick_scratch_base(real_near: Path | None, near: Path | None) -> Path | None:
-    """The first configured base that is present, outside the cache, and roomy."""
+def _ensure_cache_parent(real_near: Path | None) -> None:
+    """Create the cache parent so it can serve as a scratch base.
+
+    It is a candidate below and promotion creates it without hesitating a few
+    dozen lines later, so refusing to stage in a directory the run is about to
+    create anyway was an inconsistency: on a first run against a host with no
+    cache yet, it sent the download to the small system temporary volume, the
+    one case the whole mechanism exists for. A configured
+    LOCKFILE_SENTINEL_SCRATCH that does not exist is still passed over rather
+    than created, since a path someone typed wrong is a mistake worth
+    reporting."""
+    if real_near is None:
+        return
+    try:
+        real_near.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"could not create the cache parent {real_near.parent} ({exc}); "
+            "it stays out of the running as a scratch base")
+
+
+class ScratchUnavailableError(RuntimeError):
+    """No scratch base can hold the download, stated before a byte is spent.
+
+    A distinct type rather than a bare RuntimeError so the caller can tell a
+    missing prerequisite, which is worth its own exit code, from a genuine
+    malfunction, which deserves a traceback."""
+
+
+def _pick_scratch_base(real_near: Path | None, near: Path | None,
+                       need: int, passed_over: list[str]) -> Path | None:
+    """The first configured base that is present, outside the cache, and roomy.
+
+    `need` is what this refresh will actually stage, stated by the caller, so
+    a run that downloads less is not rejected for room it does not need.
+    Every rejection is logged where it happens and summarised into
+    `passed_over`, so a later refusal can name each base and why it lost
+    without re-measuring anything."""
     candidates = [
         (SCRATCH_BASE, "LOCKFILE_SENTINEL_SCRATCH"),
         (str(real_near.parent) if real_near else "", "the cache volume"),
@@ -1702,6 +1853,7 @@ def _pick_scratch_base(real_near: Path | None, near: Path | None) -> Path | None
         path = Path(value)
         if not path.is_dir():
             log(f"scratch base {value} from {origin} is not available")
+            passed_over.append(f"{value} from {origin} (not a directory)")
             continue
         if near is not None and is_inside(path, near):
             # Promotion renames the live cache aside before moving the staged
@@ -1714,26 +1866,33 @@ def _pick_scratch_base(real_near: Path | None, near: Path | None) -> Path | None
             log(f"scratch base {value} from {origin} is inside the cache {near} that the "
                 "download is promoted into, where it would be carried away by the "
                 "promotion and leave no live cache; passing over it")
+            passed_over.append(f"{value} from {origin} (inside the cache)")
             continue
         free = free_bytes(path)
-        if free is not None and free < SCRATCH_MIN_FREE_BYTES:
+        if free is not None and free < need:
             log(f"scratch base {value} from {origin} has {describe_free(free)}, under the "
-                f"{SCRATCH_MIN_FREE_BYTES / 1024 ** 3:.0f} GB a database refresh needs; "
+                f"{need / 1024 ** 3:.1f} GB this refresh needs; "
                 "passing over it")
+            passed_over.append(f"{value} from {origin} ({describe_free(free)})")
             continue
         return path
     return None
 
 
-def _fallback_scratch_base(real_near: Path | None, near: Path | None) -> Path:
-    """The system temporary directory, unless the cache contains it."""
+def _fallback_scratch_base(real_near: Path | None, near: Path | None,
+                           need: int, passed_over: list[str]) -> Path:
+    """The last resort when every candidate lost, or the refusal to have one.
+
+    Raises ScratchUnavailableError rather than returning a base that is
+    measurably short or certainly fatal, since deciding here is what spares
+    the run from finding out a gigabyte later."""
     system = Path(tempfile.gettempdir())
     if near is not None and is_inside(system, near):
         # The containment rule has to hold on the last resort too, or the
         # failure it exists to prevent simply moves here: a scratch under the
         # cache is carried off by the promotion rename, and the run ends with
         # no live cache at all. Low free space only makes the download likely
-        # to fail, which is why the fallback tolerates it; containment makes
+        # to fail, which is why this branch tolerates it; containment makes
         # the promotion certain to destroy the cache, and the two are not
         # comparable.
         #
@@ -1743,7 +1902,7 @@ def _fallback_scratch_base(real_near: Path | None, near: Path | None) -> Path:
         # answer than one that is certainly fatal.
         base = real_near.parent if real_near else system
         if not base.is_dir():
-            raise RuntimeError(
+            raise ScratchUnavailableError(
                 f"no scratch base is usable: the system temporary directory {system} sits "
                 f"inside the cache {near}, where a scratch would be carried away by the "
                 f"promotion, and the cache parent {base} is not a directory. Set "
@@ -1753,14 +1912,33 @@ def _fallback_scratch_base(real_near: Path | None, near: Path | None) -> Path:
             f"scratch would be carried away by the promotion; using {base} instead "
             f"({describe_free(free_bytes(base))}), short of room though it may be")
         return base
+    # The last resort is size-checked like any other base, because it is the
+    # volume the Java index download actually ran out of room on. Proceeding
+    # anyway spent the transfer to reach the original failure and reported it
+    # as an obscure write error from inside a child process; refusing here
+    # states the cause before a byte is spent, naming every base that was
+    # considered and why it lost. An unmeasurable figure still proceeds,
+    # since unknown is not known-short and every alternative was already
+    # passed over.
+    system_free = free_bytes(system)
+    if system_free is not None and system_free < need:
+        considered = "; ".join(passed_over) if passed_over else "none was configured"
+        raise ScratchUnavailableError(
+            f"no volume has the {need / 1024 ** 3:.1f} GB this refresh needs: "
+            f"candidates passed over: {considered}; the system temporary "
+            f"directory {system} has {describe_free(system_free)}. Free some "
+            "space, or set LOCKFILE_SENTINEL_SCRATCH to a volume with room."
+        )
     log(f"falling back to the system temporary directory {system} "
-        f"({describe_free(free_bytes(system))}), which is the volume the Java index "
+        f"({describe_free(system_free)}), which is the volume the Java index "
         "download ran out of room on")
     return system
 
 
 @contextlib.contextmanager
-def scratch_dir(label: str, near: Path | None = None):
+def scratch_dir(label: str, near: Path | None = None,
+                need: int = SCRATCH_MIN_FREE_BYTES,
+                leaks: list[Path] | None = None):
     """Yield a private scratch directory on a volume with room, and remove it after.
 
     Trivy stages the Java index database, roughly 900 MB compressed and larger
@@ -1776,10 +1954,25 @@ def scratch_dir(label: str, near: Path | None = None):
     variables for the child process as well, TMPDIR for Unix and TMP and TEMP
     for Windows, since the two platforms read different ones.
 
-    A base is passed over unless it has SCRATCH_MIN_FREE_BYTES to spare, because
-    "a volume with room" is the whole point and is-it-a-directory does not
-    establish it. A base whose free space cannot be read is still used, since
-    the alternative is falling back to the volume already known to be too small.
+    A base is passed over unless it has `need` bytes to spare, because "a
+    volume with room" is the whole point and is-it-a-directory does not
+    establish it. The caller states `need` from what it will actually stage,
+    since a run that downloads less needs less; the default is the full-refresh
+    figure. A base whose free space cannot be read is still used, since the
+    alternative is falling back to the volume already known to be too small.
+    When every base including the last-resort system temporary directory is
+    measurably short, ScratchUnavailableError is raised before a byte is
+    downloaded, naming each candidate and its figure: proceeding anyway spent
+    the transfer to reach the original disk-full failure and reported it as an
+    obscure write error from inside a child process. The cache parent is
+    created first when it does not exist, since promotion creates it moments
+    later anyway and refusing to stage in it sent a first run on a fresh host
+    to the small system volume, the one case this mechanism exists for.
+
+    `leaks` is how a cleanup failure reaches the caller's exit code: the
+    finally that removes the scratch cannot raise without masking whatever
+    exception is already propagating, so a directory it could not remove is
+    appended to the caller's list instead, beside the WARNING in the log.
 
     No drive letter appears anywhere in this resolution. LOCKFILE_SENTINEL_SCRATCH
     wins when set; otherwise the scratch goes beside `near`, the directory the
@@ -1828,15 +2021,33 @@ def scratch_dir(label: str, near: Path | None = None):
         except (OSError, RuntimeError) as exc:
             log(f"could not resolve the cache {near} ({exc}); "
                 "using the path as spelled to choose a scratch base")
-    base = _pick_scratch_base(real_near, near)
+    _ensure_cache_parent(real_near)
+    passed_over: list[str] = []
+    base = _pick_scratch_base(real_near, near, need, passed_over)
     if base is None:
-        base = _fallback_scratch_base(real_near, near)
+        base = _fallback_scratch_base(real_near, near, need, passed_over)
     # Before the directory exists, so that the interval between creating it and
     # restricting it holds one icacls call and not a whoami spawn as well. On a
     # 3.12.4 or newer interpreter with ACL support this interval does not matter,
     # because mkdir below creates the directory already protected; it matters on
     # exactly the builds and filesystems where that does not happen, which are
     # the ones restrict_to_owner exists for.
+    # A temp-* sibling already in the base is evidence of a cleanup that
+    # failed on an earlier run, which is exactly the leak the finally below
+    # reports: the names are random by design, so nothing else ever
+    # recognises one as garbage. Reported rather than deleted, because a
+    # directory that could not be removed may be one something still holds
+    # open, and one of these may belong to a run happening right now.
+    leftovers = sorted(entry.name for entry in base.glob("temp-*") if entry.is_dir())
+    if leftovers:
+        # A handful of names identifies the leak; hundreds of them, the very
+        # accumulation this NOTE exists to surface, would bloat the log line.
+        shown = ", ".join(leftovers[:5])
+        more = f" and {len(leftovers) - 5} more" if len(leftovers) > 5 else ""
+        log(f"NOTE: {base} already holds {len(leftovers)} temp-* "
+            f"director{'y' if len(leftovers) == 1 else 'ies'} "
+            f"({shown}{more}); each is either a concurrent run's scratch "
+            "or a leak from a cleanup that failed, and nothing removes the latter")
     sid = current_user_sid() if IS_WINDOWS else None
     path = base / f"temp-{secrets.token_hex(8)}"
     path.mkdir(mode=0o700, exist_ok=False)
@@ -1893,25 +2104,68 @@ def scratch_dir(label: str, near: Path | None = None):
         except OSError as exc:
             log(f"WARNING: could not remove the scratch directory {path} ({exc}). It holds "
                 "whatever the download left behind, and nothing else will clean it up.")
+            # The caller that passed a list gets the fact as well as the log
+            # line, so the run's exit code can say a gigabyte leaked without
+            # this finally raising over an exception already in flight.
+            if leaks is not None:
+                leaks.append(path)
 
 
-def _trivy_refresh_due(args, before: dict[str, dict[str, datetime | None]],
+def _download_into_staging(trivy: str, skip_java_db: bool,
+                           child_env: dict[str, str]) -> int:
+    """Fetch each required database into the staging cache, 0 on success.
+
+    A non-zero download exit stops the run before the gate, with the live
+    cache untouched, since a partial staging cache is exactly what the
+    staging design exists to keep away from promotion."""
+    for flag, label in (("--download-db-only", "vulnerability"),
+                        ("--download-java-db-only", "Java index")):
+        if flag == "--download-java-db-only" and skip_java_db:
+            continue
+        log(f"downloading the {label} database into the staging cache ...")
+        code, out = run([trivy, "image", flag], env=child_env)
+        echo(out, "trivy")
+        if code != 0:
+            log(f"FAIL: {label} database download exited {code}; "
+                "the live cache is untouched")
+            return 1
+    return 0
+
+
+def _trivy_refresh_due(force: bool, trivy: str, before: TrivyFreshness,
                        required: list[str]) -> bool:
-    """Whether the download should run at all, logging the reason either way."""
-    undated = [name for name in required
-               if before.get(name, {}).get("next_update") is None]
-    due = [name for name in overdue(before) if name in required]
+    """Whether anything obliges a download, logging the reason either way.
 
-    if args.force:
+    Four grounds, in order of certainty: the operator said so, a database
+    cannot be dated, a database is past its stamp, or the binary that will
+    read the cache is not the one that wrote it. Only when none holds is the
+    skip earned, and the log then names when the next refresh falls due."""
+    if force:
         log("--force given, so the databases are refreshed whether or not they are due")
         return True
+    undated = [name for name in required
+               if before.get(name, {}).get("next_update") is None]
     if undated:
         # A database Trivy cannot date is not evidence of a database that is current.
         log(f"no next-update time for: {', '.join(undated)}; treating that as due, "
             "since a database that cannot be dated is not a database known to be fresh")
         return True
+    due = [name for name in overdue(before) if name in required]
     if due:
         log(f"due now: {', '.join(due)}")
+        return True
+    changed = _trivy_binary_changed(trivy)
+    if changed:
+        # A NextUpdate stamp knows nothing about binaries. Before the skip
+        # existed the download always ran, and an incompatible cache was
+        # replaced as a side effect of running at all; the skip is what makes
+        # the binary worth checking, since an upgraded Trivy expecting a
+        # schema the cache does not carry would otherwise read "nothing due"
+        # over databases it cannot use, and the failure would surface later,
+        # in a scan, as an obscure error. This forces exactly one refresh per
+        # binary change and needs no table of which binary expects which
+        # schema, which is the part that would age badly.
+        log(changed)
         return True
     # `undated` is exactly the required databases whose next_update is None, and
     # it is empty here, so the filter drops nothing. Writing it as a filter rather
@@ -1919,7 +2173,7 @@ def _trivy_refresh_due(args, before: dict[str, dict[str, datetime | None]],
     # turns a relaxed guard above into an error rather than the soonest of a
     # smaller set, which would be a wrong answer reported as a right one.
     stamps = [before[name]["next_update"] for name in required]
-    dated = [stamp for stamp in stamps if stamp is not None]
+    dated = [stamp for stamp in stamps if isinstance(stamp, datetime)]
     if len(dated) != len(stamps):
         missing = [name for name in required if before[name]["next_update"] is None]
         raise RuntimeError(
@@ -1930,6 +2184,26 @@ def _trivy_refresh_due(args, before: dict[str, dict[str, datetime | None]],
     log(f"nothing is due yet, next at {describe_age(soonest)}; skipping the download. "
         "Pass --force to refresh anyway")
     return False
+
+
+def _trivy_binary_changed(trivy: str) -> str | None:
+    """A message when the installed Trivy is not the one that wrote the cache.
+
+    None means no refresh is owed on this ground: the versions match, or the
+    binary will not say its version, in which case a mismatch cannot be
+    claimed. A cache written before this record existed answers with the
+    unrecorded wording; the record is written only by a full refresh, so a
+    --skip-java-db run keeps answering that way until one runs."""
+    installed = trivy_binary_version(trivy)
+    if not installed:
+        return None
+    recorded = str(read_state(TRIVY_STATE).get("trivyVersion") or "")
+    if installed == recorded:
+        return None
+    was = f"trivy {recorded}" if recorded else "a trivy version that was never recorded"
+    return (f"the installed trivy is {installed} but the cached databases were "
+            f"written under {was}; treating them as due, since a newer binary "
+            "can expect a schema the cache does not carry")
 
 
 def target_trivy_db(args) -> int:
@@ -1959,12 +2233,16 @@ def target_trivy_db(args) -> int:
     # threw the result away as identical. Roughly 1 GB a night, plus 90 s of ClamAV
     # over it.
     #
-    # The decision is all-or-nothing rather than per database, and that is forced by
-    # the promotion step: it replaces the whole cache directory, so a staging cache
-    # holding only the database that was due would drop the other one from the live
-    # cache. If either is due, both are fetched.
+    # The decision is all-or-nothing rather than per database. The promotion
+    # step replaces the whole cache directory, and while it can now carry a
+    # database forward from the outgoing cache, that carry exists for the one
+    # database the operator deliberately excluded with --skip-java-db, where
+    # the alternative was deleting a copy the flag promised to leave alone.
+    # Widening it into a general per-database refresh would put every promotion
+    # in the business of deciding which halves of two caches to interleave; if
+    # either required database is due, both are fetched.
     required = ["vulnerability"] if args.skip_java_db else ["vulnerability", "java"]
-    if not _trivy_refresh_due(args, before, required):
+    if not _trivy_refresh_due(args.force, trivy, before, required):
         return 0
 
     # Download into a staging cache, gate it there, and only then put it where
@@ -1972,7 +2250,18 @@ def target_trivy_db(args) -> int:
     # databases before anything scanned them, so a rejected download was already
     # the copy every later Trivy run consumed, including this scanner's own
     # corroboration pass. Refusing to trust it after the fact changed nothing.
-    with scratch_dir("trivy databases", near=live) as staging:
+    # The space requirement follows what staging will hold, not which flags
+    # were passed: --skip-java-db stages a tenth the bytes, and the carried-
+    # forward Java index is a rename that stages nothing. Deriving the figure
+    # from `required` keeps it correct if that set ever changes for another
+    # reason.
+    need = sum(SCRATCH_NEED_BYTES[name] for name in required)
+    # The list outlives the scratch on purpose: the finally that removes the
+    # directory runs as the block exits, so a cleanup failure lands here in
+    # time for the exit code below to say the work succeeded but a scratch
+    # was left behind.
+    leaked: list[Path] = []
+    with scratch_dir("trivy databases", near=live, need=need, leaks=leaked) as staging:
         staged = staging / "cache"
         staged.mkdir(parents=True, exist_ok=True)
         # The temporary directory goes to the same scratch as the staging cache.
@@ -1987,17 +2276,8 @@ def target_trivy_db(args) -> int:
         # left this fix doing nothing at all on Linux.
         child_env = dict(os.environ, TRIVY_CACHE_DIR=str(staged),
                          TMPDIR=str(staging), TMP=str(staging), TEMP=str(staging))
-        for flag, label in (("--download-db-only", "vulnerability"),
-                            ("--download-java-db-only", "Java index")):
-            if flag == "--download-java-db-only" and args.skip_java_db:
-                continue
-            log(f"downloading the {label} database into the staging cache ...")
-            code, out = run([trivy, "image", flag], env=child_env)
-            echo(out, "trivy")
-            if code != 0:
-                log(f"FAIL: {label} database download exited {code}; "
-                    "the live cache is untouched")
-                return 1
+        if _download_into_staging(trivy, args.skip_java_db, child_env) != 0:
+            return 1
 
         if not gate(staged, "the downloaded Trivy databases", args.skip_scan):
             log("the rejected download was discarded; the live cache is untouched")
@@ -2015,12 +2295,35 @@ def target_trivy_db(args) -> int:
             return 1
 
         try:
-            promote_into(staged, live)
+            # A run that skipped the Java index still owes the cache the copy
+            # it already had: promotion replaces the whole directory, so the
+            # skipped database is named here to be carried forward rather than
+            # silently dropped, which is what --skip-java-db used to do.
+            promote_into(staged, live,
+                         keep=("java-db",) if args.skip_java_db else ())
         except OSError as exc:
             log(f"FAIL: could not promote the gated databases into {live} ({exc})")
             return 1
 
+        # Recorded only on a full refresh: a --skip-java-db run promotes a
+        # carried-forward Java index the installed binary never validated, so
+        # the record keeps naming the binary that wrote it and the next full
+        # run still sees the mismatch. The cost is a re-download of the small
+        # database on each skip run after an upgrade, which is the safe side.
+        if not args.skip_java_db:
+            write_state(TRIVY_STATE, {"trivyVersion": trivy_binary_version(trivy) or ""})
+
     log(f"Trivy databases current, promoted into {live}")
+    if leaked:
+        # The two outcomes are genuinely different and the exit code says
+        # which happened: the databases are correctly promoted, and a scratch
+        # directory that can hold a gigabyte could not be removed. A scheduled
+        # run turns amber rather than green, instead of a leak per night
+        # accumulating behind an exit 0 that looked identical to a clean one.
+        log(f"WARNING: the refresh succeeded but {len(leaked)} scratch "
+            f"director{'y' if len(leaked) == 1 else 'ies'} could not be removed; "
+            "exiting 3 so the leak is visible to whatever scheduled this run")
+        return 3
     return 0
 
 
@@ -2073,20 +2376,6 @@ def _status_offline_db() -> None:
         log(f"offline database: not present ({offline}), online mode is always current")
 
 
-def _status_trivy() -> tuple[bool, bool]:
-    """The Trivy databases' freshness, as (stale, unknown)."""
-    trivy = resolve_trivy()
-    if not trivy:
-        log("trivy: not found")
-        return False, True
-    freshness = trivy_freshness(trivy)
-    report_trivy(freshness, "trivy")
-    # No metadata means the state could not be determined, which is exit 2
-    # rather than a pass. Reading it as "nothing overdue" let a status run
-    # report health for a check that never produced an answer.
-    return bool(overdue(freshness)), not freshness
-
-
 def target_status(_args) -> int:
     """Report the freshness of everything this program maintains.
 
@@ -2100,6 +2389,30 @@ def target_status(_args) -> int:
     if any(unknown for _, unknown in checks):
         return 2
     return 1 if any(stale for stale, _ in checks) else 0
+
+
+def _status_trivy() -> tuple[bool, bool]:
+    """The Trivy half of status: (stale, unknown).
+
+    No metadata means the state could not be determined, which is exit 2
+    rather than a pass: reading it as "nothing overdue" let a status run
+    report health for a check that never produced an answer. The binary
+    version is checked beside the stamps because a schema mismatch is the one
+    staleness the stamps cannot express, and status is where the air-gapped
+    host, the one case an ordinary scan will not quietly repair, gets to find
+    out."""
+    trivy = resolve_trivy()
+    if not trivy:
+        log("trivy: not found")
+        return False, True
+    freshness = trivy_freshness(trivy)
+    report_trivy(freshness, "trivy")
+    stale = bool(overdue(freshness))
+    mismatch = _trivy_binary_changed(trivy)
+    if mismatch:
+        log(f"  {mismatch}")
+        stale = True
+    return stale, not freshness
 
 
 # --------------------------------------------------------------------------
@@ -2140,7 +2453,8 @@ def main() -> int:
     parser.add_argument("--source-url", default=DATADOG_CSV_URL,
                         help="malicious-packages: the IOC feed to read.")
     parser.add_argument("--skip-java-db", action="store_true",
-                        help="trivy-db: refresh only the vulnerability database.")
+                        help="trivy-db: refresh only the vulnerability database; "
+                             "a cached Java index is left in place.")
     args = parser.parse_args()
 
     if not args.source_dir:
@@ -2152,15 +2466,27 @@ def main() -> int:
     rotate_log()
     log(f"run start: {args.target}")
 
+    def dispatch(name: str) -> int:
+        # A refusal to stage is a prerequisite that is missing, not work that
+        # failed: the run decided before downloading rather than during, so
+        # it exits 2 with the refusal's own accounting of every base and its
+        # free space, instead of an obscure write error from inside a child
+        # process after the transfer was already spent.
+        try:
+            return TARGETS[name](args)
+        except ScratchUnavailableError as exc:
+            log(f"FAIL: {exc}")
+            return 2
+
     if args.target == "all":
         worst = 0
         for name in ("osv-scanner", "malicious-packages", "offline-db", "trivy-db"):
             log(f"--- {name} ---")
-            worst = max(worst, TARGETS[name](args))
+            worst = max(worst, dispatch(name))
         log(f"run end: all targets, worst exit {worst}")
         return worst
 
-    code = TARGETS[args.target](args)
+    code = dispatch(args.target)
     log(f"run end: {args.target}, exit {code}")
     return code
 
