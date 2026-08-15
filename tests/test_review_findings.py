@@ -99,12 +99,19 @@ def test_a_snapshot_is_written_by_replacement_not_by_truncation(
     tmp_path: Path,
 ) -> None:
     """write_text truncated the live report before writing it, so a reader
-    racing a batch update saw a half-written file."""
+    racing a batch update saw a half-written file.
+
+    The identity check is the point: correct final content and no leftover
+    temp file are both true of a truncating write too, so only a new inode at
+    the same path distinguishes replacement from writing in place."""
     target = tmp_path / "report.json"
     target.write_text('{"first": true}', encoding="utf-8")
+    before = target.stat()
     ls._write_atomic(target, '{"second": true}')
+    after = target.stat()
     assert json.loads(target.read_text(encoding="utf-8")) == {"second": True}
     assert [p.name for p in tmp_path.iterdir()] == ["report.json"]
+    assert (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
 
 
 def test_the_example_reconciles_its_own_submitted_counts() -> None:
