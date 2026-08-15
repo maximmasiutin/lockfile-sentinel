@@ -1571,6 +1571,7 @@ def test_a_staged_tree_that_cannot_be_stated_is_not_promoted(tmp_path) -> None:
     exists to remove, in the case where something is already wrong."""
     live = tmp_path / "trivy-cache"
     (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
 
     staged = tmp_path / "temp-abc123"
     (staged / "db").mkdir(parents=True)
@@ -1579,6 +1580,78 @@ def test_a_staged_tree_that_cannot_be_stated_is_not_promoted(tmp_path) -> None:
 
     with pytest.raises(us.ScratchSwappedError):
         us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_link_left_where_the_staged_tree_was_is_not_promoted(tmp_path) -> None:
+    """A link at the staged name answers for itself, not for its target.
+
+    Reading the identity through the link would report the moved-aside
+    original's device and inode, pass the comparison, and then promote the link
+    itself, leaving the cache pointing at a location the other account still
+    controls and that scratch cleanup is about to remove."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    moved_aside = tmp_path / "moved-aside"
+    staged.rename(moved_aside)
+    try:
+        staged.symlink_to(moved_aside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_source_swapped_during_a_cross_device_copy_is_not_promoted(
+        tmp_path, monkeypatch) -> None:
+    """The copy path reads the source by pathname for as long as it runs.
+
+    A single check before the rename covers none of a gigabyte-sized copy, so
+    a scratch renamed aside part-way through would otherwise leave `.incoming`
+    holding unscanned or mixed content that the swap then installs."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def swap_the_source_mid_copy(_src, dst):
+        # The copy lands, and the source is renamed aside while it runs and
+        # another directory left at the same name, as a rename of the scratch
+        # by another account would look.
+        Path(dst).mkdir()
+        staged.rename(tmp_path / "moved-aside")
+        (staged / "db").mkdir(parents=True)
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", swap_the_source_mid_copy)
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not live.with_name(live.name + ".incoming").exists()
 
 
 def test_an_unswapped_tree_still_promotes(tmp_path) -> None:

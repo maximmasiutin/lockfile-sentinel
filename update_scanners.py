@@ -1192,35 +1192,47 @@ class ScratchSwappedError(RuntimeError):
 
 
 def dir_identity(path: Path) -> tuple[int, int]:
-    """The (device, inode) of `path`, which a rename at the same name changes.
+    """The (device, inode) of the entry at `path`, not of what it points at.
 
-    st_ino is meaningful on Windows too: since 3.5 CPython fills it from the
-    NTFS file index, which is what GetFileInformationByHandle reports."""
-    info = path.stat()
+    lstat, so a link left where the directory was answers for itself and fails
+    the comparison. Following it would report the identity of the moved-aside
+    original and pass. st_ino is meaningful on Windows too: since 3.5 CPython
+    fills it from the NTFS file index, which is what GetFileInformationByHandle
+    reports."""
+    info = path.lstat()
     return info.st_dev, info.st_ino
 
 
-def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None) -> None:
+def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None,
+                       when: str = "before the promotion") -> None:
     """Refuse when `staged` is no longer the directory `identity` came from.
 
     Narrows the window rather than closing it: an account able to rename the
-    scratch aside can still do so between this stat and the rename below. A
-    handle held open across the whole interval would close it, but the call
-    that opens a directory handle is Windows-only, and portable code here is
-    worth more than the remaining microseconds."""
+    scratch aside can still do so between this stat and the operation that
+    follows. A handle held open across the whole interval would close it, but
+    the call that opens a directory handle is Windows-only, and portable code
+    here is worth more than the remaining microseconds.
+
+    A reparse point at the name is refused outright rather than compared. It
+    cannot match an lstat identity recorded for a real directory, but saying so
+    in its own words names what happened."""
     if identity is None:
         return
+    if is_reparse_point(staged):
+        raise ScratchSwappedError(
+            f"the staged tree {staged} is a link rather than the directory that was "
+            "scanned, so another account replaced it after the gate")
     try:
         current = dir_identity(staged)
     except OSError as exc:
         raise ScratchSwappedError(
-            f"the staged tree {staged} could not be stat'd immediately before promotion "
-            f"({exc}), so it cannot be shown to be the tree the scanner passed") from exc
+            f"the staged tree {staged} could not be stat'd {when} ({exc}), so it "
+            "cannot be shown to be the tree the scanner passed") from exc
     if current != identity:
         raise ScratchSwappedError(
             f"the staged tree {staged} is not the directory that was scanned: it was "
             f"{identity} when it was created and is {current} now, so another account "
-            "replaced it after the gate and before the promotion")
+            f"replaced it after the gate and {when}")
 
 
 def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
@@ -1260,16 +1272,16 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
     stat'd at that moment.
 
     `staged_identity` is the (device, inode) the caller recorded when it made
-    the staged tree. It is re-read here, immediately before the tree leaves the
-    scratch, and a mismatch refuses the promotion: between the ClamAV gate and
-    this rename the tree is otherwise trusted by pathname alone, and a base
-    that grants another account DELETE_CHILD lets that account rename the
-    scanned tree aside and leave its own at the same name.
+    the staged tree. It is re-read immediately before the tree leaves the
+    scratch, and again after a cross-device copy, and a mismatch refuses the
+    promotion: between the ClamAV gate and the rename the tree is otherwise
+    trusted by pathname alone, and a base that grants another account
+    DELETE_CHILD lets that account rename the scanned tree aside and leave its
+    own at the same name.
 
     OSError propagates. The caller reports it, because it is the caller that
     knows the run this was part of. ScratchSwappedError propagates the same way.
     """
-    _refuse_if_swapped(staged, staged_identity)
     # The real directory, not the name that reached us, for the same reason
     # is_inside resolves: a rename acts on the location rather than the spelling.
     # Where the cache path is a symlink onto a roomier volume, os.replace renames
@@ -1296,6 +1308,10 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
     # than adopted.
     if incoming.exists():
         shutil.rmtree(incoming)
+    # Here rather than at the top of the function: the restore and the rmtree
+    # above can take a while on a large leftover tree, and a check that ran
+    # before them would leave that whole interval unguarded.
+    _refuse_if_swapped(staged, staged_identity)
     try:
         # Same volume: a rename, and the except clause never runs. Another
         # volume: rename fails (EXDEV on POSIX, a not-same-device error on
@@ -1309,7 +1325,17 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
         # of the real cause. Windows raises error 17 here rather than EXDEV.
         if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
             raise
+        # The cross-device path reads the source by pathname for as long as a
+        # gigabyte takes to copy, so the single check above covers none of it.
+        # Checking again once the copy is done catches a source swapped during
+        # it, which is what a rename of the scratch would be; the copy is
+        # discarded rather than promoted.
         shutil.copytree(staged, incoming)
+        try:
+            _refuse_if_swapped(staged, staged_identity, when="during the copy")
+        except ScratchSwappedError:
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():
