@@ -894,9 +894,15 @@ def parse_stamp(text: str | None) -> datetime | None:
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        # Trivy's timestamps are UTC by contract. Left naive, astimezone() in
+        # overdue and describe_age would read the value as local time and every
+        # freshness judgement would shift by the host's UTC offset, silently.
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def trivy_freshness(trivy: str, env: dict[str, str] | None = None
