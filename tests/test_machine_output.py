@@ -397,6 +397,38 @@ def test_bounded_child_does_not_wait_for_an_inherited_pipe() -> None:
     assert time.monotonic() - started < 2
 
 
+def test_bounded_child_stops_a_continuously_written_inherited_pipe() -> None:
+    """The post-parent deadline applies even while a descendant keeps writing."""
+    writer = (
+        "import sys, time; "
+        "[(sys.stdout.buffer.write(b'x'*4096), sys.stdout.buffer.flush(), "
+        "time.sleep(.001)) for _ in range(5000)]"
+    )
+    parent = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {writer!r}])"
+    )
+    started = time.monotonic()
+    ls._run_bounded([sys.executable, "-c", parent], timeout=2)
+    assert time.monotonic() - started < 2
+
+
+def test_bounded_child_escalates_overflow_before_the_normal_timeout() -> None:
+    """A child ignoring graceful termination is killed on overflow promptly."""
+    script = (
+        "import signal, sys; "
+        "signal.signal(signal.SIGTERM, lambda *_: None); "
+        "exec(\"while True: sys.stdout.buffer.write(b'x'*65536); "
+        "sys.stdout.buffer.flush()\")"
+    )
+    started = time.monotonic()
+    with pytest.raises(ls.ChildOutputTooLarge):
+        ls._run_bounded(
+            [sys.executable, "-c", script], timeout=10, stdout_limit=1024,
+        )
+    assert time.monotonic() - started < 4
+
+
 def test_osv_output_overflow_is_a_structured_retryable_failure(monkeypatch) -> None:
     """Oversized JSON is an outage, never a clean scanner response."""
     def overflow(*_args, **_kwargs):

@@ -158,7 +158,6 @@ def _read_child_stream(
     truncated: threading.Event,
     read_failed: threading.Event,
     stop_reading: threading.Event,
-    process: subprocess.Popen[bytes],
 ) -> None:
     """Drain one pipe while retaining no more than its declared byte limit."""
     stopped_at: float | None = None
@@ -172,10 +171,10 @@ def _read_child_stream(
                 continue
             if not chunk:
                 return
-            stopped_at = None
-            _retain_child_chunk(
-                chunk, capture, limit, overflow, truncated, process
-            )
+            stopped_at = _reader_drain_started(stop_reading, stopped_at)
+            if stopped_at is not None and time.monotonic() - stopped_at >= _CHILD_DRAIN_GRACE:
+                return
+            _retain_child_chunk(chunk, capture, limit, overflow, truncated)
     except (OSError, ValueError):
         read_failed.set()
 
@@ -194,10 +193,18 @@ def _reader_idle(
     return False, stopped_at
 
 
+def _reader_drain_started(
+    stop_reading: threading.Event, stopped_at: float | None,
+) -> float | None:
+    """Start one fixed drain window even while inherited pipes stay busy."""
+    if not stop_reading.is_set():
+        return None
+    return stopped_at or time.monotonic()
+
+
 def _retain_child_chunk(
     chunk: bytes, capture: bytearray, limit: _CaptureLimit,
     overflow: threading.Event, truncated: threading.Event,
-    process: subprocess.Popen[bytes],
 ) -> None:
     """Retain one bounded chunk, as a tail or as complete machine output."""
     if limit.retain_tail:
@@ -212,10 +219,6 @@ def _retain_child_chunk(
     if len(chunk) <= available:
         return
     overflow.set()
-    try:
-        process.terminate()
-    except OSError:
-        pass
 
 
 def _stop_child(process: subprocess.Popen[bytes]) -> None:
@@ -231,6 +234,20 @@ def _stop_child(process: subprocess.Popen[bytes]) -> None:
         except OSError:
             pass
         process.wait()
+
+
+def _wait_for_child(
+    process: subprocess.Popen[bytes], command: list[str], timeout: int,
+    overflow: threading.Event,
+) -> None:
+    """Wait until exit, timeout, or an overflow that needs immediate killing."""
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if overflow.wait(_CHILD_READ_POLL):
+            _stop_child(process)
+            return
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(command, timeout)
 
 
 def _run_bounded(
@@ -265,20 +282,20 @@ def _run_bounded(
         threading.Thread(
             target=_read_child_stream,
             args=(process.stdout, stdout, _CaptureLimit(stdout_limit), overflow,
-                  threading.Event(), read_failed, stop_reading, process),
+                  threading.Event(), read_failed, stop_reading),
             daemon=True,
         ),
         threading.Thread(
             target=_read_child_stream,
             args=(process.stderr, stderr, _CaptureLimit(stderr_limit, True),
-                  threading.Event(), stderr_truncated, read_failed, stop_reading, process),
+                  threading.Event(), stderr_truncated, read_failed, stop_reading),
             daemon=True,
         ),
     )
     for reader in readers:
         reader.start()
     try:
-        process.wait(timeout=timeout)
+        _wait_for_child(process, command, timeout, overflow)
     except subprocess.TimeoutExpired as exc:
         _stop_child(process)
         raise subprocess.TimeoutExpired(command, timeout) from exc
