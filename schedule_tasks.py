@@ -100,8 +100,12 @@ def resolve_system_tool(name: str) -> str:
     `shutil.which` closed only the first. The bare-name fallback keeps an
     unusual layout, and every Unix tool such as crontab, working with the
     tool's own failure message; it never consults PATH itself. `name` needs
-    its extension, since the file test sees no PATHEXT."""
-    root = os.environ.get("SystemRoot", r"C:\Windows")
+    its extension, since the file test sees no PATHEXT. With SystemRoot unset,
+    the usual Unix case, the bare name is returned at once: a hardcoded default
+    would be a relative path there, reopening the current-directory vector."""
+    root = os.environ.get("SystemRoot")
+    if not root:
+        return name
     candidate = Path(root) / "System32" / name
     return str(candidate) if candidate.is_file() else name
 

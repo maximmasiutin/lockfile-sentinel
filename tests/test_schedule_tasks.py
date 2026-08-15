@@ -97,3 +97,11 @@ def test_the_tool_resolver_falls_back_to_the_bare_name_not_to_path(
     (decoy / "schtasks.exe").write_bytes(b"")
     monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
     assert st.resolve_system_tool("schtasks.exe") == "schtasks.exe"
+
+
+def test_the_tool_resolver_returns_the_bare_name_when_systemroot_is_unset(
+        monkeypatch) -> None:
+    """No SystemRoot, no lookup: a hardcoded default would be relative on Unix,
+    so a planted `./C:\\Windows/System32/crontab` could win."""
+    monkeypatch.delenv("SystemRoot", raising=False)
+    assert st.resolve_system_tool("crontab") == "crontab"
