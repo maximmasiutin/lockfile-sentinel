@@ -342,14 +342,18 @@ def _clamd_conf_candidates() -> list[Path]:
 
 
 def _parse_clamd_size(value: str) -> int | None:
-    """A clamd.conf size value in bytes, or None where it does not parse."""
+    """A clamd.conf size value in bytes, or None where it does not parse.
+
+    clamd defines 0 as no limit, so it maps to the libclamav ceiling, the
+    true upper bound whatever the configuration says."""
     raw = value.upper()
     multiplier = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}.get(raw[-1:], 1)
     digits = raw[:-1] if multiplier > 1 else raw
     try:
-        return int(digits) * multiplier
+        parsed = int(digits) * multiplier
     except ValueError:
         return None
+    return CLAMSCAN_FILE_CEILING if parsed == 0 else parsed
 
 
 def _refuse_oversized(files: list[Path], what: str) -> bool:

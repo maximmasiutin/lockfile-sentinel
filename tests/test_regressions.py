@@ -480,6 +480,21 @@ def test_the_clamav_gate_refuses_a_file_no_scanner_can_read(tmp_path: Path, monk
     assert us.gate(target, "an oversized artifact", skip=False) is False
 
 
+def test_a_maxfilesize_of_zero_reads_as_unlimited_not_as_a_zero_byte_cap(
+        tmp_path: Path, monkeypatch) -> None:
+    """clamd defines MaxFileSize 0 as no limit; reading it literally made the
+    gate conclude the daemon could scan nothing and fall back or refuse."""
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 0\n", encoding="utf-8")
+    monkeypatch.setenv("CLAMD_CONF", str(conf))
+    assert us.clamd_max_file_size() == us.CLAMSCAN_FILE_CEILING
+
+    assert us._parse_clamd_size("0") == us.CLAMSCAN_FILE_CEILING
+    assert us._parse_clamd_size("0M") == us.CLAMSCAN_FILE_CEILING
+    assert us._parse_clamd_size("100M") == 100 * 1024 ** 2
+    assert us._parse_clamd_size("bogus") is None
+
+
 def test_the_gate_still_refuses_when_there_is_nothing_to_scan(tmp_path: Path) -> None:
     """A missing target is a failure, not a pass."""
     assert us.gate(tmp_path / "absent", "a missing artifact", skip=False) is False
