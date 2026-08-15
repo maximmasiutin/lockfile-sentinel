@@ -1205,6 +1205,30 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
     assert json.loads(overlay.read_text(encoding="utf-8")) == original
 
 
+def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monkeypatch) -> None:
+    """urlopen reads file:// and http:// as happily as https://.
+
+    A file:// source is not a feed, and a cleartext fetch invites exactly the
+    substitution the overlay exists to catch, so both are refused before a
+    request is built. The stub raises to pin "before": a refusal that still
+    opened the URL would fail here rather than pass by accident."""
+    def must_not_open(*_args, **_kwargs):
+        raise AssertionError("the URL was opened despite the refusal")
+
+    monkeypatch.setattr(us.urllib.request, "urlopen", must_not_open)
+
+    class Args:
+        output = str(tmp_path / "overlay.json")
+        source_url = ""
+        skip_scan = True
+        min_interval = 0
+        force = True
+
+    for url in ("file:///C:/Windows/win.ini", "http://example.invalid/iocs.csv"):
+        Args.source_url = url
+        assert us.target_malicious_packages(Args()) == 1, f"accepted {url}"
+
+
 def test_cron_lines_quote_paths_and_omit_the_user_field_for_a_user_crontab() -> None:
     """Two silent scheduling failures, both of which install without error.
 

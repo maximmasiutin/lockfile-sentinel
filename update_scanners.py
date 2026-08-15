@@ -74,6 +74,7 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -85,6 +86,17 @@ from pathlib import Path
 __version__ = "0.1.0"
 
 IS_WINDOWS = os.name == "nt"
+
+
+def user_cache_base() -> Path:
+    """The per-user cache root the platform convention names.
+
+    One resolver for every cache path this program computes, because the
+    fallback spellings were drifting candidates: a base spelled differently in
+    one resolver is a cache written where the others never look."""
+    if IS_WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local"))
+    return Path(os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache"))
 OSV_EXE = "osv-scanner.exe" if IS_WINDOWS else "osv-scanner"
 TRIVY_EXE = "trivy.exe" if IS_WINDOWS else "trivy"
 
@@ -114,11 +126,7 @@ def cache_dir() -> Path:
     explicit = os.environ.get("LOCKFILE_SENTINEL_CACHE")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(base) / "lockfile-sentinel"
+    return user_cache_base() / "lockfile-sentinel"
 
 
 LOG_DIR = cache_dir() / "logs"
@@ -439,7 +447,7 @@ def osv_version(exe: Path | None) -> str | None:
     code, out = run([str(exe), "--version"], timeout=60)
     if code == 127:
         return None
-    match = re.search(r"osv-scanner version:\s*([0-9]\S*)", out)
+    match = re.search(r"osv-scanner version:\s*(\d\S*)", out)
     return match.group(1) if match else None
 
 
@@ -482,11 +490,7 @@ def trivy_cache_dir_default() -> Path:
     explicit = os.environ.get("TRIVY_CACHE_DIR")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(base) / "trivy"
+    return user_cache_base() / "trivy"
 
 
 def trivy_cache_dir() -> Path | None:
@@ -497,11 +501,7 @@ def trivy_cache_dir() -> Path | None:
     explicit = os.environ.get("TRIVY_CACHE_DIR")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    candidate = Path(base) / "trivy"
+    candidate = user_cache_base() / "trivy"
     return candidate if candidate.exists() else None
 
 
@@ -519,12 +519,16 @@ def latest_osv_version(timeout: int = 30) -> str | None:
             request = urllib.request.Request(
                 url, headers={"User-Agent": "update-scanners", "Accept": "application/json"}
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            # The URL is one of two module-level https constants, so the
+            # file:// scheme the audit rule worries about cannot be reached.
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
                 data = json.loads(response.read().decode("utf-8"))
             value = data.get(key)
             if value:
                 return str(value)
-        except Exception as exc:  # noqa: BLE001 - try the next source, then fail
+        # Broad on purpose: whatever this source's failure was, the next
+        # source is the answer, and only after both comes the None.
+        except Exception as exc:  # noqa: BLE001
             log(f"{url} lookup failed ({exc})")
     return None
 
@@ -788,6 +792,14 @@ def target_malicious_packages(args) -> int:
     ):
         return 0
 
+    # The feed URL is operator-supplied, and urlopen would happily read a
+    # file:// or http:// source. A local file is not a feed, and a cleartext
+    # fetch invites the substitution this overlay exists to catch, so anything
+    # but https is refused before a request is built.
+    if urllib.parse.urlsplit(args.source_url).scheme != "https":
+        log(f"refusing a non-https IOC feed URL: {args.source_url}")
+        return 1
+
     log(f"fetching campaign IOC feed: {args.source_url}")
     packages: dict[str, set[str]] = {}
     sources: list[str] = []
@@ -795,7 +807,7 @@ def target_malicious_packages(args) -> int:
         request = urllib.request.Request(
             args.source_url, headers={"User-Agent": "update-scanners"}
         )
-        with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310
+        with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             body = response.read()
         # Stage the download beside the overlay in the cache, never in the
         # scripts directory, so a crash between the write and the gate leaves
@@ -1254,13 +1266,10 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
     # case to an account holding SeCreateSymbolicLinkPrivilege or a machine with
     # Developer Mode on — which is a developer machine, and this is a developer's
     # tool. On an ordinary directory /L changes nothing.
-    code, output = run(
-        [resolve_system_tool("icacls.exe"), str(path), "/L", "/inheritance:r",
-         "/grant:r", f"*{sid}:(OI)(CI)F",
-         "/grant:r", "*S-1-5-18:(OI)(CI)F",
-         "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
-        timeout=60,
-    )
+    command = [resolve_system_tool("icacls.exe"), str(path), "/L", "/inheritance:r"]
+    for grant in (f"*{sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"):
+        command += ["/grant:r", grant]
+    code, output = run(command, timeout=60)
     if code != 0:
         log(f"WARNING: could not restrict the permissions on the scratch directory {path}. "
             "Whether that leaves it exposed is reported separately, from the ACL itself.")
