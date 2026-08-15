@@ -511,6 +511,18 @@ def test_an_apostrophe_in_a_bare_scalar_does_not_shield_the_comment() -> None:
     assert "keyv@6.0.0" not in ls._strip_hash_comments(text)
 
 
+def test_punctuation_inside_a_bare_scalar_does_not_open_a_string() -> None:
+    """`-` and `:` indicate only when whitespace follows them, and that
+    whitespace already admits the quote, so a quote directly behind either is
+    scalar content. Read as an opening quote it shields the comment behind it
+    and the commented-out pin survives, which is this strip's own defect."""
+    for text in (
+        "  note: pre-'90s # keyv@6.0.0\n",
+        "  note: ratio 3:'1 # keyv@6.0.0\n",
+    ):
+        assert "keyv@6.0.0" not in ls._strip_hash_comments(text), text
+
+
 def test_an_apostrophe_before_a_quoted_value_still_opens_that_value() -> None:
     """The narrowing must not cost the quoting it exists beside: a quote that
     does start a value keeps protecting the `#` inside it."""

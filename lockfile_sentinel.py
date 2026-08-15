@@ -336,8 +336,10 @@ HASH_COMMENT_LOCKFILES: frozenset[str] = frozenset(
     {YARN_LOCKFILE_NAME, PNPM_LOCKFILE_NAME}
 )
 # Where a quote may open a string. Anywhere else it is an apostrophe inside a
-# bare scalar, and opening a string there shields the rest of its line.
-_QUOTE_LEAD = frozenset(" \t\r\n{[,:-")
+# bare scalar, and opening a string there shields the rest of its line. `:` and
+# `-` are absent because each indicates only when whitespace follows it, and
+# that whitespace is already here; `pre-'90s` is bare scalar content.
+_QUOTE_LEAD = frozenset(" \t\r\n{[,")
 
 # The one timestamp shape this program writes and reads back: RFC 3339 UTC,
 # whole seconds, Z suffix. Stated once so the writer and the parsers cannot
