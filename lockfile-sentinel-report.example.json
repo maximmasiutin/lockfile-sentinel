@@ -227,7 +227,7 @@
   ],
   "findings": [
     {
-      "id": "6b2403aadba12815",
+      "id": "ac13d347dc453cf2",
       "kind": "malicious_resolved",
       "ecosystem": "npm",
       "package": "keyv",

@@ -3620,7 +3620,8 @@ def trivy_layer(requested: bool, trivy_bin: str | None,
     return layer
 
 
-def build_findings(statuses: list[RepoStatus]) -> list[dict[str, Any]]:
+def build_findings(statuses: list[RepoStatus],
+                   lookup: bool = True) -> list[dict[str, Any]]:
     """The canonical findings array: one entry per fact, whoever saw it.
 
     When the offline table and OSV flag the same resolved version, that is one
@@ -3629,7 +3630,7 @@ def build_findings(statuses: list[RepoStatus]) -> list[dict[str, Any]]:
     for human inspection; this array is the shape a pipeline flattens."""
     findings: list[dict[str, Any]] = []
     for status in statuses:
-        findings.extend(_resolved_findings(status))
+        findings.extend(_resolved_findings(status, lookup))
         findings.extend(_range_findings(status))
         findings.extend(_payload_findings(status))
     findings.sort(key=lambda f: (
@@ -3639,7 +3640,23 @@ def build_findings(statuses: list[RepoStatus]) -> list[dict[str, Any]]:
     return findings
 
 
-def _resolved_findings(status: RepoStatus) -> list[dict[str, Any]]:
+def _finding_campaign(name: str, advisories: list[str], lookup: bool) -> str | None:
+    """The campaign a resolved finding belongs to, or None when none is known.
+
+    A package the built-in table or overlay watches is the campaign's own by
+    construction. An OSV-only package is attributed the way the human report
+    attributes it, through the advisory text, so the JSON does not lose a
+    campaign the prose beside it names; lookup=False keeps the resolution to
+    the built-in notes, which is what --no-advisory-lookup promises."""
+    if _is_shai_hulud_name(name):
+        return "shai-hulud"
+    return next(
+        (campaign for campaign in (campaign_of(a, lookup) for a in advisories)
+         if campaign), None,
+    )
+
+
+def _resolved_findings(status: RepoStatus, lookup: bool) -> list[dict[str, Any]]:
     """One repository's malicious_resolved findings, both layers merged."""
     findings: list[dict[str, Any]] = []
     for name in sorted(set(status.poisoned_versions) | set(status.osv_malicious)):
@@ -3658,8 +3675,12 @@ def _resolved_findings(status: RepoStatus) -> list[dict[str, Any]]:
                 for p in status.evidence.get(("resolved", name, version), set())
             )
             findings.append({
+                # The id names the fact alone, never the evidence: advisory
+                # ids arrive and grow with database enrichment, and an id
+                # that moved with them would defeat the cross-run
+                # correlation a stable id is advertised for.
                 "id": _finding_id(status.path, "malicious_resolved", name,
-                                  version, ",".join(advisories)),
+                                  version, ""),
                 "kind": "malicious_resolved",
                 "ecosystem": "npm",
                 "package": name,
@@ -3670,7 +3691,7 @@ def _resolved_findings(status: RepoStatus) -> list[dict[str, Any]]:
                 "source_files": sources,
                 "advisories": advisories,
                 "detection_layers": layers,
-                "campaign": "shai-hulud" if _is_shai_hulud_name(name) else None,
+                "campaign": _finding_campaign(name, advisories, lookup),
                 "trivy_confirmed": sorted(
                     status.trivy_confirmed.get(f"{name}@{version}", set())
                 ),
@@ -3888,6 +3909,7 @@ def build_report(
     started_utc: str,
     finished_utc: str | None,
     complete: bool,
+    advisory_lookup: bool = True,
 ) -> dict[str, Any]:
     """Assemble the versioned scan report around the per-repository statuses.
 
@@ -3903,7 +3925,7 @@ def build_report(
         repo_to_dict(s, osv_requested, osv_available, trivy_requested, trivy_available)
         for s in sorted(statuses, key=lambda s: (s.name.lower(), s.path))
     ]
-    findings = build_findings(statuses)
+    findings = build_findings(statuses, advisory_lookup)
     return {
         "schema": {"name": REPORT_SCHEMA_NAME, "version": REPORT_SCHEMA_VERSION},
         "tool": {"name": "lockfile-sentinel", "version": __version__},
@@ -4403,6 +4425,7 @@ class _Sweep:
             started_utc=self.started_utc,
             finished_utc=finished,
             complete=complete,
+            advisory_lookup=not self.args.no_advisory_lookup,
         ))
 
     def persist_snapshot(self) -> None:

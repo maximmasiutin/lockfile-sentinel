@@ -376,14 +376,31 @@ def test_ranges_and_payloads_are_their_own_finding_kinds() -> None:
 
 
 def test_finding_ids_are_stable_across_runs_and_distinct_across_repos() -> None:
-    """The id is derived from what the finding names, so it survives re-runs
-    for deduplication and changes when the subject does."""
+    """The id is derived from the fact alone, never the evidence, so a run
+    without OSV and a later enriched run correlate on the same id, and the id
+    changes only when the subject does."""
     first = ls.build_findings([_poisoned_repo()])[0]["id"]
     second = ls.build_findings([_poisoned_repo()])[0]["id"]
     assert first == second
+    unenriched = _poisoned_repo()
+    unenriched.osv_malicious = {}
+    unenriched.osv_advisory_ids = {}
+    assert ls.build_findings([unenriched])[0]["id"] == first
     moved = _poisoned_repo()
     moved.path = "/t/elsewhere"
     assert ls.build_findings([moved])[0]["id"] != first
+
+
+def test_an_osv_only_package_still_gets_its_campaign_from_the_advisory() -> None:
+    """The human report attributes an OSV-only hit through the advisory text,
+    and the JSON must not lose that attribution; lookup=False keeps the
+    resolution to the built-in notes, honouring --no-advisory-lookup."""
+    status = ls.RepoStatus(name="app", path="/t/app")
+    status.osv_malicious = {"not-a-table-package": {"1.0.0"}}
+    status.osv_advisory_ids = {"not-a-table-package@1.0.0": {"MAL-2026-11524"}}
+    finding = ls.build_findings([status], lookup=False)[0]
+    assert finding["campaign"] is not None
+    assert "Shai-Hulud" in finding["campaign"]
 
 
 def test_scan_lockfile_attributes_the_poison_to_the_file_that_carried_it(
