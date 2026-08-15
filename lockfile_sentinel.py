@@ -2367,17 +2367,23 @@ def _chunked(items: list[str], size: int) -> list[list[str]]:
 
 def _extract_malicious_findings(
     osv_json: dict[str, Any]
-) -> dict[str, list[tuple[str, str, set[str]]]]:
+) -> dict[str, list[tuple[str, str, set[str]]]] | None:
     """Parse one OSV-Scanner JSON payload into
     {normalized_source_path: [(package_name, version, malicious_ids), ...]}.
 
     Only vulnerabilities whose id or aliases carry the OSV malicious-packages
     'MAL-' prefix are kept; ordinary CVE-style advisories are deliberately
-    dropped here since they are outside this scanner's purpose."""
+    dropped here since they are outside this scanner's purpose.
+
+    None where the payload carries no `results` list at all. The scanner emits
+    that key on every run, empty when it found nothing, so its absence is a
+    shape this parser does not know; reading it as zero findings would mark
+    every lockfile in the batch resolved on the strength of output nothing
+    understood."""
     by_source: dict[str, list[tuple[str, str, set[str]]]] = {}
     results = osv_json.get("results")
     if not isinstance(results, list):
-        return by_source
+        return None
     for result in results:
         source = result.get("source", {})
         source_path = source.get("path")
@@ -2578,13 +2584,29 @@ def _run_osv_batch(
         if failure is not None:
             failure["cause"] = "rejected"
         return None
+    parsed = _parse_osv_output(proc.stdout, len(paths))
+    if parsed is None and failure is not None:
+        failure["cause"] = "unavailable"
+    return parsed
+
+
+def _parse_osv_output(
+    stdout: str, batch_size: int
+) -> dict[str, list[tuple[str, str, set[str]]]] | None:
+    """The scanner's payload as findings, or None when it is unreadable.
+
+    Unparsable and unrecognised are the same answer here: both mean nothing
+    is known about these lockfiles, which is a fact about the tooling."""
     try:
-        return _extract_malicious_findings(json.loads(proc.stdout or "{}"))
+        payload = json.loads(stdout or "{}")
     except json.JSONDecodeError:
-        _progress(f"osv-scanner produced non-JSON output on {len(paths)} lockfile(s)")
-        if failure is not None:
-            failure["cause"] = "unavailable"
+        _progress(f"osv-scanner produced non-JSON output on {batch_size} lockfile(s)")
         return None
+    parsed = _extract_malicious_findings(payload)
+    if parsed is None:
+        _progress("osv-scanner produced JSON this parser does not recognise on "
+                  f"{batch_size} lockfile(s)")
+    return parsed
 
 
 def _report_osv_rejection(
@@ -2891,13 +2913,18 @@ def _advisory_cache_dir() -> Path:
     return OVERLAY_PATH.parent / "advisories"
 
 
-def fetch_advisory(advisory_id: str, timeout: int = 20) -> dict:
+def fetch_advisory(advisory_id: str, timeout: int = 20,
+                   network: bool = True) -> dict:
     """Fetch one advisory from OSV.dev, through a cache on disk.
 
     An advisory is immutable enough for this purpose and there are only ever a
     handful per run, so a cached copy beside the overlay means a repeated scan
     costs no requests at all. Any failure returns an empty record, because a
-    naming aid that cannot reach the network must not stop a scan."""
+    naming aid that cannot reach the network must not stop a scan.
+
+    network=False answers from the caches alone. Machine mode renders under
+    it, because a report generator that reaches the network per advisory turns
+    a scan of files already on disk into an outbound request per finding."""
     if advisory_id in _ADVISORY_CACHE:
         return _ADVISORY_CACHE[advisory_id]
 
@@ -2908,6 +2935,9 @@ def fetch_advisory(advisory_id: str, timeout: int = 20) -> dict:
         return record
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         pass
+
+    if not network:
+        return {}
 
     record = {}
     try:
@@ -2931,7 +2961,8 @@ def fetch_advisory(advisory_id: str, timeout: int = 20) -> dict:
     return record
 
 
-def campaign_of(advisory_id: str, lookup: bool = True) -> str | None:
+def campaign_of(advisory_id: str, lookup: bool = True,
+                network: bool = True) -> str | None:
     """Name the campaign an advisory belongs to, or None when it names none.
 
     The advisory's own summary and details are the source, because they carry
@@ -2940,8 +2971,11 @@ def campaign_of(advisory_id: str, lookup: bool = True) -> str | None:
     the summary itself, which still says what the package is."""
     text = ""
     if lookup:
-        record = fetch_advisory(advisory_id)
-        text = f"{record.get('summary', '')} {record.get('details', '')}".lower()
+        record = fetch_advisory(advisory_id, network=network)
+        # Stripped: two empty fields join into a single space, which is truthy,
+        # and left the built-in fallback below unreachable on every failed or
+        # cache-only lookup.
+        text = f"{record.get('summary', '')} {record.get('details', '')}".lower().strip()
     if not text:
         text = ADVISORY_NOTES.get(advisory_id, "").lower()
     for pattern, label in CAMPAIGN_PATTERNS:
@@ -3657,14 +3691,16 @@ def _finding_campaign(name: str, advisories: list[str], lookup: bool) -> str | N
     """The campaign a resolved finding belongs to, or None when none is known.
 
     A package the built-in table or overlay watches is the campaign's own by
-    construction. An OSV-only package is attributed the way the human report
-    attributes it, through the advisory text, so the JSON does not lose a
-    campaign the prose beside it names; lookup=False keeps the resolution to
-    the built-in notes, which is what --no-advisory-lookup promises."""
+    construction. An OSV-only package is attributed through the advisory text,
+    so the JSON does not lose a campaign the prose beside it names, but from
+    the caches and the built-in notes alone: rendering a report must not put a
+    request on the wire per finding. lookup=False narrows it further to the
+    notes, which is what --no-advisory-lookup promises."""
     if _is_shai_hulud_name(name):
         return "shai-hulud"
     return next(
-        (campaign for campaign in (campaign_of(a, lookup) for a in advisories)
+        (campaign for campaign in
+         (campaign_of(a, lookup, network=False) for a in advisories)
          if campaign), None,
     )
 
@@ -4363,9 +4399,11 @@ def _write_root_refusal(
     writing anything. The refusal is a finished, incomplete document naming
     each refused root in errors; the layer objects are built as for an empty
     tree, since nothing was asked of them, and the complete flag plus the
-    error codes carry the verdict."""
-    if not args.output:
-        return
+    error codes carry the verdict.
+
+    Without -o the same document goes to stdout under --json, since a caller
+    of the machine-readable mode would otherwise get exit 2 and nothing to
+    parse. Human mode keeps its stderr refusal and writes no stdout."""
     errors = [
         _error("root_unreadable", "invocation", f"root {root} {reason}",
                file=str(root))
@@ -4394,10 +4432,15 @@ def _write_root_refusal(
             invocation_id=invocation_id, started_utc=started_utc,
             finished_utc=_utc_now_iso(), complete=False,
         ))
+    elif not args.output:
+        return
     else:
         lines = [str(e["message"]) for e in errors]
         lines.append("refusing to report on a scan that could not cover every root given")
         text = "\n".join(lines) + "\n"
+    if not args.output:
+        sys.stdout.write(text)
+        return
     try:
         _write_atomic(Path(args.output), text)
     except OSError as exc:

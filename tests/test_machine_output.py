@@ -29,6 +29,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import lockfile_sentinel as ls  # noqa: E402  # pylint: disable=wrong-import-position
 
+def _must_not_open(*_args, **_kwargs):
+    """A network seam that fails the test rather than reaching the wire."""
+    raise AssertionError("machine mode opened a connection")
+
+
 INVOCATION_ID = "00000000-0000-0000-0000-000000000000"
 STARTED = "2026-08-15T00:00:00Z"
 FINISHED = "2026-08-15T00:00:05Z"
@@ -739,6 +744,48 @@ def test_refused_roots_invalidate_a_stale_report_on_disk(
     assert report["invocation"]["finished_utc"] is not None
     assert report["errors"][0]["code"] == "root_unreadable"
     assert str(missing) in report["errors"][0]["message"]
+
+
+def test_an_unrecognised_scanner_payload_is_a_failure_not_zero_findings() -> None:
+    """The scanner emits results on every run, empty when it found nothing, so
+    a payload without it is a shape this parser does not know. Reading it as
+    zero findings marked every lockfile in the batch resolved on the strength
+    of output nothing understood."""
+    assert ls._extract_malicious_findings({"unexpected": []}) is None
+    assert ls._extract_malicious_findings({"results": []}) == {}
+
+
+def test_the_json_report_resolves_campaigns_without_the_network(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Rendering a report must not put a request on the wire per finding, so
+    machine mode answers from the caches and the built-in notes alone."""
+    monkeypatch.setattr(ls, "_open_https", _must_not_open)
+    monkeypatch.setattr(ls, "_ADVISORY_CACHE", {})
+    monkeypatch.setattr(ls, "OVERLAY_PATH", tmp_path / "overlay.json")
+    status = ls.RepoStatus(name="app", path="/t/app")
+    status.osv_malicious = {"not-a-table-package": {"1.0.0"}}
+    status.osv_advisory_ids = {"not-a-table-package@1.0.0": {"MAL-2026-11524"}}
+    finding = ls.build_findings([status], lookup=True)[0]
+    assert "Shai-Hulud" in finding["campaign"]
+
+
+def test_a_refused_root_still_prints_a_report_to_stdout_under_json(
+    tmp_path: Path, capsys
+) -> None:
+    """A caller of the machine-readable mode without -o would otherwise get
+    exit 2 and nothing to parse."""
+    args = ls._build_parser().parse_args(
+        ["--json", "--no-osv", "--no-trivy", "--no-overlay", "--no-refresh"]
+    )
+    missing = tmp_path / "missing-root"
+    ls._write_root_refusal(
+        args, [missing], [(missing, "does not exist")],
+        _overlay_layer("not_requested"), INVOCATION_ID, STARTED,
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["invocation"]["complete"] is False
+    assert report["errors"][0]["code"] == "root_unreadable"
 
 
 def test_a_tree_with_no_lockfiles_completes_the_osv_layer_without_a_scanner() -> None:
