@@ -523,8 +523,12 @@ def test_the_scratch_directory_does_not_keep_the_permissions_it_inherited(
         # today — report_scratch_privacy reads the descriptor through
         # GetNamedSecurityInfoW and spawns nothing — but it did when this was
         # written, which is how the fragility was found.
+        # By basename, because production now resolves icacls against System32
+        # and hands run() an absolute path on any host that has one, while the
+        # bare-name fallback keeps this list from assuming either form.
         acl = [cmd for cmd in issued
-               if cmd[0] == "icacls" and cmd[1] == str(scratch) and "/inheritance:r" in cmd]
+               if Path(cmd[0]).name.lower() == "icacls.exe"
+               and cmd[1] == str(scratch) and "/inheritance:r" in cmd]
 
     assert acl, f"the scratch directory kept its inherited ACL: {issued}"
     granted = {acl[0][index + 1] for index, arg in enumerate(acl[0]) if arg == "/grant:r"}
@@ -806,6 +810,48 @@ def test_a_whoami_that_succeeds_and_says_nothing_does_not_raise(monkeypatch) -> 
     for output in ("", "   ", "\n", " \r\n \n"):
         monkeypatch.setattr(us, "run", lambda cmd, _o=output, **_kwargs: (0, _o))
         assert us.current_user_sid() is None, f"raised or accepted on {output!r}"
+
+
+def test_the_tool_resolver_ignores_a_decoy_that_is_first_on_path(
+        tmp_path, monkeypatch) -> None:
+    """A whoami.exe planted ahead of System32 on PATH must not be the answer.
+
+    This is the assertion that matters, because the obvious implementation —
+    `shutil.which`, which the schedule_tasks helper used — passes every other
+    test and fails this one: which searches PATH, so the decoy is exactly what
+    it returns. The updater is meant to run from a scheduled task as a more
+    privileged account than the one that can plant a file on a writable PATH
+    entry, which is what turns this from untidiness into code execution.
+
+    Built against a fabricated SystemRoot rather than the host's, so the test
+    pins the same behaviour on every platform and does not depend on the runner
+    having a real System32."""
+    system32 = tmp_path / "windows" / "System32"
+    system32.mkdir(parents=True)
+    (system32 / "whoami.exe").write_bytes(b"")
+    decoy = tmp_path / "planted"
+    decoy.mkdir()
+    (decoy / "whoami.exe").write_bytes(b"")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "windows"))
+    monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
+    assert us.resolve_system_tool("whoami.exe") == str(system32 / "whoami.exe")
+
+
+def test_the_tool_resolver_falls_back_to_the_bare_name_not_to_path(
+        tmp_path, monkeypatch) -> None:
+    """When System32 lacks the file, the answer is the bare name, decoy and all.
+
+    The fallback exists so a host with an unusual layout still runs and fails
+    with the tool's own message. What it must not do is consult PATH itself on
+    the way out: a resolver that falls back to searching is the hijack with an
+    extra step, so the decoy stays planted here to pin that it is not
+    consulted."""
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "windows"))
+    decoy = tmp_path / "planted"
+    decoy.mkdir()
+    (decoy / "whoami.exe").write_bytes(b"")
+    monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
+    assert us.resolve_system_tool("whoami.exe") == "whoami.exe"
 
 
 def test_an_unreadable_sid_warns_and_still_produces_a_usable_scratch(
@@ -1146,7 +1192,7 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
     def unreachable(*_args, **_kwargs):
         raise OSError("feed unreachable")
 
-    monkeypatch.setattr(us.urllib.request, "urlopen", unreachable)
+    monkeypatch.setattr(us, "open_https", unreachable)
 
     class Args:
         output = str(overlay)
@@ -1157,6 +1203,52 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
 
     assert us.target_malicious_packages(Args()) == 1
     assert json.loads(overlay.read_text(encoding="utf-8")) == original
+
+
+def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monkeypatch) -> None:
+    """urlopen reads file:// and http:// as happily as https://.
+
+    A file:// source is not a feed, and a cleartext fetch invites exactly the
+    substitution the overlay exists to catch, so both are refused before a
+    request is built. The stub raises to pin "before": a refusal that still
+    opened the URL would fail here rather than pass by accident."""
+    def must_not_open(*_args, **_kwargs):
+        raise AssertionError("the URL was opened despite the refusal")
+
+    monkeypatch.setattr(us, "open_https", must_not_open)
+
+    class Args:
+        output = str(tmp_path / "overlay.json")
+        source_url = ""
+        skip_scan = True
+        min_interval = 0
+        force = True
+
+    # The unmatched bracket is the case urlsplit itself raises on, so it pins
+    # that a mistyped URL earns the same one-line refusal as a wrong scheme
+    # rather than a traceback.
+    for url in ("file:///C:/Windows/win.ini", "http://example.invalid/iocs.csv",
+                "https://["):
+        Args.source_url = url
+        assert us.target_malicious_packages(Args()) == 1, f"accepted {url}"
+
+
+def test_a_feed_redirect_off_https_is_refused_mid_flight() -> None:
+    """A checked https URL can still hand the connection to cleartext a hop later.
+
+    urlopen follows redirects across schemes, so the scheme gate on the
+    operator's URL never sees the feed host answering 302 with an http
+    location. The handler is exercised directly because the interesting
+    behaviour is its verdict on the redirect target, not the network plumbing
+    around it: http is refused, https is passed through to the base class."""
+    handler = us.HttpsOnlyRedirects()
+    request = us.urllib.request.Request("https://example.invalid/iocs.csv")
+    with pytest.raises(us.urllib.error.URLError, match="refusing a redirect off https"):
+        handler.redirect_request(
+            request, None, 302, "Found", {}, "http://example.invalid/iocs.csv")
+    followed = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://mirror.invalid/iocs.csv")
+    assert followed is not None and followed.full_url == "https://mirror.invalid/iocs.csv"
 
 
 def test_cron_lines_quote_paths_and_omit_the_user_field_for_a_user_crontab() -> None:
