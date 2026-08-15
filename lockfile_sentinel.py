@@ -417,10 +417,9 @@ class RepoStatus:
     # version-or-spec) with kind "resolved" or "range". The findings array names
     # its evidence, and without this the best a finding could claim is "one of
     # the files this repository holds". OSV attribution is exact, since the
-    # scanner reports per source path; offline attribution is the file whose
-    # scan first recorded the pair, so a second lockfile repeating an
-    # already-recorded poison is not re-attributed, which understates the
-    # evidence list without ever misstating it.
+    # scanner reports per source path; offline attribution is exact too, since
+    # each file is matched into a probe of its own before merging, so every
+    # file carrying a coordinate is listed however many carried it first.
     evidence: dict[tuple[str, str, str], set[str]] = field(default_factory=dict)
     # The lockfiles that actually produced a finding, as opposed to every
     # lockfile in the repository. The Trivy re-check submits only these.
@@ -618,16 +617,18 @@ def scan_package_json(path: Path, status: RepoStatus) -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    ranges_before = {
-        (name, spec)
-        for name, specs in status.poisoned_ranges.items()
-        for spec in specs
-    }
-    _scan_dependency_fields(data, status)
-    for name, specs in status.poisoned_ranges.items():
+    # Scanned into a probe of this manifest alone, then merged, so a poisoned
+    # range already declared by an earlier manifest is still attributed here
+    # rather than credited only to the first file that carried it.
+    probe = RepoStatus(name=status.name, path=status.path)
+    _scan_dependency_fields(data, probe)
+    for attribute in ("range_only", "poisoned_ranges"):
+        target = getattr(status, attribute)
+        for name, specs in getattr(probe, attribute).items():
+            target.setdefault(name, set()).update(specs)
+    for name, specs in probe.poisoned_ranges.items():
         for spec in specs:
-            if (name, spec) not in ranges_before:
-                status.evidence.setdefault(("range", name, spec), set()).add(str(path))
+            status.evidence.setdefault(("range", name, spec), set()).add(str(path))
     return True
 
 
@@ -839,18 +840,25 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
         # recorded as a resolved pin the effective tree does not contain. A
         # comment installs nothing, so stripping it loses no real pin.
         text = _strip_jsonc_comments(text)
-    before = _poison_count(status)
-    pairs_before = {
-        (name, version)
-        for name, versions in status.poisoned_versions.items()
-        for version in versions
-    }
+    # Matched into a probe of this file alone, then merged, so a poisoned pair
+    # already known from an earlier lockfile is still attributed to this one:
+    # diffing against the repository-wide state credited only the first file
+    # that carried each coordinate, and the findings' evidence lists silently
+    # omitted every duplicate occurrence.
+    probe = RepoStatus(name=status.name, path=status.path)
     if path.name.lower().endswith(JSON_SUFFIX):
-        scan_npm_lockfile_json(text, status)
-    _match_text_patterns(text, status)
-    if _poison_count(status) > before:
+        scan_npm_lockfile_json(text, probe)
+    _match_text_patterns(text, probe)
+    for attribute in ("present_versions", "poisoned_versions"):
+        target = getattr(status, attribute)
+        for name, versions in getattr(probe, attribute).items():
+            target.setdefault(name, set()).update(versions)
+    if probe.poisoned_versions:
         status.flagged_lockfiles.add(str(path))
-        _attribute_new_pairs(status, pairs_before, str(path))
+        for name, versions in probe.poisoned_versions.items():
+            for version in versions:
+                status.evidence.setdefault(
+                    ("resolved", name, version), set()).add(str(path))
     return True
 
 
@@ -865,16 +873,6 @@ def _match_text_patterns(text: str, status: RepoStatus) -> None:
         for pattern in (tarball_re, token_re):
             for name, version in pattern.findall(text):
                 record_resolved_version(status, name, version, [poisoned_version])
-
-
-def _attribute_new_pairs(
-    status: RepoStatus, pairs_before: set[tuple[str, str]], path: str
-) -> None:
-    """Charge every poisoned pair this file's scan added to this file."""
-    for name, versions in status.poisoned_versions.items():
-        for version in versions:
-            if (name, version) not in pairs_before:
-                status.evidence.setdefault(("resolved", name, version), set()).add(path)
 
 
 def scan_payload_filename(path: Path, status: RepoStatus) -> None:
@@ -1760,9 +1758,7 @@ def _freshness(unknown: bool, stale: bool) -> str:
 def _status_engine(osv_bin: str | None) -> dict[str, Any]:
     """The osv-scanner binary's freshness facts: version, build, last check."""
     engine_state = _read_json(cache_dir() / "logs" / "update-osv-scanner.state.json")
-    checked_unix = engine_state.get("lastCheckUnix")
-    if not isinstance(checked_unix, (int, float)):
-        checked_unix = None
+    checked_unix = _as_unix_time(engine_state.get("lastCheckUnix"))
     engine_stale = checked_unix is not None and time.time() - checked_unix > 24 * 3600
     return {
         "path": osv_bin,
@@ -1797,13 +1793,24 @@ def _overlay_refresh_unix(overlay_file: Path) -> float | None:
     unknown, and a permanent exit 1, on any host where the scanner does its
     own refreshing."""
     refresh = _read_json(cache_dir() / "logs" / "update-malicious-packages.state.json")
-    last_refresh = refresh.get("lastRefreshUnix")
-    if isinstance(last_refresh, (int, float)):
+    last_refresh = _as_unix_time(refresh.get("lastRefreshUnix"))
+    if last_refresh is not None:
         return last_refresh
     try:
         return overlay_file.stat().st_mtime
     except OSError:
         return None
+
+
+def _as_unix_time(value: Any) -> float | None:
+    """A numeric unix time, or None for anything else, booleans included.
+
+    bool is a subclass of int, so a state file corrupted to `true` would
+    otherwise read as timestamp 1, compute a confidently wrong freshness and
+    emit a boolean where the published schema promises a number or null."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _status_overlay(overlay_file: Path) -> dict[str, Any]:

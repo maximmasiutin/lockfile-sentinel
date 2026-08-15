@@ -753,6 +753,39 @@ def test_the_status_schema_matches_what_gather_status_writes(
     assert doc["overall"]["state"] in schema["properties"]["overall"]["properties"]["state"]["enum"]
 
 
+def test_every_lockfile_carrying_a_poison_is_attributed(tmp_path: Path) -> None:
+    """The same poisoned pair in two lockfiles of one repository names both
+    as evidence: attribution is per file, not first-file-wins, so with OSV
+    absent the finding still lists every occurrence."""
+    status = ls.RepoStatus(name="t", path=str(tmp_path))
+    for name in ("a", "b"):
+        lockfile = tmp_path / name / "yarn.lock"
+        lockfile.parent.mkdir()
+        lockfile.write_text('keyv@6.0.0:\n  version "6.0.0"\n', encoding="utf-8")
+        ls.scan_lockfile(lockfile, status)
+    evidence = status.evidence[("resolved", "keyv", "6.0.0")]
+    assert evidence == {str(tmp_path / "a" / "yarn.lock"),
+                        str(tmp_path / "b" / "yarn.lock")}
+    finding = ls.build_findings([status])[0]
+    assert finding["source_files"] == ["a/yarn.lock", "b/yarn.lock"]
+
+
+def test_a_boolean_timestamp_in_a_state_file_reads_as_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """bool is a subclass of int, so a state file corrupted to true would
+    otherwise compute freshness from timestamp 1 and emit a boolean where the
+    schema promises a number or null."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    state = tmp_path / "logs" / "update-osv-scanner.state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({"lastCheckUnix": True}), encoding="utf-8")
+    doc = ls.gather_status(tmp_path / "missing.json", osv_bin=None)
+    engine = doc["sources"]["osv_scanner"]
+    assert engine["version_checked_unix"] is None
+    assert engine["state"] == "unknown"
+
+
 def test_status_honours_the_output_option(tmp_path: Path, monkeypatch) -> None:
     """A status pipeline that asked for a file and got stdout has silently
     lost its document, so -o writes the status there, atomically, in either

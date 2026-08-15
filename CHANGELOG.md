@@ -10,7 +10,7 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 - Breaking change to scan exit codes: 0 and 1 now assert complete requested coverage as well as the finding count, and anything short of that returns 2 even when findings exist, which are still present in the report. A requested-but-missing osv-scanner, a rejected or unsubmitted lockfile, an unreadable applicable input, a stale overlay after a failed refresh, and a report that could not be written all return 2. Layers declined with `--no-osv`, `--no-overlay` or `--no-trivy` are recorded policy choices, not failures.
 - With `--output`, in-progress snapshots now go to `<output>.partial` and the requested path is written once, atomically, on completion, so a consumer of the final path can never read a mid-run report; the partial is removed on success and left behind by a killed run as parseable incomplete evidence. All report and summary writes are atomic (temp file, fsync, rename). An empty lockfile now counts as resolved rather than as a permanent coverage gap, matching the verdict osv-scanner itself gives one.
-- Overlay refreshes are serialised through a lock file beside the overlay, and the overlay is written atomically, so concurrent runs cannot interleave writes; a lock older than fifteen minutes is presumed abandoned and broken.
+- Overlay refreshes are serialised through the operating system's advisory lock on a file beside the overlay (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere), and the overlay is written atomically, so concurrent runs cannot interleave writes; the kernel admits exactly one holder and releases the lock when its holder exits, so no staleness heuristic exists to race.
 
 ### Added
 
