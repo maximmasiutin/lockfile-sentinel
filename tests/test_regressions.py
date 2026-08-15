@@ -318,14 +318,14 @@ def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text("{}", encoding="utf-8")
 
-    def timed_out(*_args, **kwargs):
+    # The stub stands in for a function whose None answer is the case under
+    # test, so the return is the point rather than an accident of falling
+    # off the end.
+    def timed_out(*_args, **kwargs):  # pylint: disable=useless-return
         failure = kwargs.get("failure")
         if failure is not None:
             failure["cause"] = "unavailable"
-        # The stub stands in for a function whose None answer is the case under
-        # test, so the return is the point rather than an accident of falling
-        # off the end.
-        return None  # pylint: disable=useless-return
+        return None
 
     monkeypatch.setattr(ls, "_run_osv_batch", timed_out)
     code = ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
@@ -1501,6 +1501,40 @@ def test_a_failed_final_swap_puts_the_previous_cache_back(tmp_path, monkeypatch)
         us.promote_into(staged, live)
 
     assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_an_interrupted_promotion_is_restored_before_anything_is_deleted(tmp_path, monkeypatch) -> None:
+    """A run killed between the two renames must not cost the next run the cache.
+
+    That death leaves the only good cache at .previous and nothing at live.
+    The next promotion used to clear .previous as a leftover, so a second
+    failure of the swap ended with no cache at all. The restore happens before
+    any cleanup, so even a swap that fails again leaves the old databases
+    where Trivy reads."""
+    live = tmp_path / "trivy-cache"
+    previous = live.with_name(live.name + ".previous")
+    (previous / "db").mkdir(parents=True)
+    (previous / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    real_replace = os.replace
+    incoming = live.with_name(live.name + ".incoming")
+
+    def refuse_the_swap_into_place(src, dst, **kwargs):
+        if Path(src) == incoming:
+            raise OSError(13, "Permission denied")
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_swap_into_place)
+
+    with pytest.raises(OSError):
+        us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not previous.exists(), "the only good cache was left renamed aside"
 
 
 def test_the_space_requirement_follows_what_is_staged(tmp_path, monkeypatch) -> None:
