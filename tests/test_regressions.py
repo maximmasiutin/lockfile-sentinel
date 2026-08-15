@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1535,6 +1536,98 @@ def test_an_interrupted_promotion_is_restored_before_anything_is_deleted(tmp_pat
 
     assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
     assert not previous.exists(), "the only good cache was left renamed aside"
+
+
+def test_a_staged_tree_swapped_after_the_gate_is_not_promoted(tmp_path) -> None:
+    """The tree promoted has to be the tree the scanner passed.
+
+    A base that grants another account DELETE_CHILD lets it rename the scanned
+    directory aside and leave its own at the same name; promotion by pathname
+    then installs a tree nothing scanned."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    staged.rename(tmp_path / "moved-aside")
+    hostile = tmp_path / "temp-abc123"
+    (hostile / "db").mkdir(parents=True)
+    (hostile / "db" / "trivy.db").write_text("hostile", encoding="utf-8")
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_staged_tree_that_cannot_be_stated_is_not_promoted(tmp_path) -> None:
+    """An identity that cannot be read is not an identity that matches.
+
+    Treating the failure as a pass would restore the pathname trust the check
+    exists to remove, in the case where something is already wrong."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    identity = us.dir_identity(staged)
+    shutil.rmtree(staged)
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+
+def test_an_unswapped_tree_still_promotes(tmp_path) -> None:
+    """The check must not refuse the ordinary case it guards."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live, staged_identity=us.dir_identity(staged))
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+
+
+def test_a_rename_error_that_is_not_cross_device_is_not_retried_as_a_copy(
+        tmp_path, monkeypatch) -> None:
+    """Only a not-same-device rename earns the copy path.
+
+    Falling back on any OSError turned a permission or missing-path failure
+    into a copytree that half-writes the incoming tree and reports its own
+    error in place of the real cause."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+
+    real_replace = os.replace
+
+    def refuse_with_a_permission_error(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(13, "Permission denied")
+        return real_replace(src, dst, **kwargs)
+
+    def must_not_run(_src, _dst):
+        raise AssertionError("a permission error was retried as a copy")
+
+    monkeypatch.setattr(us.os, "replace", refuse_with_a_permission_error)
+    monkeypatch.setattr(us.shutil, "copytree", must_not_run)
+
+    with pytest.raises(OSError) as caught:
+        us.promote_into(staged, live)
+
+    assert caught.value.errno == 13
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
 
 
 def test_the_space_requirement_follows_what_is_staged(tmp_path, monkeypatch) -> None:
