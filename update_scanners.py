@@ -42,7 +42,7 @@ Usage:
     python update_scanners.py all
 """
 
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel
@@ -84,7 +84,7 @@ from pathlib import Path
 # Carried per file rather than imported, because each of these three runs on its
 # own and an imported version would tie a standalone copy back to a checkout it
 # may not have. tests/test_headers.py is what keeps the three from drifting.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 IS_WINDOWS = os.name == "nt"
 
@@ -303,8 +303,12 @@ def resolve_system_tool(name: str) -> str:
     The bare name is kept as the fallback when the file is not there, so a host
     with an unusual layout still runs and fails with the tool's own message
     rather than a fabricated one. `name` therefore needs its extension, since
-    the file test sees no PATHEXT."""
-    root = os.environ.get("SystemRoot", r"C:\Windows")
+    the file test sees no PATHEXT. With SystemRoot unset, the usual Unix case,
+    the bare name is returned at once: a hardcoded default would be a relative
+    path there, reopening the current-directory vector."""
+    root = os.environ.get("SystemRoot")
+    if not root:
+        return name
     candidate = Path(root) / "System32" / name
     return str(candidate) if candidate.is_file() else name
 
@@ -330,6 +334,20 @@ def clamd_max_file_size() -> int | None:
     CLAMD_CONF names the file directly. Otherwise the Unix locations are tried,
     and on Windows the configuration sits beside the daemon binary, so the one
     found on PATH points at it."""
+    for candidate in _clamd_conf_candidates():
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "MaxFileSize":
+                return _parse_clamd_size(parts[1])
+    return None
+
+
+def _clamd_conf_candidates() -> list[Path]:
+    """Every place a clamd.conf may sit, most authoritative first."""
     candidates: list[Path] = []
     explicit = os.environ.get("CLAMD_CONF")
     if explicit:
@@ -339,22 +357,56 @@ def clamd_max_file_size() -> int | None:
         candidates.append(Path(daemon).resolve().parent / "clamd.conf")
     candidates += [Path("/etc/clamav/clamd.conf"), Path("/usr/local/etc/clamd.conf"),
                    Path("/opt/homebrew/etc/clamav/clamd.conf")]
-    for candidate in candidates:
-        try:
-            text = candidate.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[0] == "MaxFileSize":
-                raw = parts[1].upper()
-                multiplier = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}.get(raw[-1:], 1)
-                digits = raw[:-1] if multiplier > 1 else raw
-                try:
-                    return int(digits) * multiplier
-                except ValueError:
-                    return None
-    return None
+    return candidates
+
+
+def _parse_clamd_size(value: str) -> int | None:
+    """A clamd.conf size value in bytes, or None where it does not parse."""
+    raw = value.upper()
+    multiplier = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}.get(raw[-1:], 1)
+    digits = raw[:-1] if multiplier > 1 else raw
+    try:
+        return int(digits) * multiplier
+    except ValueError:
+        return None
+
+
+def _refuse_oversized(files: list[Path], what: str) -> bool:
+    """True when a file exceeds the 2 GiB libclamav ceiling.
+
+    A file above the ceiling is refused rather than warned about. Neither
+    scanner reads it, and both still exit 0, so warning and continuing meant
+    returning a clean verdict for bytes nothing had looked at. That is the one
+    outcome a gate must never produce, and gate's docstring claimed it was
+    already refused when it was not."""
+    oversized = [p for p in files if p.stat().st_size > CLAMSCAN_FILE_CEILING]
+    if not oversized:
+        return False
+    for path in oversized:
+        log(f"FAIL: {path} is {path.stat().st_size / 1024 / 1024:.0f} MB, above the 2 GiB "
+            "libclamav ceiling, so no scanner here can read it")
+    log(f"refusing to trust {what}: {len(oversized)} file(s) could not be scanned at all")
+    return True
+
+
+def _scan_command(target: Path, largest: int, what: str) -> tuple[list[str], str] | None:
+    """The scanner invocation the sizes allow, or None where nothing can read them."""
+    cap = clamd_max_file_size()
+    clamdscan = resolve_clam("clamdscan")
+    use_daemon = bool(clamdscan) and cap is not None and largest <= cap
+    if clamdscan and not use_daemon:
+        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB against "
+            f"a clamd MaxFileSize of "
+            f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}")
+    if use_daemon:
+        return ([str(clamdscan), "--multiscan", "--infected", "--no-summary", str(target)],
+                "clamdscan")
+    clamscan = resolve_clam("clamscan")
+    if not clamscan:
+        log(f"FAIL: no ClamAV scanner able to read files this size; refusing to trust {what}")
+        return None
+    return [clamscan, "--recursive", "--infected", "--no-summary",
+            "--max-filesize=0", "--max-scansize=0", str(target)], "clamscan"
 
 
 def gate(target: Path, what: str, skip: bool) -> bool:
@@ -381,38 +433,13 @@ def gate(target: Path, what: str, skip: bool) -> bool:
     files = [p for p in target.rglob("*") if p.is_file()] if target.is_dir() else [target]
     largest = max((p.stat().st_size for p in files), default=0)
 
-    # A file above the ceiling is refused rather than warned about. Neither
-    # scanner reads it, and both still exit 0, so warning and continuing meant
-    # returning a clean verdict for bytes nothing had looked at. That is the one
-    # outcome a gate must never produce, and the docstring above claimed it was
-    # already refused when it was not.
-    oversized = [p for p in files if p.stat().st_size > CLAMSCAN_FILE_CEILING]
-    if oversized:
-        for path in oversized:
-            log(f"FAIL: {path} is {path.stat().st_size / 1024 / 1024:.0f} MB, above the 2 GiB "
-                "libclamav ceiling, so no scanner here can read it")
-        log(f"refusing to trust {what}: {len(oversized)} file(s) could not be scanned at all")
+    if _refuse_oversized(files, what):
         return False
 
-    cap = clamd_max_file_size()
-    clamdscan = resolve_clam("clamdscan")
-    use_daemon = bool(clamdscan) and cap is not None and largest <= cap
-    if clamdscan and not use_daemon:
-        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB against "
-            f"a clamd MaxFileSize of "
-            f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}")
-
-    if use_daemon:
-        cmd = [str(clamdscan), "--multiscan", "--infected", "--no-summary", str(target)]
-        label = "clamdscan"
-    else:
-        clamscan = resolve_clam("clamscan")
-        if not clamscan:
-            log(f"FAIL: no ClamAV scanner able to read files this size; refusing to trust {what}")
-            return False
-        cmd = [clamscan, "--recursive", "--infected", "--no-summary",
-               "--max-filesize=0", "--max-scansize=0", str(target)]
-        label = "clamscan"
+    chosen = _scan_command(target, largest, what)
+    if chosen is None:
+        return False
+    cmd, label = chosen
 
     started = time.monotonic()
     code, output = run(cmd)
@@ -550,18 +577,8 @@ def latest_osv_version(timeout: int = 30) -> str | None:
     return None
 
 
-def build_from_source(args, go: str, exe: Path | None, installed: str | None,
-                      latest: str) -> int:
-    """Clone or update a git working tree, check out the target ref, and build."""
-    git = resolve_git()
-    if not git:
-        log("FAIL: git not found; cannot use --from-source")
-        return 2
-
-    source_dir = Path(args.source_dir)
-    target_ref = args.ref or f"v{latest}"
-    log(f"source mode: {source_dir} at {target_ref} (git: {git})")
-
+def _sync_source_tree(git: str, source_dir: Path) -> int:
+    """Clone the repository, or fetch into the working tree already there."""
     if not (source_dir / ".git").exists():
         if source_dir.exists() and any(source_dir.iterdir()):
             log(f"FAIL: {source_dir} exists, is not a git working tree, and is not empty")
@@ -581,6 +598,47 @@ def build_from_source(args, go: str, exe: Path | None, installed: str | None,
         if code != 0:
             log(f"FAIL: git fetch exited {code}")
             return 1
+    return 0
+
+
+def _checkout_target(git: str, source_dir: Path, target_ref: str) -> bool | None:
+    """Check out the ref, saying whether it was a branch; None means failure.
+
+    A tag is checked out detached; a branch is fast-forwarded. Nothing merges
+    or rebases, so the tree cannot end up conflicted."""
+    code, _ = run([git, "-C", str(source_dir), "-c", "advice.detachedHead=false",
+                   "checkout", "--quiet", "--detach", f"refs/tags/{target_ref}"])
+    if code == 0:
+        return False
+    code, out = run([git, "-C", str(source_dir), "checkout", "--quiet", target_ref])
+    echo(out, "git")
+    if code != 0:
+        log(f"FAIL: '{target_ref}' is neither a tag nor a branch in {source_dir}")
+        return None
+    code, out = run([git, "-C", str(source_dir), "merge", "--ff-only", "--quiet",
+                     f"origin/{target_ref}"])
+    echo(out, "git")
+    if code != 0:
+        log(f"FAIL: could not fast-forward {target_ref}")
+        return None
+    return True
+
+
+def build_from_source(args, go: str, exe: Path | None, installed: str | None,
+                      latest: str) -> int:
+    """Clone or update a git working tree, check out the target ref, and build."""
+    git = resolve_git()
+    if not git:
+        log("FAIL: git not found; cannot use --from-source")
+        return 2
+
+    source_dir = Path(args.source_dir)
+    target_ref = args.ref or f"v{latest}"
+    log(f"source mode: {source_dir} at {target_ref} (git: {git})")
+
+    code = _sync_source_tree(git, source_dir)
+    if code != 0:
+        return code
 
     # A checkout over uncommitted work discards it. Refuse rather than decide
     # on the user's behalf that their edits were disposable.
@@ -591,24 +649,9 @@ def build_from_source(args, go: str, exe: Path | None, installed: str | None,
             f"{target_ref}. Commit, stash, or pass --force.")
         return 1
 
-    # A tag is checked out detached; a branch is fast-forwarded. Nothing merges
-    # or rebases, so the tree cannot end up conflicted.
-    on_branch = False
-    code, _ = run([git, "-C", str(source_dir), "-c", "advice.detachedHead=false",
-                   "checkout", "--quiet", "--detach", f"refs/tags/{target_ref}"])
-    if code != 0:
-        code, out = run([git, "-C", str(source_dir), "checkout", "--quiet", target_ref])
-        echo(out, "git")
-        if code != 0:
-            log(f"FAIL: '{target_ref}' is neither a tag nor a branch in {source_dir}")
-            return 1
-        on_branch = True
-        code, out = run([git, "-C", str(source_dir), "merge", "--ff-only", "--quiet",
-                         f"origin/{target_ref}"])
-        echo(out, "git")
-        if code != 0:
-            log(f"FAIL: could not fast-forward {target_ref}")
-            return 1
+    on_branch = _checkout_target(git, source_dir, target_ref)
+    if on_branch is None:
+        return 1
 
     _, head_out = run([git, "-C", str(source_dir), "rev-parse", "HEAD"])
     head = head_out.strip().splitlines()[0].strip() if head_out.strip() else ""
@@ -633,9 +676,15 @@ def build_from_source(args, go: str, exe: Path | None, installed: str | None,
         log("FAIL: could not resolve the Go bin directory to build into")
         return 2
 
+    return _compile_and_swap(args, go, exe, source_dir, expected, head, commit_date,
+                             installed, short)
+
+
+def _compile_and_swap(args, go: str, exe: Path, source_dir: Path, expected: str,
+                      head: str, commit_date: str, installed: str | None, short: str) -> int:
+    """Build beside the live binary and swap only after the gate and the version
+    check pass; writing straight to the target fails while the old one runs."""
     exe.parent.mkdir(parents=True, exist_ok=True)
-    # Build beside the live binary and swap only after the gate and the version
-    # check pass; writing straight to the target fails while the old one runs.
     tmp_exe = exe.with_suffix(exe.suffix + ".new")
     tmp_exe.unlink(missing_ok=True)
     ldflags = (f"-s -w -X {VERSION_VAR}={expected} -X {COMMIT_VAR}={head} "
@@ -706,6 +755,11 @@ def target_osv_scanner(args) -> int:
         log(f"osv-scanner is already current at {installed}")
         return 0
 
+    return _go_install_latest(args, go, latest, installed)
+
+
+def _go_install_latest(args, go: str, latest: str, installed: str | None) -> int:
+    """Build the released module with go install, gate it, and swap it in."""
     target = f"{MODULE_PATH}@v{latest}"
     log(f"building {target} with go install ...")
 
@@ -1179,6 +1233,15 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
     live.parent.mkdir(parents=True, exist_ok=True)
     previous = live.with_name(live.name + ".previous")
     incoming = live.with_name(live.name + ".incoming")
+    # A promotion killed between its two renames leaves the only good cache
+    # at .previous and nothing at live. Restore it before any cleanup below,
+    # because the .previous clearing a few lines down would otherwise delete
+    # the only copy while live is absent, and a second failure of the swap
+    # would then leave no cache at all.
+    if not live.exists() and previous.exists():
+        log(f"an interrupted promotion left the cache renamed aside at {previous}; "
+            "restoring it before promoting")
+        os.replace(previous, live)
     # A leftover .incoming is a promotion that died between the copy and the
     # swap on an earlier run; it was never trusted, so it is cleared rather
     # than adopted.
@@ -1205,6 +1268,17 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
         if previous.exists() and not live.exists():
             os.replace(previous, live)
         raise
+    _carry_kept_forward(previous, live, keep)
+    shutil.rmtree(previous, ignore_errors=True)
+
+
+def _carry_kept_forward(previous: Path, live: Path, keep: tuple[str, ...]) -> None:
+    """Rename each kept database out of the outgoing cache into the new one.
+
+    Same volume by construction, so this moves no data. A failure is logged
+    rather than raised, because the promotion has already succeeded and the
+    carried database is re-downloadable; a name the staged tree already holds
+    is left alone, since the download is fresher than the carry."""
     for name in keep:
         held = previous / name
         if not held.is_dir() or (live / name).exists():
@@ -1214,7 +1288,6 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
         except OSError as exc:
             log(f"WARNING: could not carry {name} forward from the previous cache "
                 f"({exc}); it will be downloaded again on the next run that needs it")
-    shutil.rmtree(previous, ignore_errors=True)
 
 
 def current_user_sid() -> str | None:
@@ -1703,6 +1776,26 @@ def report_scratch_privacy(path: Path, sid: str | None) -> None:
             "so an entry granted there later reaches the staged database.")
 
 
+def _ensure_cache_parent(real_near: Path | None) -> None:
+    """Create the cache parent so it can serve as a scratch base.
+
+    It is a candidate below and promotion creates it without hesitating a few
+    dozen lines later, so refusing to stage in a directory the run is about to
+    create anyway was an inconsistency: on a first run against a host with no
+    cache yet, it sent the download to the small system temporary volume, the
+    one case the whole mechanism exists for. A configured
+    LOCKFILE_SENTINEL_SCRATCH that does not exist is still passed over rather
+    than created, since a path someone typed wrong is a mistake worth
+    reporting."""
+    if real_near is None:
+        return
+    try:
+        real_near.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"could not create the cache parent {real_near.parent} ({exc}); "
+            "it stays out of the running as a scratch base")
+
+
 class ScratchUnavailableError(RuntimeError):
     """No scratch base can hold the download, stated before a byte is spent.
 
@@ -1711,13 +1804,19 @@ class ScratchUnavailableError(RuntimeError):
     malfunction, which deserves a traceback."""
 
 
-def _pick_scratch_base(candidates: list[tuple[str, str]], near: Path | None,
+def _pick_scratch_base(real_near: Path | None, near: Path | None,
                        need: int, passed_over: list[str]) -> Path | None:
-    """The first candidate that is a directory, outside the cache, with room.
+    """The first configured base that is present, outside the cache, and roomy.
 
+    `need` is what this refresh will actually stage, stated by the caller, so
+    a run that downloads less is not rejected for room it does not need.
     Every rejection is logged where it happens and summarised into
     `passed_over`, so a later refusal can name each base and why it lost
     without re-measuring anything."""
+    candidates = [
+        (SCRATCH_BASE, "LOCKFILE_SENTINEL_SCRATCH"),
+        (str(real_near.parent) if real_near else "", "the cache volume"),
+    ]
     for value, origin in candidates:
         if not value:
             continue
@@ -1750,7 +1849,7 @@ def _pick_scratch_base(candidates: list[tuple[str, str]], near: Path | None,
     return None
 
 
-def _fallback_scratch_base(near: Path | None, real_near: Path | None,
+def _fallback_scratch_base(real_near: Path | None, near: Path | None,
                            need: int, passed_over: list[str]) -> Path:
     """The last resort when every candidate lost, or the refusal to have one.
 
@@ -1797,8 +1896,8 @@ def _fallback_scratch_base(near: Path | None, real_near: Path | None,
         raise ScratchUnavailableError(
             f"no volume has the {need / 1024 ** 3:.1f} GB this refresh needs: "
             f"candidates passed over: {considered}; the system temporary "
-            f"directory {system} has {describe_free(system_free)}. Free space "
-            "or set LOCKFILE_SENTINEL_SCRATCH to a volume with room."
+            f"directory {system} has {describe_free(system_free)}. Free some "
+            "space, or set LOCKFILE_SENTINEL_SCRATCH to a volume with room."
         )
     log(f"falling back to the system temporary directory {system} "
         f"({describe_free(system_free)}), which is the volume the Java index "
@@ -1892,28 +1991,11 @@ def scratch_dir(label: str, near: Path | None = None,
         except (OSError, RuntimeError) as exc:
             log(f"could not resolve the cache {near} ({exc}); "
                 "using the path as spelled to choose a scratch base")
-    if real_near is not None:
-        # The cache parent is a candidate below and promotion creates it
-        # without hesitating a few dozen lines later, so refusing to stage in
-        # a directory this run is about to create anyway was an inconsistency:
-        # on a first run against a host with no cache yet, it sent the
-        # download to the small system temporary volume, the one case the
-        # whole mechanism exists for. A configured LOCKFILE_SENTINEL_SCRATCH
-        # that does not exist is still passed over rather than created, since
-        # a path someone typed wrong is a mistake worth reporting.
-        try:
-            real_near.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            log(f"could not create the cache parent {real_near.parent} ({exc}); "
-                "it stays out of the running as a scratch base")
-    candidates = [
-        (SCRATCH_BASE, "LOCKFILE_SENTINEL_SCRATCH"),
-        (str(real_near.parent) if real_near else "", "the cache volume"),
-    ]
+    _ensure_cache_parent(real_near)
     passed_over: list[str] = []
-    base = _pick_scratch_base(candidates, near, need, passed_over)
+    base = _pick_scratch_base(real_near, near, need, passed_over)
     if base is None:
-        base = _fallback_scratch_base(near, real_near, need, passed_over)
+        base = _fallback_scratch_base(real_near, near, need, passed_over)
     # Before the directory exists, so that the interval between creating it and
     # restricting it holds one icacls call and not a whoami spawn as well. On a
     # 3.12.4 or newer interpreter with ACL support this interval does not matter,
@@ -1928,9 +2010,13 @@ def scratch_dir(label: str, near: Path | None = None,
     # open, and one of these may belong to a run happening right now.
     leftovers = sorted(entry.name for entry in base.glob("temp-*") if entry.is_dir())
     if leftovers:
+        # A handful of names identifies the leak; hundreds of them, the very
+        # accumulation this NOTE exists to surface, would bloat the log line.
+        shown = ", ".join(leftovers[:5])
+        more = f" and {len(leftovers) - 5} more" if len(leftovers) > 5 else ""
         log(f"NOTE: {base} already holds {len(leftovers)} temp-* "
             f"director{'y' if len(leftovers) == 1 else 'ies'} "
-            f"({', '.join(leftovers)}); each is either a concurrent run's scratch "
+            f"({shown}{more}); each is either a concurrent run's scratch "
             "or a leak from a cleanup that failed, and nothing removes the latter")
     sid = current_user_sid() if IS_WINDOWS else None
     path = base / f"temp-{secrets.token_hex(8)}"
@@ -2075,16 +2161,16 @@ def _trivy_binary_changed(trivy: str) -> str | None:
 
     None means no refresh is owed on this ground: the versions match, or the
     binary will not say its version, in which case a mismatch cannot be
-    claimed. A cache written before this record existed answers with the
-    unrecorded wording, which forces exactly one refresh to establish the
-    baseline."""
+    claimed. A cache written before this record existed reports the mismatch
+    until a full refresh records the baseline; --skip-java-db runs do not
+    record it, so they keep reporting it."""
     installed = trivy_binary_version(trivy)
     if not installed:
         return None
     recorded = str(read_state(TRIVY_STATE).get("trivyVersion") or "")
     if installed == recorded:
         return None
-    was = f"trivy {recorded}" if recorded else "a trivy version nothing recorded"
+    was = f"trivy {recorded}" if recorded else "a trivy version that was never recorded"
     return (f"the installed trivy is {installed} but the cached databases were "
             f"written under {was}; treating them as due, since a newer binary "
             "can expect a schema the cache does not carry")
@@ -2215,15 +2301,8 @@ def target_trivy_db(args) -> int:
 # Target: status.
 # --------------------------------------------------------------------------
 
-def target_status(_args) -> int:
-    """Report the freshness of everything this program maintains.
-
-    Exit 0 when all fresh, 1 when something is stale, 2 when something could not
-    be determined, following the house rule that a check which could not run
-    must not report health."""
-    stale = False
-    unknown = False
-
+def _status_osv() -> tuple[bool, bool]:
+    """The osv-scanner build's freshness, as (stale, unknown)."""
     go = resolve_go()
     exe = go_bin(go) if go else None
     installed = osv_version(exe)
@@ -2232,29 +2311,32 @@ def target_status(_args) -> int:
     if state.get("lastCommit"):
         log(f"  built from commit {str(state['lastCommit'])[:12]}")
     last_check = state.get("lastCheckUnix")
-    if isinstance(last_check, (int, float)):
-        age = (time.time() - last_check) / 3600.0
-        log(f"  version last checked {age:.1f} h ago")
-        stale = stale or age > 24
-    else:
+    if not isinstance(last_check, (int, float)):
         log("  version last checked: unknown")
-        unknown = True
+        return False, True
+    age = (time.time() - last_check) / 3600.0
+    log(f"  version last checked {age:.1f} h ago")
+    return age > 24, False
 
+
+def _status_overlay() -> tuple[bool, bool]:
+    """The campaign overlay's freshness, as (stale, unknown)."""
     overlay = overlay_path()
     data = read_state(overlay)
-    if data:
-        log(f"overlay: {data.get('package_count', '?')} packages, "
-            f"{data.get('version_count', '?')} versions at {overlay}")
-        generated = parse_stamp(str(data.get("generated_utc") or "").replace("Z", "+00:00"))
-        log(f"  generated {describe_age(generated)}")
-        if generated is not None:
-            stale = stale or (datetime.now(timezone.utc) - generated).total_seconds() > 24 * 3600
-        else:
-            unknown = True
-    else:
+    if not data:
         log(f"overlay: absent or unreadable at {overlay}")
-        unknown = True
+        return False, True
+    log(f"overlay: {data.get('package_count', '?')} packages, "
+        f"{data.get('version_count', '?')} versions at {overlay}")
+    generated = parse_stamp(str(data.get("generated_utc") or "").replace("Z", "+00:00"))
+    log(f"  generated {describe_age(generated)}")
+    if generated is None:
+        return False, True
+    return (datetime.now(timezone.utc) - generated).total_seconds() > 24 * 3600, False
 
+
+def _status_offline_db() -> None:
+    """Report the offline database; informational, never stale or unknown."""
     offline = offline_db_dir()
     if offline.is_dir():
         newest = max((p.stat().st_mtime for p in offline.rglob("*") if p.is_file()), default=0)
@@ -2263,13 +2345,20 @@ def target_status(_args) -> int:
     else:
         log(f"offline database: not present ({offline}), online mode is always current")
 
-    trivy_stale, trivy_unknown = _status_trivy()
-    stale = stale or trivy_stale
-    unknown = unknown or trivy_unknown
 
-    if unknown:
+def target_status(_args) -> int:
+    """Report the freshness of everything this program maintains.
+
+    Exit 0 when all fresh, 1 when something is stale, 2 when something could not
+    be determined, following the house rule that a check which could not run
+    must not report health."""
+    checks = [_status_osv(), _status_overlay()]
+    _status_offline_db()
+    checks.append(_status_trivy())
+
+    if any(unknown for _, unknown in checks):
         return 2
-    return 1 if stale else 0
+    return 1 if any(stale for stale, _ in checks) else 0
 
 
 def _status_trivy() -> tuple[bool, bool]:

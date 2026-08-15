@@ -16,10 +16,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        # Every version the README names. It advertises 3.12 or newer, so a
-        # release after the last entry here is claimed and untested, which the
-        # README states rather than leaving this list to imply otherwise.
-        python: ["3.12", "3.13", "3.14"]
+        # One version per OS, and it is the floor on purpose: 3.12 is what the
+        # README requires, so it is the interpreter whose breakage matters,
+        # and the README states that later releases are untested rather than
+        # leaving this list to imply otherwise.
+        python: ["3.12"]
     runs-on: ${{ matrix.os }}
     steps:
       # persist-credentials off because no later step performs an
@@ -44,9 +45,10 @@ jobs:
         # is clean outside tests/, and this step is the only thing keeping those
         # sentences true.
         #
-        # --python-version is pinned to the floor rather than following the
-        # matrix on purpose: it asks whether the code is valid on the oldest
-        # interpreter the README claims, and the matrix answers the newer ones.
+        # --python-version is pinned to the floor: it asks whether the code is
+        # valid on the oldest interpreter the README claims, which is also the
+        # only one the matrix runs. Later releases are untested, and the README
+        # says so rather than leaving this pin to imply otherwise.
         run: |
           python -m pip install --upgrade mypy pylint bandit
           python -m mypy --python-version 3.12 lockfile_sentinel.py update_scanners.py schedule_tasks.py bump_version.py

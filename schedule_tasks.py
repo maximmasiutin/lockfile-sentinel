@@ -29,7 +29,7 @@ Usage:
     python schedule_tasks.py --all --elevate --path-var MY_REPOS_DIR
 """
 
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel
@@ -63,7 +63,7 @@ from typing import TypedDict
 # Carried per file rather than imported, because each of these three runs on its
 # own and an imported version would tie a standalone copy back to a checkout it
 # may not have. tests/test_headers.py is what keeps the three from drifting.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def escape(text: str) -> str:
@@ -92,13 +92,22 @@ def ps_quote(text: str) -> str:
 
 
 def resolve_system_tool(name: str) -> str:
-    """Absolute path to a system executable, or the bare name if PATH has none.
+    """The System32 path of a system executable, or the bare name if absent.
 
-    Passing a bare name to subprocess leaves the resolution to PATH at run time,
-    which is a hijacking surface for a program that is often run elevated. The
-    bare name is kept as the fallback so a host with an unusual layout still
-    works and fails with the tool's own message rather than ours."""
-    return shutil.which(name) or name
+    Mirrors the resolver in update_scanners.py: resolving against
+    %SystemRoot%\\System32 closes both the current-directory and the PATH
+    planting vectors for a program that is often run elevated, where
+    `shutil.which` closed only the first. The bare-name fallback keeps an
+    unusual layout, and every Unix tool such as crontab, working with the
+    tool's own failure message; it never consults PATH itself. `name` needs
+    its extension, since the file test sees no PATHEXT. With SystemRoot unset,
+    the usual Unix case, the bare name is returned at once: a hardcoded default
+    would be a relative path there, reopening the current-directory vector."""
+    root = os.environ.get("SystemRoot")
+    if not root:
+        return name
+    candidate = Path(root) / "System32" / name
+    return str(candidate) if candidate.is_file() else name
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UPDATER = SCRIPT_DIR / "update_scanners.py"
@@ -460,39 +469,31 @@ def cron_body(selected: list[str], delay: int, user: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def linux_install(selected: list[str], delay: int, dry_run: bool, remove: bool) -> int:
-    """Install or remove the managed block, writing only when it would change."""
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
-    target = CRON_DIR / "update-scanners"
-
-    if os.access(CRON_DIR, os.W_OK):
-        desired = "" if remove else cron_body(selected, delay, user)
-        current = target.read_text(encoding="utf-8") if target.exists() else ""
-        if current == desired:
-            print(f"{target} is already current, nothing written.")
-            return 0
-        if dry_run:
-            print(f"would {'remove' if remove else 'write'} {target}")
-            return 0
-        try:
-            if remove:
-                target.unlink(missing_ok=True)
-                print(f"{target} removed.")
-            else:
-                target.write_text(desired, encoding="utf-8")
-                target.chmod(0o644)
-                print(f"{target} written.")
-        except OSError as exc:
-            print(f"FAIL: {exc}")
-            return 1
+def _install_cron_d(target: Path, desired: str, dry_run: bool, remove: bool) -> int:
+    """Write or remove the /etc/cron.d file, only when it would change."""
+    current = target.read_text(encoding="utf-8") if target.exists() else ""
+    if current == desired:
+        print(f"{target} is already current, nothing written.")
         return 0
+    if dry_run:
+        print(f"would {'remove' if remove else 'write'} {target}")
+        return 0
+    try:
+        if remove:
+            target.unlink(missing_ok=True)
+            print(f"{target} removed.")
+        else:
+            target.write_text(desired, encoding="utf-8")
+            target.chmod(0o644)
+            print(f"{target} written.")
+    except OSError as exc:
+        print(f"FAIL: {exc}")
+        return 1
+    return 0
 
-    # No write access to /etc/cron.d, so manage a marked block in the user
-    # crontab instead. Replacing the block as a unit is what keeps this
-    # idempotent without disturbing anything else the user has scheduled.
-    crontab = resolve_system_tool("crontab")
-    proc = subprocess.run([crontab, "-l"], capture_output=True, text=True, check=False)  # nosec B603
-    existing = proc.stdout if proc.returncode == 0 else ""
+
+def _without_managed_block(existing: str) -> list[str]:
+    """The crontab's lines with the managed block, markers included, dropped."""
     kept = []
     inside = False
     for line in existing.splitlines():
@@ -504,6 +505,18 @@ def linux_install(selected: list[str], delay: int, dry_run: bool, remove: bool) 
             continue
         if not inside:
             kept.append(line)
+    return kept
+
+
+def _install_user_crontab(selected: list[str], delay: int, dry_run: bool, remove: bool) -> int:
+    """Replace the managed block in the user crontab as a unit.
+
+    Replacing the block as a unit is what keeps this idempotent without
+    disturbing anything else the user has scheduled."""
+    crontab = resolve_system_tool("crontab")
+    proc = subprocess.run([crontab, "-l"], capture_output=True, text=True, check=False)  # nosec B603
+    existing = proc.stdout if proc.returncode == 0 else ""
+    kept = _without_managed_block(existing)
     # No user field here: this block goes into the user's own crontab.
     block = "" if remove else cron_body(selected, delay, "")
     desired = ("\n".join(kept).rstrip() + "\n\n" + block).lstrip() if block else \
@@ -523,10 +536,21 @@ def linux_install(selected: list[str], delay: int, dry_run: bool, remove: bool) 
     return 0
 
 
+def linux_install(selected: list[str], delay: int, dry_run: bool, remove: bool) -> int:
+    """Install or remove the managed block, writing only when it would change."""
+    if os.access(CRON_DIR, os.W_OK):
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
+        desired = "" if remove else cron_body(selected, delay, user)
+        return _install_cron_d(CRON_DIR / "update-scanners", desired, dry_run, remove)
+    # No write access to /etc/cron.d, so manage a marked block in the user
+    # crontab instead.
+    return _install_user_crontab(selected, delay, dry_run, remove)
+
+
 # --------------------------------------------------------------------------
 
-def main() -> int:
-    """Install, remove or list the scheduled jobs."""
+def build_parser() -> argparse.ArgumentParser:
+    """The command line, kept out of main so the flow there stays readable."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -558,7 +582,35 @@ def main() -> int:
                         help="Windows: a PowerShell wrapper to invoke in front of the updater, "
                              "for a site that logs its own scheduled runs. Default: none, so "
                              "the updater is called directly.")
-    args = parser.parse_args()
+    return parser
+
+
+def windows_schedule(args, selected: list[str]) -> int:
+    """Install or remove the selected jobs in the Windows task scheduler."""
+    if args.elevate and not is_admin():
+        return relaunch_elevated([a for a in sys.argv[1:] if a != "--elevate"])
+    if not is_admin() and not args.dry_run:
+        print("not elevated; schtasks will be denied for a root-folder task. Use --elevate.")
+        return 2
+
+    user_id = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
+    worst = 0
+    for name in selected:
+        job = JOBS[name]
+        name_in_scheduler = task_name(job, args.prefix)
+        if args.remove:
+            worst = max(worst, windows_remove(name_in_scheduler, args.dry_run))
+            continue
+        hour, minute = (int(part) for part in job["time"].split(":"))
+        xml = windows_xml(job, boundary(hour, minute), args.random_delay, user_id,
+                          args.runner, args.path_var)
+        worst = max(worst, windows_install(name_in_scheduler, xml, args.dry_run))
+    return worst
+
+
+def main() -> int:
+    """Install, remove or list the scheduled jobs."""
+    args = build_parser().parse_args()
 
     if args.runner and not Path(args.runner).exists():
         print(f"FAIL: --runner {args.runner} does not exist")
@@ -591,26 +643,7 @@ def main() -> int:
 
     if not IS_WINDOWS:
         return linux_install(selected, args.random_delay, args.dry_run, args.remove)
-
-    if args.elevate and not is_admin():
-        return relaunch_elevated([a for a in sys.argv[1:] if a != "--elevate"])
-    if not is_admin() and not args.dry_run:
-        print("not elevated; schtasks will be denied for a root-folder task. Use --elevate.")
-        return 2
-
-    user_id = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
-    worst = 0
-    for name in selected:
-        job = JOBS[name]
-        name_in_scheduler = task_name(job, args.prefix)
-        if args.remove:
-            worst = max(worst, windows_remove(name_in_scheduler, args.dry_run))
-            continue
-        hour, minute = (int(part) for part in job["time"].split(":"))
-        xml = windows_xml(job, boundary(hour, minute), args.random_delay, user_id,
-                          args.runner, args.path_var)
-        worst = max(worst, windows_install(name_in_scheduler, xml, args.dry_run))
-    return worst
+    return windows_schedule(args, selected)
 
 
 if __name__ == "__main__":
