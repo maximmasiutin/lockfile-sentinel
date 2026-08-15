@@ -74,6 +74,7 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Sequence
@@ -784,6 +785,30 @@ def parse_datadog_csv(text: str) -> dict[str, set[str]]:
     return packages
 
 
+class HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect whose target leaves https.
+
+    urlopen follows redirects across schemes, so a checked https URL can still
+    hand the connection to cleartext one hop later: the feed host answers 302
+    with an http location, the downgrade is followed silently, and the scheme
+    gate above the call never sees it. Raised as URLError so the caller's
+    existing failure path reports it and keeps the previous overlay."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise urllib.error.URLError(f"refusing a redirect off https: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_https(request: urllib.request.Request, timeout: int):
+    """Open an https request through an opener that cannot be redirected off it.
+
+    The scheme of the request's own URL is the caller's gate; this closes the
+    hop that gate cannot see."""
+    opener = urllib.request.build_opener(HttpsOnlyRedirects())
+    return opener.open(request, timeout=timeout)  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+
+
 def target_malicious_packages(args) -> int:
     """Refresh the campaign overlay from the consolidated IOC feed."""
     output = Path(args.output) if args.output else overlay_path()
@@ -807,7 +832,7 @@ def target_malicious_packages(args) -> int:
         request = urllib.request.Request(
             args.source_url, headers={"User-Agent": "update-scanners"}
         )
-        with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        with open_https(request, timeout=60) as response:
             body = response.read()
         # Stage the download beside the overlay in the cache, never in the
         # scripts directory, so a crash between the write and the gate leaves

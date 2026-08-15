@@ -1192,7 +1192,7 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
     def unreachable(*_args, **_kwargs):
         raise OSError("feed unreachable")
 
-    monkeypatch.setattr(us.urllib.request, "urlopen", unreachable)
+    monkeypatch.setattr(us, "open_https", unreachable)
 
     class Args:
         output = str(overlay)
@@ -1215,7 +1215,7 @@ def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monk
     def must_not_open(*_args, **_kwargs):
         raise AssertionError("the URL was opened despite the refusal")
 
-    monkeypatch.setattr(us.urllib.request, "urlopen", must_not_open)
+    monkeypatch.setattr(us, "open_https", must_not_open)
 
     class Args:
         output = str(tmp_path / "overlay.json")
@@ -1227,6 +1227,24 @@ def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monk
     for url in ("file:///C:/Windows/win.ini", "http://example.invalid/iocs.csv"):
         Args.source_url = url
         assert us.target_malicious_packages(Args()) == 1, f"accepted {url}"
+
+
+def test_a_feed_redirect_off_https_is_refused_mid_flight() -> None:
+    """A checked https URL can still hand the connection to cleartext a hop later.
+
+    urlopen follows redirects across schemes, so the scheme gate on the
+    operator's URL never sees the feed host answering 302 with an http
+    location. The handler is exercised directly because the interesting
+    behaviour is its verdict on the redirect target, not the network plumbing
+    around it: http is refused, https is passed through to the base class."""
+    handler = us.HttpsOnlyRedirects()
+    request = us.urllib.request.Request("https://example.invalid/iocs.csv")
+    with pytest.raises(us.urllib.error.URLError, match="refusing a redirect off https"):
+        handler.redirect_request(
+            request, None, 302, "Found", {}, "http://example.invalid/iocs.csv")
+    followed = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://mirror.invalid/iocs.csv")
+    assert followed is not None and followed.full_url == "https://mirror.invalid/iocs.csv"
 
 
 def test_cron_lines_quote_paths_and_omit_the_user_field_for_a_user_crontab() -> None:
