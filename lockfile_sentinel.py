@@ -1426,12 +1426,14 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
     whatever age the disk left it. The prose above the return sites is for the
     operator; the word is for the report.
 
-    Refreshes are serialised through a lock file beside the overlay, created
-    exclusively, so two concurrent runs do not both download and interleave
-    writes. A lock older than fifteen minutes is presumed abandoned by a killed
-    run, since a refresh takes seconds, and is broken rather than honoured
-    forever. The overlay itself is written to a temporary name and renamed into
-    place, so a reader never sees a half-written table."""
+    Refreshes are serialised through an operating-system advisory lock on a
+    file beside the overlay, so two concurrent runs do not both download.
+    The OS releases the lock the moment its holder exits, killed or not,
+    which is why there is no staleness heuristic here: every timestamp-based
+    takeover protocol tried in review had a takeover race one level further
+    down, and the kernel's own lock has none. The lock file itself is inert
+    and stays on disk. The overlay is written to a temporary name and renamed
+    into place, so a reader never sees a half-written table."""
     if min_interval > 0 and overlay_file.exists():
         age = (time.time() - overlay_file.stat().st_mtime) / 60.0
         if age < min_interval:
@@ -1439,7 +1441,8 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
             return "throttled"
 
     lock_file = overlay_file.with_name(overlay_file.name + ".lock")
-    if not _acquire_overlay_lock(overlay_file, lock_file):
+    lock_fd = _acquire_overlay_lock(overlay_file, lock_file)
+    if lock_fd is None:
         return "locked"
 
     try:
@@ -1474,76 +1477,65 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
                   f"{payload['version_count']} versions")
         return "refreshed"
     finally:
-        for held in (lock_file, _adoption_marker(lock_file)):
-            try:
-                held.unlink()
-            except OSError:
-                pass
+        _release_overlay_lock(lock_fd)
 
 
-def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> bool:
-    """Take the exclusive refresh lock, breaking one only when it is stale."""
+def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> int | None:
+    """Take the OS advisory lock on the lock file, or None when it is held.
+
+    The kernel is the arbiter: the exclusive lock is granted to exactly one
+    open descriptor across processes, and it evaporates when its holder
+    exits, cleanly or not. That is what no timestamp protocol can offer, and
+    why the file itself is opened rather than exclusively created; the file
+    persisting on disk means nothing."""
     try:
         overlay_file.parent.mkdir(parents=True, exist_ok=True)
-        os.close(os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-        return True
-    except FileExistsError:
-        pass
+        fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
     except OSError as exc:
-        _progress(f"could not take the overlay lock ({exc}); using what is on disk")
-        return False
+        _progress(f"could not open the overlay lock ({exc}); using what is on disk")
+        return None
+    if _lock_descriptor(fd):
+        return fd
+    os.close(fd)
+    _progress("another refresh holds the overlay lock; using what is on disk")
+    return None
+
+
+def _lock_descriptor(fd: int) -> bool:
+    """Take a non-blocking exclusive OS lock on an open descriptor."""
     try:
-        held_for = time.time() - lock_file.stat().st_mtime
+        if sys.platform == "win32":
+            import msvcrt  # pylint: disable=import-outside-toplevel
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            # fcntl exists only on POSIX, which the sys.platform guard above proves;
+            # the analysis host is Windows, so the import check is disabled here.
+            import fcntl  # pylint: disable=import-outside-toplevel,import-error
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
     except OSError:
-        held_for = 0.0
-    if held_for <= 15 * 60:
-        _progress("another refresh holds the overlay lock; using what is on disk")
         return False
-    _progress("adopting an overlay lock older than fifteen minutes")
-    return _adopt_stale_lock(lock_file)
 
 
-def _adopt_stale_lock(lock_file: Path) -> bool:
-    """Take over a stale lock in place, with exactly one adopter.
-
-    The lock is adopted by freshening its timestamp, never removed and
-    recreated: any remove-then-recreate protocol leaves an interval where the
-    path is vacant, a third process acquires it, and the serialisation is
-    gone. Which adopter wins is decided by an exclusive create of an adoption
-    marker beside the lock, so of any number of processes that observed the
-    same stale lock, one proceeds and the rest defer. The marker lives only
-    for the adopted refresh and is removed with the lock; a marker left by a
-    crashed adopter goes stale on the same fifteen-minute rule and is cleared
-    by the next candidate before it races for its own."""
-    marker = _adoption_marker(lock_file)
+def _release_overlay_lock(fd: int) -> None:
+    """Release the advisory lock and close the descriptor."""
     try:
-        marker_age = time.time() - marker.stat().st_mtime
-        if marker_age <= 15 * 60:
-            _progress("another process is adopting the overlay lock; deferring")
-            return False
-        marker.unlink()
+        if sys.platform == "win32":
+            import msvcrt  # pylint: disable=import-outside-toplevel
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            # fcntl exists only on POSIX, which the sys.platform guard above proves;
+            # the analysis host is Windows, so the import check is disabled here.
+            import fcntl  # pylint: disable=import-outside-toplevel,import-error
+            fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass
     try:
-        os.close(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        os.close(fd)
     except OSError:
-        _progress("another process won the overlay lock adoption; deferring")
-        return False
-    try:
-        now = time.time()
-        os.utime(lock_file, (now, now))
-        return True
-    except OSError:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
-        return False
-
-
-def _adoption_marker(lock_file: Path) -> Path:
-    """The exclusive-create file that arbitrates stale-lock adoption."""
-    return lock_file.with_name(lock_file.name + ".adopt")
+        pass
 
 
 def resolve_trivy() -> str | None:

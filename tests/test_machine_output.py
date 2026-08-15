@@ -18,9 +18,7 @@ as a clean scan, both times because the failure was legible only in prose."""
 from __future__ import annotations
 
 import json
-import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -452,8 +450,13 @@ def test_refresh_overlay_respects_a_live_lock(tmp_path: Path, monkeypatch) -> No
 
     monkeypatch.setattr(ls, "_open_https", explode)
     overlay = tmp_path / "compromised-npm-packages.json"
-    (tmp_path / "compromised-npm-packages.json.lock").write_text("", encoding="utf-8")
-    assert ls.refresh_overlay(overlay, min_interval=0) == "locked"
+    lock = tmp_path / "compromised-npm-packages.json.lock"
+    held = ls._acquire_overlay_lock(overlay, lock)
+    assert held is not None
+    try:
+        assert ls.refresh_overlay(overlay, min_interval=0) == "locked"
+    finally:
+        ls._release_overlay_lock(held)
 
 
 def test_fetches_refuse_plain_http_and_downgrade_redirects() -> None:
@@ -576,34 +579,20 @@ def test_the_tool_version_probe_runs_once_per_binary(monkeypatch) -> None:
     assert len(calls) == 1
 
 
-def test_a_stale_lock_is_adopted_in_place_never_vacated(tmp_path: Path) -> None:
-    """A stale lock is taken over by freshening its timestamp, so the path is
-    never vacant for a third process to claim and no protocol step can ever
-    destroy a lock another process just acquired. After the adoption the lock
-    still exists, reads as fresh, and a second taker defers."""
+def test_the_overlay_lock_admits_exactly_one_holder_at_a_time(tmp_path: Path) -> None:
+    """The kernel's advisory lock is the arbiter: one open descriptor holds
+    it across processes, a second taker defers, and releasing it makes the
+    lock acquirable again. No timestamp heuristic exists to race, and a
+    crashed holder's lock evaporates with its process."""
     overlay = tmp_path / "compromised-npm-packages.json"
     lock = tmp_path / "compromised-npm-packages.json.lock"
-    lock.write_text("", encoding="utf-8")
-    stale = time.time() - 3600
-    os.utime(lock, (stale, stale))
-    assert ls._acquire_overlay_lock(overlay, lock) is True
-    assert lock.exists()
-    assert time.time() - lock.stat().st_mtime < 60
-    assert ls._acquire_overlay_lock(overlay, lock) is False
-
-
-def test_exactly_one_of_two_stale_lock_observers_adopts(tmp_path: Path) -> None:
-    """Two processes that both passed the staleness check race for the
-    adoption marker, whose exclusive create admits exactly one; the loser
-    defers rather than refreshing concurrently, and the winner's adoption
-    leaves the lock path continuously occupied."""
-    lock = tmp_path / "compromised-npm-packages.json.lock"
-    lock.write_text("", encoding="utf-8")
-    stale = time.time() - 3600
-    os.utime(lock, (stale, stale))
-    assert ls._adopt_stale_lock(lock) is True
-    assert ls._adopt_stale_lock(lock) is False
-    assert lock.exists()
+    first = ls._acquire_overlay_lock(overlay, lock)
+    assert first is not None
+    assert ls._acquire_overlay_lock(overlay, lock) is None
+    ls._release_overlay_lock(first)
+    second = ls._acquire_overlay_lock(overlay, lock)
+    assert second is not None
+    ls._release_overlay_lock(second)
 
 
 def test_unreadable_dirs_are_stored_as_a_bounded_preview_with_a_full_total(
