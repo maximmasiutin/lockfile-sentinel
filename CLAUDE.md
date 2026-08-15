@@ -16,7 +16,7 @@ Code targets Python 3.12 or newer and uses 3.12+ syntax where it helps (PEP 695 
 
 ## Pre-Commit Gate
 
-Before any commit, all five analyzers run and every finding is fixed rather than suppressed: `mypy` (3.12 floor, all four programs), `pylint` (must stay 10/10), `bandit -r . -x ./tests`, `semgrep scan --config auto`, and SonarScanner against the local SonarQube at `http://localhost:9000` (project key `maximmasiutin_lockfile-sentinel`), including code-smell and cognitive-complexity findings. The Sonar token is per-host and is passed on the command line, never committed.
+Before any commit, all five analyzers run and every finding is fixed rather than suppressed: `mypy` (3.12 floor, all four programs), `pylint` (must stay 10/10), `bandit -r . -x ./tests`, `semgrep scan --config p/python --config p/security-audit` (the rule sets the README documents; `--config auto` may be added on top but never replaces them, since its heuristic selection can drift), and SonarScanner against the local SonarQube at `http://localhost:9000` (project key `maximmasiutin_lockfile-sentinel`), including code-smell and cognitive-complexity findings. The Sonar token is per-host and is passed on the command line, never committed.
 
 ## Comments
 

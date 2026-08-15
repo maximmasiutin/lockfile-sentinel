@@ -11,7 +11,7 @@
       "required": ["name", "version"],
       "properties": {
         "name": { "const": "lockfile-sentinel-report" },
-        "version": { "type": "integer", "minimum": 1 }
+        "version": { "const": 1 }
       }
     },
     "tool": {
@@ -36,7 +36,12 @@
       "properties": {
         "id": { "type": "string" },
         "started_utc": { "type": "string", "format": "date-time" },
-        "finished_utc": { "type": ["string", "null"], "format": "date-time" },
+        "finished_utc": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "string", "format": "date-time" }
+          ]
+        },
         "complete": {
           "type": "boolean",
           "description": "True only when the run finished AND every requested layer completed over every input. A snapshot an interrupted run leaves behind has complete false and finished_utc null; a finished run with a coverage gap has complete false and finished_utc set, and exits 2. A consumer treats complete false as a scan whose absence of findings proves nothing."

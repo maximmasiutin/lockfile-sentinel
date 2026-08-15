@@ -11,7 +11,7 @@
       "required": ["name", "version"],
       "properties": {
         "name": { "const": "lockfile-sentinel-status" },
-        "version": { "type": "integer", "minimum": 1 }
+        "version": { "const": 1 }
       }
     },
     "tool": {
