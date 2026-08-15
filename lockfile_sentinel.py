@@ -335,6 +335,11 @@ MANIFEST_NAME = "package.json"
 HASH_COMMENT_LOCKFILES: frozenset[str] = frozenset(
     {YARN_LOCKFILE_NAME, PNPM_LOCKFILE_NAME}
 )
+# Where a quote may open a string. Anywhere else it is an apostrophe inside a
+# bare scalar, and opening a string there shields the rest of its line. `:` and
+# `-` are absent because each indicates only when whitespace follows it, and
+# that whitespace is already here; `pre-'90s` is bare scalar content.
+_QUOTE_LEAD = frozenset(" \t\r\n{[,")
 
 # The one timestamp shape this program writes and reads back: RFC 3339 UTC,
 # whole seconds, Z suffix. Stated once so the writer and the parsers cannot
@@ -819,7 +824,12 @@ def _strip_hash_comments(text: str) -> str:
     is YAML's own rule and holds for yarn: the tarball URLs both formats carry
     end in `#<sha>`, so a marker with a non-space character before it is part
     of the token. And a `#` inside a quoted string is data, in either quote
-    style, since yarn quotes its descriptors and YAML admits both.
+    style, since yarn quotes its descriptors and YAML admits both. A quote
+    counts as opening one only where a value may start and only when its
+    scalar closes on the same line: an apostrophe inside a bare scalar is an
+    apostrophe, wherever it sits, and reading it as an opening quote makes
+    the rest of its line string content, leaving a real comment behind it
+    unstripped with its pin intact.
 
     Newlines are kept, so removing a comment never joins two lines into a
     token neither line carried."""
@@ -829,7 +839,7 @@ def _strip_hash_comments(text: str) -> str:
     previous = "\n"
     while position < length:
         char = text[position]
-        if char in '"\'':
+        if char in '"\'' and previous in _QUOTE_LEAD:
             end = _copy_quoted(text, position, out)
             previous = text[end - 1] if end > position else char
             position = end
@@ -850,30 +860,35 @@ def _copy_quoted(text: str, position: int, out: list[str]) -> int:
     """Copy one quoted scalar, quotes included, in either quote style.
 
     Backslash escapes are honoured inside double quotes only, which is both
-    YAML's rule and yarn's; inside single quotes YAML doubles the quote to
-    escape it, and that pair is copied as two ordinary characters, which ends
-    the scalar and immediately opens the next one. The result is the same
-    text either way, and no `#` inside it is ever read as a comment."""
-    length = len(text)
+    YAML's rule and yarn's. Both formats are line-oriented, so a quote whose
+    scalar never closes before its line ends is not an opener at all: it is
+    an apostrophe inside a plain scalar, copied alone, and the rest of its
+    line stays subject to comment stripping."""
+    end = _quoted_end(text, position)
+    if end is None:
+        out.append(text[position])
+        return position + 1
+    out.append(text[position:end])
+    return end
+
+
+def _quoted_end(text: str, position: int) -> int | None:
+    """End index of the quoted scalar opened at `position`, or None when no
+    closing quote arrives before the line ends."""
     quote = text[position]
-    out.append(quote)
-    position += 1
-    while position < length:
-        char = text[position]
-        out.append(char)
-        if quote == '"' and char == "\\" and position + 1 < length:
-            out.append(text[position + 1])
-            position += 2
-            continue
-        position += 1
-        if char == quote:
-            break
-        # An unterminated scalar ends at the line, as both formats are
-        # line-oriented; running to the end of the file would swallow every
-        # later comment marker and, with it, this function's whole purpose.
+    length = len(text)
+    index = position + 1
+    while index < length:
+        char = text[index]
         if char == "\n":
-            break
-    return position
+            return None
+        if quote == '"' and char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            return index + 1
+        index += 1
+    return None
 
 
 def scan_lockfile(path: Path, status: RepoStatus) -> bool:
