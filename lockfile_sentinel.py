@@ -3431,10 +3431,11 @@ def _trivy_version(trivy_bin: str | None) -> str | None:
 def _finding_id(*parts: str) -> str:
     """A stable identifier for one finding, derived from what it names.
 
-    The hash input is the coordinates the plan specifies: repository, kind,
-    package or artifact, version or range, and the advisory ids. Sixteen hex
-    characters keep it short enough to grep for while leaving collisions out of
-    practical reach for the counts involved."""
+    The hash input is the underlying fact alone: repository, kind, package or
+    artifact, and version or range. Advisory ids stay out so the id survives
+    database enrichment. Sixteen hex characters keep it short enough to grep
+    for while leaving collisions out of practical reach for the counts
+    involved."""
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
