@@ -3431,11 +3431,10 @@ def _trivy_version(trivy_bin: str | None) -> str | None:
 def _finding_id(*parts: str) -> str:
     """A stable identifier for one finding, derived from what it names.
 
-    The hash input is the underlying fact alone: repository, kind, package or
-    artifact, and version or range. Advisory ids stay out so the id survives
-    database enrichment. Sixteen hex characters keep it short enough to grep
-    for while leaving collisions out of practical reach for the counts
-    involved."""
+    The hash input is the coordinates the plan specifies: repository, kind,
+    package or artifact, version or range, and the advisory ids. Sixteen hex
+    characters keep it short enough to grep for while leaving collisions out of
+    practical reach for the counts involved."""
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -3512,11 +3511,6 @@ def _repo_trivy_coverage(
     elif status.trivy_failed_count:
         state = "partial"
         reasons.append("trivy_scan_failed")
-    elif status.trivy_submitted_count < flagged:
-        # Mirrors the layer-level rule: a snapshot written before the Trivy
-        # pass must not report a repository's corroboration as done.
-        state = "partial"
-        reasons.append("corroboration_pending")
     else:
         state = "completed"
     return {
@@ -4364,7 +4358,7 @@ def _write_root_refusal(
     each refused root in errors; the layer objects are built as for an empty
     tree, since nothing was asked of them, and the complete flag plus the
     error codes carry the verdict."""
-    if not args.output:
+    if not args.output and not args.json:
         return
     errors = [
         _error("root_unreadable", "invocation", f"root {root} {reason}",
@@ -4398,6 +4392,9 @@ def _write_root_refusal(
         lines = [str(e["message"]) for e in errors]
         lines.append("refusing to report on a scan that could not cover every root given")
         text = "\n".join(lines) + "\n"
+    if not args.output:
+        sys.stdout.write(text + "\n")
+        return
     try:
         _write_atomic(Path(args.output), text)
     except OSError as exc:

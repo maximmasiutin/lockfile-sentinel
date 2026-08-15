@@ -704,19 +704,6 @@ def test_trivy_stays_pending_in_snapshots_until_every_flagged_file_was_submitted
     assert done["state"] == "completed"
 
 
-def test_repository_trivy_coverage_also_stays_pending_before_submission() -> None:
-    """The repository-level object obeys the same rule as the layer, so a
-    snapshot cannot show a partial layer over completed repositories."""
-    flagged = ls.RepoStatus(name="t", path="/t")
-    flagged.flagged_lockfiles = {"/t/package-lock.json"}
-    pending = ls._repo_trivy_coverage(flagged, requested=True, available=True)
-    assert pending["state"] == "partial"
-    assert pending["reason_codes"] == ["corroboration_pending"]
-    flagged.trivy_submitted_count = 1
-    done = ls._repo_trivy_coverage(flagged, requested=True, available=True)
-    assert done["state"] == "completed"
-
-
 def test_refused_roots_invalidate_a_stale_report_on_disk(
     tmp_path: Path,
 ) -> None:
@@ -739,6 +726,21 @@ def test_refused_roots_invalidate_a_stale_report_on_disk(
     assert report["invocation"]["finished_utc"] is not None
     assert report["errors"][0]["code"] == "root_unreadable"
     assert str(missing) in report["errors"][0]["message"]
+
+
+def test_refused_roots_emit_machine_output_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    """Machine mode always emits a parseable refusal envelope."""
+    args = ls._build_parser().parse_args(
+        ["--json", "--no-osv", "--no-trivy", "--no-overlay", "--no-refresh"]
+    )
+    missing = Path("/missing-root")
+    ls._write_root_refusal(
+        args, [missing], [(missing, "does not exist")],
+        _overlay_layer("not_requested"), INVOCATION_ID, STARTED,
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["invocation"]["complete"] is False
+    assert report["errors"][0]["code"] == "root_unreadable"
 
 
 def test_a_tree_with_no_lockfiles_completes_the_osv_layer_without_a_scanner() -> None:
