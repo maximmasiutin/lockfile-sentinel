@@ -163,7 +163,7 @@
         "unreadable_dirs": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Directories the walk could not enumerate. Anything beneath one was never seen, so a non-empty list here is incomplete coverage and the scan exits 2."
+          "description": "Directories the walk could not enumerate, as a bounded preview of at most 100 paths; counts.dirs_unreadable carries the full total. Anything beneath one was never seen, so a non-zero total is incomplete coverage and the scan exits 2."
         },
         "lockfiles": { "type": "array", "items": { "type": "string" } },
         "counts": {

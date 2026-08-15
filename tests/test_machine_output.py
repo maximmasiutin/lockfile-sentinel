@@ -531,7 +531,6 @@ def test_a_scanner_outage_is_never_reported_as_a_rejected_lockfile(
     def no_answer(_bin, _paths, _timeout, _debug=False, failure=None):
         if failure is not None:
             failure["cause"] = "unavailable"
-        return None
 
     monkeypatch.setattr(ls, "_run_osv_batch", no_answer)
     run = ls.OsvRunReport()
@@ -577,28 +576,129 @@ def test_the_tool_version_probe_runs_once_per_binary(monkeypatch) -> None:
     assert len(calls) == 1
 
 
-def test_a_stale_lock_is_broken_by_exactly_one_taker(tmp_path: Path) -> None:
-    """Breaking a stale lock is an atomic rename, so of two processes that
-    both observe it, one wins and the other defers instead of unlinking the
-    winner's fresh lock and refreshing concurrently."""
+def test_a_stale_lock_is_adopted_in_place_never_vacated(tmp_path: Path) -> None:
+    """A stale lock is taken over by freshening its timestamp, so the path is
+    never vacant for a third process to claim and no protocol step can ever
+    destroy a lock another process just acquired. After the adoption the lock
+    still exists, reads as fresh, and a second taker defers."""
     overlay = tmp_path / "compromised-npm-packages.json"
     lock = tmp_path / "compromised-npm-packages.json.lock"
     lock.write_text("", encoding="utf-8")
     stale = time.time() - 3600
     os.utime(lock, (stale, stale))
     assert ls._acquire_overlay_lock(overlay, lock) is True
+    assert lock.exists()
+    assert time.time() - lock.stat().st_mtime < 60
     assert ls._acquire_overlay_lock(overlay, lock) is False
 
 
-def test_a_late_breaker_hands_back_a_lock_that_turned_out_fresh(tmp_path: Path) -> None:
-    """The interleaving the rename alone leaves open: a taker that observed
-    the stale lock renames only after the winner has recreated a fresh one.
-    The claim is re-checked after the rename, handed back as a restored
-    placeholder, and the late taker defers, so the winner's hold survives."""
-    lock = tmp_path / "compromised-npm-packages.json.lock"
-    lock.write_text("", encoding="utf-8")
-    assert ls._break_stale_lock(lock) is False
-    assert lock.exists()
+def test_unreadable_dirs_are_stored_as_a_bounded_preview_with_a_full_total(
+    tmp_path: Path,
+) -> None:
+    """A hostile tree can manufacture unreadable directories by the thousand,
+    so the stored list is a preview; the total carries the real count and is
+    what completeness and the JSON counts use."""
+    statuses: dict[Path, ls.RepoStatus] = {}
+    dirs = [tmp_path / "app" / f"d{i:04d}" for i in range(150)]
+    ls._attribute([(tmp_path / "app", [], [])], tmp_path, [], statuses, {}, dirs)
+    status = statuses[tmp_path / "app"]
+    assert len(status.unreadable_dirs) == ls.UNREADABLE_DIRS_STORED_LIMIT
+    assert status.unreadable_dir_total == 150
+    repo = ls.repo_to_dict(status, True, True, True, True)
+    assert repo["counts"]["dirs_unreadable"] == 150
+    assert ls.report_is_complete(_layers([status]), [status]) is False
+
+
+def test_a_systemic_outage_is_recorded_without_splitting_the_batch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A timeout is not a property of one file, so a whole group goes to the
+    unavailable bucket in one invocation instead of one per lockfile."""
+    paths = []
+    for name in ("a", "b", "c"):
+        lockfile = tmp_path / name / "package-lock.json"
+        lockfile.parent.mkdir()
+        lockfile.write_text('{"lockfileVersion": 3}', encoding="utf-8")
+        paths.append(str(lockfile))
+    calls: list[int] = []
+
+    def no_answer(_bin, batch, _timeout, _debug=False, failure=None):
+        calls.append(len(batch))
+        if failure is not None:
+            failure["cause"] = "unavailable"
+
+    monkeypatch.setattr(ls, "_run_osv_batch", no_answer)
+    run = ls.OsvRunReport()
+    ls.run_osv_scanner("osv-scanner-never-invoked", paths, 100, 10, run_report=run)
+    assert calls == [3]
+    assert run.unavailable == paths
+    assert not run.failed
+
+
+def test_snapshot_outcomes_never_mention_batches_that_have_not_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A snapshot written between batches describes only what has happened:
+    the submitted list grows batch by batch and the failure sets are synced
+    before each callback, so an interrupted partial reconciles."""
+    good = tmp_path / "good" / "package-lock.json"
+    bad = tmp_path / "bad" / "package-lock.json"
+    for lockfile in (good, bad):
+        lockfile.parent.mkdir()
+        lockfile.write_text('{"lockfileVersion": 3}', encoding="utf-8")
+
+    def per_batch(_bin, batch, _timeout, _debug=False, failure=None):
+        if batch == [str(good)]:
+            return {}
+        if failure is not None:
+            failure["cause"] = "rejected"
+        return None
+
+    monkeypatch.setattr(ls, "_run_osv_batch", per_batch)
+    run = ls.OsvRunReport()
+    seen: list[tuple[list[str], list[str]]] = []
+
+    def snapshot(_findings, _processed):
+        seen.append((list(run.submitted), list(run.failed)))
+
+    ls.run_osv_scanner(
+        "osv-scanner-never-invoked", [str(good), str(bad)], 1, 10,
+        on_batch_done=snapshot, run_report=run,
+    )
+    assert seen[0] == ([str(good)], [])
+    assert seen[1] == ([str(good), str(bad)], [str(bad)])
+
+
+def test_a_tree_with_no_lockfiles_completes_the_osv_layer_without_a_scanner() -> None:
+    """Nothing to scan completes the layer whatever is installed, the same
+    way Trivy completes with nothing to confirm; a lockfile-free tree must
+    not exit 2 over a scanner it never needed."""
+    layer = ls.osv_layer(True, None, ls.OsvRunReport(), 0, 0)
+    assert layer["state"] == "completed"
+    assert layer["reason_code"] == "nothing_to_scan"
+    status = ls.RepoStatus(name="t", path="/t")
+    layers = _layers([status], osv_bin=None)
+    assert ls.report_is_complete(layers, [status]) is True
+
+
+def test_a_partial_layer_appears_in_the_structured_errors() -> None:
+    """Exit 2 with an empty error list sends the consumer hunting by hand, so
+    a requested layer that half-ran is named with its own reason code."""
+    layers = _layers([], overlay_state="partial")
+    layers["overlay"]["reason_code"] = "overlay_refresh_failed"
+    errors = ls.collect_errors(layers, [], ls.OsvRunReport())
+    assert any(e["code"] == "overlay_refresh_failed" and e["scope"] == "layer"
+               for e in errors)
+
+
+def test_overlapping_and_repeated_roots_are_walked_once(tmp_path: Path) -> None:
+    """The same tree walked twice yields duplicate statuses that the
+    path-keyed lockfile index can only half-satisfy, turning a good scan
+    into partial coverage and exit 2."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    kept = ls._deduplicate_roots([tmp_path, tmp_path, inner])
+    assert kept == [tmp_path]
 
 
 # --------------------------------------------------------------------------

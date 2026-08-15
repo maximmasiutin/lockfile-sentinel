@@ -346,6 +346,10 @@ LOCKFILE_NAMES: frozenset[str] = frozenset(
 # one member that is not a lockfile, being a marker and a range source only,
 # and it never passes through scan_lockfile.
 NPM_MARKER_FILES: frozenset[str] = LOCKFILE_NAMES | {MANIFEST_NAME}
+
+# How many unreadable-directory paths a repository stores and serializes; the
+# count of them is kept in full separately.
+UNREADABLE_DIRS_STORED_LIMIT: int = 100
 ALWAYS_SKIP_DIRS: frozenset[str] = frozenset({".git"})
 DEPENDENCY_FIELDS: tuple[str, ...] = (
     "dependencies",
@@ -365,8 +369,11 @@ class RepoStatus:
     npm_files: list[str] = field(default_factory=list)
     # Directories the walk could not enumerate. Anything beneath one was never
     # seen, so a repository carrying an entry here is incomplete coverage, not
-    # a clean tree that happened to be small.
+    # a clean tree that happened to be small. The list is a bounded preview,
+    # because a hostile tree can manufacture unreadable directories by the
+    # thousand; the total carries the real count and is what the verdicts use.
     unreadable_dirs: list[str] = field(default_factory=list)
+    unreadable_dir_total: int = 0
     # npm_files records what the walk found; these two record whether it yielded
     # anything. unreadable_files covers both halves of that: a manifest whose
     # permissions deny access or which disappeared between enumeration and
@@ -1077,7 +1084,10 @@ def _attribute(
         owner = _owner_repo(unreadable, repo_roots, root)
         if owner not in statuses:
             statuses[owner] = RepoStatus(name=_repo_label(root, owner), path=str(owner))
-        statuses[owner].unreadable_dirs.append(str(unreadable))
+        status = statuses[owner]
+        status.unreadable_dir_total += 1
+        if len(status.unreadable_dirs) < UNREADABLE_DIRS_STORED_LIMIT:
+            status.unreadable_dirs.append(str(unreadable))
 
 
 def _attribute_file(
@@ -1300,7 +1310,9 @@ def _merge_statuses(into: StatusesByOwner, other: StatusesByOwner) -> None:
             continue
         dst.has_npm = dst.has_npm or src.has_npm
         dst.npm_files.extend(src.npm_files)
+        dst.unreadable_dir_total += src.unreadable_dir_total
         dst.unreadable_dirs.extend(src.unreadable_dirs)
+        del dst.unreadable_dirs[UNREADABLE_DIRS_STORED_LIMIT:]
         dst.read_files.extend(src.read_files)
         dst.unreadable_files.extend(src.unreadable_files)
         dst.lockfiles.extend(src.lockfiles)
@@ -1486,47 +1498,20 @@ def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> bool:
     if held_for <= 15 * 60:
         _progress("another refresh holds the overlay lock; using what is on disk")
         return False
-    _progress("breaking an overlay lock older than fifteen minutes")
-    return _break_stale_lock(lock_file)
-
-
-def _break_stale_lock(lock_file: Path) -> bool:
-    """Take over a lock believed stale, without ever removing a live one.
-
-    The break is an atomic rename rather than an unlink, because two
-    processes can both observe the same stale lock: with unlink, the loser
-    would remove the winner's fresh lock and both would refresh at once.
-    Only one rename of the same file can succeed, and the winner still has
-    to win the exclusive create afterwards.
-
-    The rename alone still leaves one interleaving open: a taker that
-    observed the stale lock, lost the race, and renames only after the winner
-    has already recreated a fresh lock at the same path. So what was claimed
-    is checked again after the rename, and a claim that turns out fresh is
-    handed back: a placeholder is restored at the lock path so the winner's
-    hold stays visible, and this caller defers."""
-    claimed = lock_file.with_name(f"{lock_file.name}.stale-{os.getpid()}")
+    # A stale lock is adopted in place by freshening its timestamp, never
+    # removed and recreated: any remove-then-recreate protocol leaves an
+    # interval where the path is vacant, a third process acquires it, and the
+    # promised serialisation is gone. Adoption keeps the path continuously
+    # occupied, so nobody can ever destroy a lock another process just took.
+    # Two processes that both observe the same stale lock can both adopt it
+    # and refresh concurrently, and that is accepted on purpose: the lock is
+    # a bandwidth saver, not a correctness device, because the overlay itself
+    # is written atomically and every observable copy is complete whichever
+    # refresh lands last.
+    _progress("adopting an overlay lock older than fifteen minutes")
     try:
-        os.replace(lock_file, claimed)
-    except OSError:
-        return False
-    claim_was_stale = True
-    try:
-        claim_was_stale = time.time() - claimed.stat().st_mtime > 15 * 60
-    except OSError:
-        pass
-    try:
-        claimed.unlink()
-    except OSError:
-        pass
-    if not claim_was_stale:
-        try:
-            os.close(os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-        except OSError:
-            pass
-        return False
-    try:
-        os.close(os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        now = time.time()
+        os.utime(lock_file, (now, now))
         return True
     except OSError:
         return False
@@ -2543,6 +2528,15 @@ def _scan_with_isolation(
     result = _run_osv_batch(osv_bin, paths, timeout, debug, failure=failure)
     if result is not None:
         return result, {_normalize_path(p) for p in paths}
+    if failure.get("cause") == "unavailable":
+        # A timeout, spawn failure or unparsable output is systemic, not a
+        # property of one file, so splitting would multiply the outage by an
+        # invocation per lockfile. The whole group is recorded unanswered and
+        # the binary search is reserved for genuine rejections.
+        _progress(f"  no verdict on a group of {len(paths)}, the scanner did not run")
+        if outages is not None:
+            outages.extend(paths)
+        return {}, set()
     if len(paths) == 1:
         _record_isolated_failure(paths[0], failure, failures, outages)
         return {}, set()
@@ -2627,8 +2621,6 @@ def run_osv_scanner(
     started = time.monotonic()
 
     lockfile_paths = _filter_usable_lockfiles(lockfile_paths, processed, run_report)
-    if run_report is not None:
-        run_report.submitted.extend(lockfile_paths)
 
     batches = _chunked(lockfile_paths, batch_size)
     failures: list[str] = []
@@ -2647,6 +2639,15 @@ def run_osv_scanner(
         )
         combined.update(batch_findings)
         processed.update(batch_ok)
+        if run_report is not None:
+            # Synced per batch rather than once at the end, so a snapshot
+            # written from the callback below describes only the batches that
+            # have actually run and its counts reconcile mid-flight too; the
+            # submitted list likewise grows batch by batch instead of claiming
+            # up front that every future path was already handed over.
+            run_report.submitted.extend(batch)
+            run_report.failed[:] = failures
+            run_report.unavailable[:] = outages
         if tracker is not None:
             tracker.advance(f"{len(combined)} lockfile(s) with findings", count=len(batch))
         if on_batch_done is not None:
@@ -2658,8 +2659,8 @@ def run_osv_scanner(
     if failures:
         _write_failure_list(failures)
     if run_report is not None:
-        run_report.failed.extend(failures)
-        run_report.unavailable.extend(outages)
+        run_report.failed[:] = failures
+        run_report.unavailable[:] = outages
         run_report.duration_ms = int((time.monotonic() - started) * 1000)
     return combined, processed
 
@@ -3450,7 +3451,13 @@ def osv_layer(requested: bool, osv_bin: str | None,
     }
     if not requested:
         return layer
-    if not osv_bin:
+    if discovered == 0:
+        # Nothing for the layer to do completes it whatever is installed, the
+        # same way the Trivy layer completes with nothing to confirm; a tree
+        # with no lockfiles must not exit 2 over a scanner it never needed.
+        layer["state"] = "completed"
+        layer["reason_code"] = "nothing_to_scan"
+    elif not osv_bin:
         layer["state"] = "unavailable"
         layer["reason_code"] = "binary_not_found"
         layer["message"] = ("osv-scanner was requested and is not installed, so "
@@ -3651,7 +3658,11 @@ def collect_errors(
     errors: list[dict[str, Any]] = []
     for layer_name in ("overlay", "osv", "trivy"):
         layer = layers.get(layer_name, {})
-        if layer.get("requested") and layer.get("state") in ("unavailable", "failed"):
+        # partial counts too: a requested layer that half-ran makes the run
+        # exit 2, and an exit 2 whose error list is empty sends the consumer
+        # hunting through the layers by hand for the reason.
+        if layer.get("requested") and layer.get("state") in (
+                "unavailable", "failed", "partial"):
             errors.append(_error(
                 str(layer.get("reason_code") or f"{layer_name}_unavailable"),
                 "layer",
@@ -3738,7 +3749,7 @@ def repo_to_dict(status: RepoStatus, osv_requested: bool, osv_available: bool,
             "files_read": len(status.read_files),
             "files_unreadable": len(status.unreadable_files),
             "lockfiles_unreadable": lockfile_unreadable,
-            "dirs_unreadable": len(status.unreadable_dirs),
+            "dirs_unreadable": status.unreadable_dir_total,
         },
         "present_versions": {k: sorted(v) for k, v in status.present_versions.items()},
         "range_only": {k: sorted(v) for k, v in status.range_only.items()},
@@ -3813,7 +3824,7 @@ def build_report(
             "lockfiles_failed": len(osv_run.failed),
             "files_read": sum(len(s.read_files) for s in statuses),
             "files_unreadable": sum(len(s.unreadable_files) for s in statuses),
-            "dirs_unreadable": sum(len(s.unreadable_dirs) for s in statuses),
+            "dirs_unreadable": sum(s.unreadable_dir_total for s in statuses),
         },
         "totals": {
             "repositories": len(statuses),
@@ -3840,7 +3851,7 @@ def report_is_complete(layers: dict[str, dict[str, Any]],
         if layer.get("requested") and layer.get("state") not in ("completed",):
             return False
     for status in statuses:
-        if status.unreadable_files or status.unreadable_dirs:
+        if status.unreadable_files or status.unreadable_dir_total:
             return False
         if status.lockfiles and not status.osv_checked \
                 and layers.get("osv", {}).get("requested"):
@@ -4092,7 +4103,7 @@ def _run_sweep(args: argparse.Namespace) -> int:
     # that run was silently discarded while the coverage line still claimed the
     # lockfile had been submitted and resolved. A package the offline table does
     # not already know would have been reported clean.
-    roots = [Path(r).resolve() for r in (args.roots or ["."])]
+    roots = _deduplicate_roots([Path(r).resolve() for r in (args.roots or ["."])])
 
     # A root that does not resolve is fatal, not skippable. Skipping it left
     # all_statuses empty, printed "Repositories scanned: 0" and exited 0, so a
@@ -4136,6 +4147,30 @@ def _run_sweep(args: argparse.Namespace) -> int:
     sweep.run_live_layer()
     sweep.run_trivy_layer()
     return sweep.finish()
+
+
+def _deduplicate_roots(roots: list[Path]) -> list[Path]:
+    """Drop a root that repeats, or that sits inside another requested root.
+
+    Walking the same tree twice produces duplicate repository statuses while
+    the path-keyed lockfile index submits each physical lockfile once, so
+    only one duplicate ever receives OSV results: the run then reads as
+    partial coverage and exits 2 after a perfectly good scan. The report
+    describes trees, so each tree is walked once whatever the caller typed."""
+    kept: list[Path] = []
+    for root in roots:
+        covered_by = next(
+            (other for other in roots
+             if other != root and other in root.parents), None,
+        )
+        if covered_by is not None:
+            _progress(f"root {root} is inside {covered_by}, walking it once there")
+            continue
+        if root in kept:
+            _progress(f"root {root} was named more than once, walking it once")
+            continue
+        kept.append(root)
+    return kept
 
 
 def _roots_are_usable(roots: list[Path]) -> bool:
@@ -4287,7 +4322,20 @@ class _Sweep:
         def on_batch_done(
             findings: dict[str, list[tuple[str, str, set[str]]]], processed: set[str]
         ) -> None:
-            apply_osv_results(self.lockfile_index, findings, processed)
+            # The full outcome sets travel with every snapshot, not only the
+            # final report, so an interrupted multi-batch run leaves a partial
+            # whose per-repository counts already reconcile with what had
+            # actually happened when it was written.
+            apply_osv_results(
+                self.lockfile_index, findings, processed,
+                failed_paths={_normalize_path(p) for p in self.osv_run.failed},
+                skipped_paths={_normalize_path(p)
+                               for p in self.osv_run.skipped_unreadable},
+                unavailable_paths={_normalize_path(p)
+                                   for p in self.osv_run.unavailable},
+                empty_paths={_normalize_path(p)
+                             for p in self.osv_run.skipped_empty},
+            )
             self.persist_snapshot()
 
         osv_findings, osv_processed = run_osv_scanner(
