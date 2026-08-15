@@ -1203,6 +1203,36 @@ def dir_identity(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
+SCRATCH_MARKER = ".lockfile-sentinel-scratch-id"
+
+
+def _mark_scratch(staged: Path) -> str:
+    """Write a random token into the staged tree and return it.
+
+    The token is what an identity comparison cannot supply: two stats taken
+    either side of a copy agree again if the original directory is renamed back
+    before the second one, so a tree substituted only for the duration of the
+    copy passes. A copy carrying this token came from the directory that held
+    it, and the directory's ACL is what keeps the token unreadable."""
+    token = secrets.token_hex(16)
+    (staged / SCRATCH_MARKER).write_text(token, encoding="utf-8")
+    return token
+
+
+def _require_marker(copied: Path, token: str) -> None:
+    """Refuse a copy that does not carry the token the source was marked with."""
+    try:
+        found = (copied / SCRATCH_MARKER).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ScratchSwappedError(
+            f"the copy at {copied} carries no scratch marker ({exc}), so it did not "
+            "come from the tree the scanner passed") from exc
+    if found != token:
+        raise ScratchSwappedError(
+            f"the copy at {copied} carries a different scratch marker, so its source "
+            "was substituted while it was being copied")
+
+
 def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None,
                        when: str = "before the promotion") -> None:
     """Refuse when `staged` is no longer the directory `identity` came from.
@@ -1273,8 +1303,10 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
 
     `staged_identity` is the (device, inode) the caller recorded when it made
     the staged tree. It is re-read immediately before the tree leaves the
-    scratch, and again after a cross-device copy, and a mismatch refuses the
-    promotion: between the ClamAV gate and the rename the tree is otherwise
+    scratch, and again after a cross-device copy, which also has to carry the
+    marker token written just before it, since an identity restored after a
+    substitution passes a comparison and cannot forge a token. A failure of
+    either refuses the promotion: between the ClamAV gate and the rename the tree is otherwise
     trusted by pathname alone, and a base that grants another account
     DELETE_CHILD lets that account rename the scanned tree aside and leave its
     own at the same name.
@@ -1312,6 +1344,9 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
     # above can take a while on a large leftover tree, and a check that ran
     # before them would leave that whole interval unguarded.
     _refuse_if_swapped(staged, staged_identity)
+    # Marked after the identity check and before the copy, so the token names
+    # this tree at the moment it was last shown to be the scanned one.
+    token = _mark_scratch(staged) if staged_identity is not None else None
     try:
         # Same volume: a rename, and the except clause never runs. Another
         # volume: rename fails (EXDEV on POSIX, a not-same-device error on
@@ -1326,16 +1361,21 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
         if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
             raise
         # The cross-device path reads the source by pathname for as long as a
-        # gigabyte takes to copy, so the single check above covers none of it.
-        # Checking again once the copy is done catches a source swapped during
-        # it, which is what a rename of the scratch would be; the copy is
-        # discarded rather than promoted.
+        # gigabyte takes to copy, so the check above covers none of it. The
+        # copy is required to carry the token as well as the source to still
+        # have the identity: an ABA rename, aside during the copy and back
+        # before the check, restores the inode and defeats the comparison
+        # alone, but not a token the substituted tree could not read.
         shutil.copytree(staged, incoming)
         try:
             _refuse_if_swapped(staged, staged_identity, when="during the copy")
+            if token is not None:
+                _require_marker(incoming, token)
         except ScratchSwappedError:
             shutil.rmtree(incoming, ignore_errors=True)
             raise
+    # The marker belongs to the transfer, not to the cache Trivy reads.
+    (incoming / SCRATCH_MARKER).unlink(missing_ok=True)
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():

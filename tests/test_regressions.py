@@ -1654,6 +1654,64 @@ def test_a_source_swapped_during_a_cross_device_copy_is_not_promoted(
     assert not live.with_name(live.name + ".incoming").exists()
 
 
+def test_a_source_restored_after_a_swap_is_still_refused(tmp_path, monkeypatch) -> None:
+    """An ABA rename restores the inode and passes the comparison.
+
+    The attacker renames the validated tree aside once the copy starts, serves
+    its own at the pathname while files are read, and renames the original back
+    before the post-copy check. Both stats then agree while the copy holds
+    unscanned content, so identity alone cannot answer this; the token can,
+    because the substituted tree cannot read it."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def copy_a_hostile_tree(_src, dst):
+        # What the copy reads is the attacker's tree, which never held the
+        # token. The rename back is modelled by the identity below, which keeps
+        # answering as it did before the copy.
+        landed = Path(dst)
+        (landed / "db").mkdir(parents=True)
+        (landed / "db" / "trivy.db").write_text("hostile", encoding="utf-8")
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", copy_a_hostile_tree)
+    monkeypatch.setattr(us, "dir_identity", lambda _path: identity)
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not live.with_name(live.name + ".incoming").exists()
+
+
+def test_the_scratch_marker_does_not_reach_the_promoted_cache(tmp_path) -> None:
+    """The token belongs to the transfer, not to the databases Trivy reads."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live, staged_identity=us.dir_identity(staged))
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert not (live / us.SCRATCH_MARKER).exists()
+
+
 def test_an_unswapped_tree_still_promotes(tmp_path) -> None:
     """The check must not refuse the ordinary case it guards."""
     live = tmp_path / "trivy-cache"
