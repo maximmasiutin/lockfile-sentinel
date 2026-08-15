@@ -347,7 +347,12 @@ def _clamd_directive_size(name: str) -> int | None:
 
     CLAMD_CONF names the file directly. Otherwise the Unix locations are tried,
     and on Windows the configuration sits beside the daemon binary, so the one
-    found on PATH points at it."""
+    found on PATH points at it.
+
+    The first readable file answers, whether or not it carries the directive.
+    Searching on would read one ceiling from the operator's configuration and
+    the other from a stale file elsewhere on the host, and a pair of limits
+    from two different daemons describes no daemon at all."""
     for candidate in _clamd_conf_candidates():
         try:
             text = candidate.read_text(encoding="utf-8", errors="ignore")
@@ -357,6 +362,7 @@ def _clamd_directive_size(name: str) -> int | None:
             parts = line.split()
             if len(parts) == 2 and parts[0] == name:
                 return _parse_clamd_size(parts[1])
+        return None
     return None
 
 
