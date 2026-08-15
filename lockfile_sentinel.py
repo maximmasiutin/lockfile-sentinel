@@ -247,7 +247,7 @@ def _wait_for_child(
             _stop_child(process)
             return
         overflow.wait(_CHILD_READ_POLL)
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline and process.poll() is None:
             raise subprocess.TimeoutExpired(command, timeout)
 
 

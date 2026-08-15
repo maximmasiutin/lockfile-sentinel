@@ -384,6 +384,24 @@ def test_bounded_child_timeout_reaps_the_process() -> None:
     assert time.monotonic() - started < 5
 
 
+def test_child_exit_at_deadline_is_not_reported_as_timeout() -> None:
+    """The deadline check observes an exit that followed the loop poll."""
+    class ExitsOnSecondPoll:
+        """A child that exits between the loop and deadline polls."""
+
+        calls = 0
+
+        def poll(self):
+            """Return running once, then exited."""
+            self.calls += 1
+            return None if self.calls == 1 else 0
+
+    ls._wait_for_child(
+        ExitsOnSecondPoll(), ["scanner"], 0,
+        ls.threading.Event(), ls.threading.Event(),
+    )
+
+
 def test_bounded_child_does_not_wait_for_an_inherited_pipe() -> None:
     """A background descendant holding the pipe cannot strand its reader."""
     script = (
