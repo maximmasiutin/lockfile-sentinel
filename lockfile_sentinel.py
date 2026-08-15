@@ -2857,7 +2857,7 @@ def _run_osv_batch(
         _set_failure_cause(failure, "unavailable")
         return None
     except (OSError, subprocess.SubprocessError) as exc:
-        _progress(f"osv-scanner failed to start: {exc}")
+        _progress(f"osv-scanner reached no verdict: {exc}")
         _set_failure_cause(failure, "unavailable")
         return None
     # 128 is "No package sources found", which is not a failure: the file
@@ -2955,9 +2955,8 @@ def _scan_with_isolation(
         return result, {_normalize_path(p) for p in paths}
     if failure.get("cause") == "unavailable":
         # A timeout, spawn failure or unparsable output is systemic, not a
-        # property of one file, so splitting would multiply the outage by an
-        # invocation per lockfile. The whole group is recorded unanswered and
-        # the binary search is reserved for genuine rejections.
+        # property of one file, so splitting would multiply the outage. Output
+        # overflow still splits because smaller batches may fit the limit.
         _progress(f"  no verdict on a group of {len(paths)}, the scanner did not run")
         if outages is not None:
             outages.extend(paths)
@@ -3846,11 +3845,10 @@ def _repo_trivy_coverage(
         reasons.append("binary_not_found")
     elif status.trivy_failed_count:
         state = "partial"
-        reasons.append(
-            "child_output_too_large"
-            if status.trivy_output_too_large_count == status.trivy_failed_count
-            else "trivy_scan_failed"
-        )
+        if status.trivy_output_too_large_count:
+            reasons.append("child_output_too_large")
+        if status.trivy_output_too_large_count < status.trivy_failed_count:
+            reasons.append("trivy_scan_failed")
     elif status.trivy_submitted_count < flagged:
         # Mirrors the layer-level rule: a snapshot written before the Trivy
         # pass must not report a repository's corroboration as done.
@@ -4160,8 +4158,9 @@ def collect_errors(
             "lockfile_unreadable", "file",
             "this lockfile could not be read at submission time", file=path,
         ))
+    oversized_paths = set(osv_run.output_too_large)
     for path in osv_run.unavailable:
-        oversized = path in osv_run.output_too_large
+        oversized = path in oversized_paths
         errors.append(_error(
             "child_output_too_large" if oversized else "osv_scanner_unavailable", "file",
             ("osv-scanner exceeded its output limit"

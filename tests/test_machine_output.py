@@ -392,9 +392,9 @@ def test_bounded_child_does_not_wait_for_an_inherited_pipe() -> None:
         "print('parent done')"
     )
     started = time.monotonic()
-    result = ls._run_bounded([sys.executable, "-c", script], timeout=2)
+    result = ls._run_bounded([sys.executable, "-c", script], timeout=30)
     assert result.stdout.splitlines() == ["parent done"]
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < 4
 
 
 def test_bounded_child_stops_a_continuously_written_inherited_pipe() -> None:
@@ -409,8 +409,8 @@ def test_bounded_child_stops_a_continuously_written_inherited_pipe() -> None:
         f"subprocess.Popen([sys.executable, '-c', {writer!r}])"
     )
     started = time.monotonic()
-    ls._run_bounded([sys.executable, "-c", parent], timeout=2)
-    assert time.monotonic() - started < 2
+    ls._run_bounded([sys.executable, "-c", parent], timeout=30)
+    assert time.monotonic() - started < 4
 
 
 def test_bounded_child_escalates_overflow_before_the_normal_timeout() -> None:
@@ -472,6 +472,20 @@ def test_trivy_output_overflow_is_distinct_from_an_ordinary_failure(monkeypatch)
     errors = ls._repository_errors(status)
     assert status.trivy_output_too_large_count == 1
     assert [error["code"] for error in errors] == ["child_output_too_large"]
+
+
+def test_mixed_trivy_failures_report_both_reason_codes() -> None:
+    """Coverage reasons agree with the repository error records."""
+    status = ls.RepoStatus(name="app", path="/app")
+    status.flagged_lockfiles = {"one", "two"}
+    status.trivy_submitted_count = 2
+    status.trivy_failed_count = 2
+    status.trivy_output_too_large_count = 1
+
+    coverage = ls._repo_trivy_coverage(status, requested=True, available=True)
+    assert coverage["reason_codes"] == [
+        "child_output_too_large", "trivy_scan_failed",
+    ]
 
 
 # --------------------------------------------------------------------------
