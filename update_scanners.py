@@ -148,6 +148,11 @@ MAX_LOG_BYTES = 1024 * 1024
 # and the scanner reports the input as never refreshed.
 OSV_STATE = LOG_DIR / "update-osv-scanner.state.json"
 OVERLAY_STATE = LOG_DIR / "update-malicious-packages.state.json"
+# Which Trivy binary last wrote the promoted databases. NextUpdate stamps know
+# nothing about binaries, so without this record an upgraded Trivy expecting a
+# schema the cache does not carry reads "nothing due" over a cache it cannot
+# use, and the failure surfaces later, in a scan, as an obscure error.
+TRIVY_STATE = LOG_DIR / "update-trivy-db.state.json"
 
 MODULE_PATH = "github.com/google/osv-scanner/v2/cmd/osv-scanner"
 PROXY_LATEST = "https://proxy.golang.org/github.com/google/osv-scanner/v2/@latest"
@@ -1040,12 +1045,19 @@ def parse_stamp(text: str | None) -> datetime | None:
     return parsed
 
 
+TrivyFreshness = dict[str, dict[str, "datetime | int | None"]]
+
+
 def trivy_freshness(trivy: str, env: dict[str, str] | None = None
-                    ) -> dict[str, dict[str, datetime | None]]:
-    """Return {database: {updated, next_update}} as Trivy reports it.
+                    ) -> TrivyFreshness:
+    """Return {database: {updated, next_update, schema}} as Trivy reports it.
 
     An empty result means the state could not be determined, not that the
-    databases are fine; every caller has to treat it that way."""
+    databases are fine; every caller has to treat it that way. `schema` is the
+    metadata's own Version integer, carried through so status can report a
+    cache whose schema the installed binary does not expect; it was read and
+    discarded before, which left status unable to describe the one mismatch
+    the offline, air-gapped case cannot repair by scanning."""
     # The exit code is deliberately ignored: Trivy reports a non-zero code for
     # conditions that still print usable version JSON, and an unparseable body
     # is handled below, so the output is the only thing worth testing.
@@ -1054,15 +1066,33 @@ def trivy_freshness(trivy: str, env: dict[str, str] | None = None
         data = json.loads(out or "{}")
     except json.JSONDecodeError:
         return {}
-    result: dict[str, dict[str, datetime | None]] = {}
+    result: TrivyFreshness = {}
     for key, label in (("VulnerabilityDB", "vulnerability"), ("JavaDB", "java")):
         entry = data.get(key)
         if isinstance(entry, dict):
+            schema = entry.get("Version")
             result[label] = {
                 "updated": parse_stamp(entry.get("UpdatedAt")),
                 "next_update": parse_stamp(entry.get("NextUpdate")),
+                "schema": schema if isinstance(schema, int) else None,
             }
     return result
+
+
+def trivy_binary_version(trivy: str) -> str | None:
+    """The installed Trivy's own version string, or None when it will not say.
+
+    Read from the same `version --format json` answer the freshness comes
+    from, but as a separate call on purpose: freshness is asked about a
+    specific cache through TRIVY_CACHE_DIR, while the binary version is a
+    property of the executable alone."""
+    _code, out = run([trivy, "version", "--format", "json"], timeout=120)
+    try:
+        data = json.loads(out or "{}")
+    except json.JSONDecodeError:
+        return None
+    version = data.get("Version")
+    return version if isinstance(version, str) and version else None
 
 
 def describe_age(when: datetime | None) -> str:
@@ -1079,17 +1109,17 @@ def describe_age(when: datetime | None) -> str:
     return f"{stamp} ({hours / 24:.1f} days ago)"
 
 
-def overdue(freshness: dict[str, dict[str, datetime | None]]) -> list[str]:
+def overdue(freshness: TrivyFreshness) -> list[str]:
     """Return the databases whose NextUpdate is already in the past."""
     now = datetime.now(timezone.utc)
     return [
         label for label, entry in freshness.items()
-        if entry.get("next_update") is not None
-        and entry["next_update"].astimezone(timezone.utc) < now  # type: ignore[union-attr]
+        if isinstance(stamp := entry.get("next_update"), datetime)
+        and stamp.astimezone(timezone.utc) < now
     ]
 
 
-def report_trivy(freshness: dict[str, dict[str, datetime | None]], when: str) -> None:
+def report_trivy(freshness: TrivyFreshness, when: str) -> None:
     """Log the state of each Trivy database."""
     if not freshness:
         log(f"{when}: Trivy reported no database metadata")
@@ -1097,8 +1127,14 @@ def report_trivy(freshness: dict[str, dict[str, datetime | None]], when: str) ->
     stale = set(overdue(freshness))
     for label, entry in freshness.items():
         state = "OVERDUE" if label in stale else "current"
-        log(f"{when}: {label} db {state}, updated {describe_age(entry.get('updated'))}, "
-            f"next due {describe_age(entry.get('next_update'))}")
+        schema = entry.get("schema")
+        suffix = f", schema v{schema}" if schema is not None else ""
+        updated = entry.get("updated")
+        next_due = entry.get("next_update")
+        log(f"{when}: {label} db {state}, "
+            f"updated {describe_age(updated if isinstance(updated, datetime) else None)}, "
+            f"next due {describe_age(next_due if isinstance(next_due, datetime) else None)}"
+            f"{suffix}")
 
 
 def free_bytes(path: Path) -> int | None:
@@ -2066,23 +2102,40 @@ def _download_into_staging(trivy: str, skip_java_db: bool,
     return 0
 
 
-def _trivy_refresh_due(args, before: dict[str, dict[str, datetime | None]],
+def _trivy_refresh_due(force: bool, trivy: str, before: TrivyFreshness,
                        required: list[str]) -> bool:
-    """Whether the download should run at all, logging the reason either way."""
-    undated = [name for name in required
-               if before.get(name, {}).get("next_update") is None]
-    due = [name for name in overdue(before) if name in required]
+    """Whether anything obliges a download, logging the reason either way.
 
-    if args.force:
+    Four grounds, in order of certainty: the operator said so, a database
+    cannot be dated, a database is past its stamp, or the binary that will
+    read the cache is not the one that wrote it. Only when none holds is the
+    skip earned, and the log then names when the next refresh falls due."""
+    if force:
         log("--force given, so the databases are refreshed whether or not they are due")
         return True
+    undated = [name for name in required
+               if before.get(name, {}).get("next_update") is None]
     if undated:
         # A database Trivy cannot date is not evidence of a database that is current.
         log(f"no next-update time for: {', '.join(undated)}; treating that as due, "
             "since a database that cannot be dated is not a database known to be fresh")
         return True
+    due = [name for name in overdue(before) if name in required]
     if due:
         log(f"due now: {', '.join(due)}")
+        return True
+    changed = _trivy_binary_changed(trivy)
+    if changed:
+        # A NextUpdate stamp knows nothing about binaries. Before the skip
+        # existed the download always ran, and an incompatible cache was
+        # replaced as a side effect of running at all; the skip is what makes
+        # the binary worth checking, since an upgraded Trivy expecting a
+        # schema the cache does not carry would otherwise read "nothing due"
+        # over databases it cannot use, and the failure would surface later,
+        # in a scan, as an obscure error. This forces exactly one refresh per
+        # binary change and needs no table of which binary expects which
+        # schema, which is the part that would age badly.
+        log(changed)
         return True
     # `undated` is exactly the required databases whose next_update is None, and
     # it is empty here, so the filter drops nothing. Writing it as a filter rather
@@ -2090,7 +2143,7 @@ def _trivy_refresh_due(args, before: dict[str, dict[str, datetime | None]],
     # turns a relaxed guard above into an error rather than the soonest of a
     # smaller set, which would be a wrong answer reported as a right one.
     stamps = [before[name]["next_update"] for name in required]
-    dated = [stamp for stamp in stamps if stamp is not None]
+    dated = [stamp for stamp in stamps if isinstance(stamp, datetime)]
     if len(dated) != len(stamps):
         missing = [name for name in required if before[name]["next_update"] is None]
         raise RuntimeError(
@@ -2101,6 +2154,26 @@ def _trivy_refresh_due(args, before: dict[str, dict[str, datetime | None]],
     log(f"nothing is due yet, next at {describe_age(soonest)}; skipping the download. "
         "Pass --force to refresh anyway")
     return False
+
+
+def _trivy_binary_changed(trivy: str) -> str | None:
+    """A message when the installed Trivy is not the one that wrote the cache.
+
+    None means no refresh is owed on this ground: the versions match, or the
+    binary will not say its version, in which case a mismatch cannot be
+    claimed. A cache written before this record existed answers with the
+    unrecorded wording; the record is written only by a full refresh, so a
+    --skip-java-db run keeps answering that way until one runs."""
+    installed = trivy_binary_version(trivy)
+    if not installed:
+        return None
+    recorded = str(read_state(TRIVY_STATE).get("trivyVersion") or "")
+    if installed == recorded:
+        return None
+    was = f"trivy {recorded}" if recorded else "a trivy version that was never recorded"
+    return (f"the installed trivy is {installed} but the cached databases were "
+            f"written under {was}; treating them as due, since a newer binary "
+            "can expect a schema the cache does not carry")
 
 
 def target_trivy_db(args) -> int:
@@ -2139,7 +2212,7 @@ def target_trivy_db(args) -> int:
     # in the business of deciding which halves of two caches to interleave; if
     # either required database is due, both are fetched.
     required = ["vulnerability"] if args.skip_java_db else ["vulnerability", "java"]
-    if not _trivy_refresh_due(args, before, required):
+    if not _trivy_refresh_due(args.force, trivy, before, required):
         return 0
 
     # Download into a staging cache, gate it there, and only then put it where
@@ -2201,6 +2274,14 @@ def target_trivy_db(args) -> int:
         except OSError as exc:
             log(f"FAIL: could not promote the gated databases into {live} ({exc})")
             return 1
+
+        # Recorded only on a full refresh: a --skip-java-db run promotes a
+        # carried-forward Java index the installed binary never validated, so
+        # the record keeps naming the binary that wrote it and the next full
+        # run still sees the mismatch. The cost is a re-download of the small
+        # database on each skip run after an upgrade, which is the safe side.
+        if not args.skip_java_db:
+            write_state(TRIVY_STATE, {"trivyVersion": trivy_binary_version(trivy) or ""})
 
     log(f"Trivy databases current, promoted into {live}")
     if leaked:
@@ -2265,20 +2346,6 @@ def _status_offline_db() -> None:
         log(f"offline database: not present ({offline}), online mode is always current")
 
 
-def _status_trivy() -> tuple[bool, bool]:
-    """The Trivy databases' freshness, as (stale, unknown)."""
-    trivy = resolve_trivy()
-    if not trivy:
-        log("trivy: not found")
-        return False, True
-    freshness = trivy_freshness(trivy)
-    report_trivy(freshness, "trivy")
-    # No metadata means the state could not be determined, which is exit 2
-    # rather than a pass. Reading it as "nothing overdue" let a status run
-    # report health for a check that never produced an answer.
-    return bool(overdue(freshness)), not freshness
-
-
 def target_status(_args) -> int:
     """Report the freshness of everything this program maintains.
 
@@ -2292,6 +2359,30 @@ def target_status(_args) -> int:
     if any(unknown for _, unknown in checks):
         return 2
     return 1 if any(stale for stale, _ in checks) else 0
+
+
+def _status_trivy() -> tuple[bool, bool]:
+    """The Trivy half of status: (stale, unknown).
+
+    No metadata means the state could not be determined, which is exit 2
+    rather than a pass: reading it as "nothing overdue" let a status run
+    report health for a check that never produced an answer. The binary
+    version is checked beside the stamps because a schema mismatch is the one
+    staleness the stamps cannot express, and status is where the air-gapped
+    host, the one case an ordinary scan will not quietly repair, gets to find
+    out."""
+    trivy = resolve_trivy()
+    if not trivy:
+        log("trivy: not found")
+        return False, True
+    freshness = trivy_freshness(trivy)
+    report_trivy(freshness, "trivy")
+    stale = bool(overdue(freshness))
+    mismatch = _trivy_binary_changed(trivy)
+    if mismatch:
+        log(f"  {mismatch}")
+        stale = True
+    return stale, not freshness
 
 
 # --------------------------------------------------------------------------
