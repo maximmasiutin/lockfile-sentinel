@@ -803,6 +803,25 @@ def test_a_non_finite_timestamp_in_a_state_file_reads_as_unknown(
     json.loads(json.dumps(doc))
 
 
+def test_an_unrepresentable_timestamp_reads_as_unknown_not_fresh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """1e300 is finite, reads as impossibly fresh, and still overflows
+    fromtimestamp in the human rendering; a negative stamp predates the unix
+    epoch. Both read as unknown, and the human report renders without
+    raising."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    state = tmp_path / "logs" / "update-osv-scanner.state.json"
+    state.parent.mkdir(parents=True)
+    for literal in ("1e300", "-5"):
+        state.write_text(f'{{"lastCheckUnix": {literal}}}', encoding="utf-8")
+        doc = ls.gather_status(tmp_path / "missing.json", osv_bin=None)
+        engine = doc["sources"]["osv_scanner"]
+        assert engine["version_checked_unix"] is None
+        assert engine["state"] == "unknown"
+        assert ls.render_status_human(doc)
+
+
 def test_status_honours_the_output_option(tmp_path: Path, monkeypatch) -> None:
     """A status pipeline that asked for a file and got stdout has silently
     lost its document, so -o writes the status there, atomically, in either

@@ -1803,6 +1803,12 @@ def _overlay_refresh_unix(overlay_file: Path) -> float | None:
         return None
 
 
+# The last unix second datetime.max can represent in UTC, which is the
+# ceiling a stored timestamp must clear to be renderable at all.
+_MAX_UNIX_TIME: float = datetime(
+    9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+
+
 def _as_unix_time(value: Any) -> float | None:
     """A numeric unix time, or None for anything else, booleans included.
 
@@ -1812,12 +1818,18 @@ def _as_unix_time(value: Any) -> float | None:
     non-finite float is refused for the same reason: json.loads accepts NaN
     and Infinity, either of which would classify the source as fresh, crash
     the human rendering in fromtimestamp, and serialize as tokens that are
-    not JSON at all."""
+    not JSON at all. The finite value is then bounded to what a datetime can
+    represent, because 1e300 is finite, reads as impossibly fresh, and still
+    overflows fromtimestamp; a negative value predates the unix epoch and no
+    updater on this stack has run before 1970."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if not math.isfinite(value):
         return None
-    return float(value)
+    stamp = float(value)
+    if stamp < 0 or stamp > _MAX_UNIX_TIME:
+        return None
+    return stamp
 
 
 def _status_overlay(overlay_file: Path) -> dict[str, Any]:
