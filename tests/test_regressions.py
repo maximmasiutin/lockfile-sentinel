@@ -37,9 +37,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import lockfile_sentinel as ls  # noqa: E402
-import schedule_tasks as st  # noqa: E402
-import update_scanners as us  # noqa: E402
+# The path insertion above is what makes these imports resolvable at all, so
+# they cannot precede it; the suppressions state that rather than restructure
+# the project into a package for the tests' sake.
+import lockfile_sentinel as ls  # noqa: E402  pylint: disable=wrong-import-position
+import schedule_tasks as st  # noqa: E402  pylint: disable=wrong-import-position
+import update_scanners as us  # noqa: E402  pylint: disable=wrong-import-position
 
 
 # --------------------------------------------------------------------------
@@ -319,7 +322,10 @@ def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
         failure = kwargs.get("failure")
         if failure is not None:
             failure["cause"] = "unavailable"
-        return None
+        # The stub stands in for a function whose None answer is the case under
+        # test, so the return is the point rather than an accident of falling
+        # off the end.
+        return None  # pylint: disable=useless-return
 
     monkeypatch.setattr(ls, "_run_osv_batch", timed_out)
     code = ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
@@ -1195,6 +1201,7 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
     monkeypatch.setattr(us, "open_https", unreachable)
 
     class Args:
+        """The argparse namespace target_malicious_packages expects, pinned."""
         output = str(overlay)
         source_url = "https://example.invalid/iocs.csv"
         skip_scan = True
@@ -1218,6 +1225,7 @@ def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monk
     monkeypatch.setattr(us, "open_https", must_not_open)
 
     class Args:
+        """The argparse namespace target_malicious_packages expects, pinned."""
         output = str(tmp_path / "overlay.json")
         source_url = ""
         skip_scan = True
@@ -1403,6 +1411,114 @@ def test_a_symlinked_cache_keeps_pointing_where_it_was_aimed(tmp_path) -> None:
     assert (target / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
     assert not live.with_name(live.name + ".previous").exists()
     assert not target.with_name(target.name + ".previous").exists()
+
+
+def test_a_kept_database_survives_a_promotion_that_did_not_stage_it(tmp_path) -> None:
+    """A run that skipped the Java index must not delete the one the cache holds.
+
+    --skip-java-db stages only the vulnerability database, and promotion
+    replaces the whole cache directory, so without the carry the flag that says
+    skip deletes. The carried tree has to arrive byte-identical, since it was
+    never re-downloaded."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+    (live / "java-db").mkdir()
+    (live / "java-db" / "trivy-java.db").write_text("java-old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live, keep=("java-db",))
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert (live / "java-db" / "trivy-java.db").read_text(encoding="utf-8") == "java-old"
+    assert not live.with_name(live.name + ".previous").exists()
+
+
+def test_a_failed_cross_device_copy_leaves_the_previous_cache_live(tmp_path, monkeypatch) -> None:
+    """A copy that dies part-way must not have touched the cache Trivy reads.
+
+    When staging sits on another filesystem the move into place is a copy, and
+    the old code renamed the live cache aside before starting it, so a failure
+    left `live` absent or half written. The copy now lands in an `.incoming`
+    sibling first, so the failure happens while the live cache is still whole."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def die_mid_copy(_src, dst):
+        Path(dst).mkdir()
+        (Path(dst) / "db").mkdir()
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", die_mid_copy)
+
+    with pytest.raises(OSError):
+        us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_failed_final_swap_puts_the_previous_cache_back(tmp_path, monkeypatch) -> None:
+    """The one rename that can strand the cache restores it on failure.
+
+    After the live tree is renamed aside, a failure of the rename into place
+    used to leave nothing at `live` at all. The previous cache is renamed
+    straight back, so Trivy keeps reading the databases it had."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    real_replace = os.replace
+    incoming = live.with_name(live.name + ".incoming")
+
+    def refuse_the_swap_into_place(src, dst, **kwargs):
+        if Path(src) == incoming:
+            raise OSError(13, "Permission denied")
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_swap_into_place)
+
+    with pytest.raises(OSError):
+        us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_the_space_requirement_follows_what_is_staged(tmp_path, monkeypatch) -> None:
+    """A run that stages a tenth the bytes must not demand the full figure.
+
+    The 5 GB requirement priced every run as a full refresh, so a base with
+    ample room for a vulnerability-only download was rejected and the staging
+    fell through to the unchecked system temporary directory."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 1024 ** 3)
+
+    small_need = us.SCRATCH_NEED_BYTES["vulnerability"]
+    assert small_need < 1024 ** 3 < us.SCRATCH_MIN_FREE_BYTES
+
+    with us.scratch_dir("test", near=cache, need=small_need) as scratch:
+        assert scratch.parent == tmp_path, f"fell through to the fallback: {scratch}"
 
 
 def test_a_symlinked_cache_stages_on_the_volume_it_points_at(tmp_path, monkeypatch) -> None:

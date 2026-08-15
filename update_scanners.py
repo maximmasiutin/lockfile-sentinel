@@ -108,14 +108,24 @@ TRIVY_EXE = "trivy.exe" if IS_WINDOWS else "trivy"
 # See scratch_dir for why this is not simply TEMP.
 SCRATCH_BASE = os.environ.get("LOCKFILE_SENTINEL_SCRATCH", "")
 
-# How much room a scratch base has to have before it is worth using. The Java
-# index database is roughly 900 MB compressed and is unpacked beside the archive
-# it arrived in, so the peak is a multiple of the download rather than the
-# download. The figure is measured rather than guessed: the failure this whole
-# mechanism exists for had 2.74 GB free and that was not enough. A base below
-# this is passed over with its figure logged, because finding out by running out
-# of disk costs the download and reports it as an obscure write error.
-SCRATCH_MIN_FREE_BYTES = 5 * 1024 ** 3
+# How much room a scratch base has to have before it is worth using, expressed
+# per database so a run that stages less can require less. The Java index is
+# roughly 900 MB compressed and is unpacked beside the archive it arrived in,
+# so its peak is a multiple of the download rather than the download; the
+# vulnerability database is roughly a tenth its size. The total for a full
+# refresh is measured rather than guessed: the failure this whole mechanism
+# exists for had 2.74 GB free and that was not enough, and the two figures
+# below sum to the 5 GB margin that has proved sufficient since. A base below
+# the requirement is passed over with its figure logged, because finding out by
+# running out of disk costs the download and reports it as an obscure write
+# error. The requirement is derived from what staging will actually hold, not
+# from which flags were passed, so it stays correct if the set of staged
+# databases ever changes for another reason.
+SCRATCH_NEED_BYTES = {
+    "vulnerability": 512 * 1024 ** 2,
+    "java": 4608 * 1024 ** 2,
+}
+SCRATCH_MIN_FREE_BYTES = sum(SCRATCH_NEED_BYTES.values())
 
 
 def cache_dir() -> Path:
@@ -1083,18 +1093,34 @@ def is_inside(path: Path, container: Path) -> bool:
         return True
 
 
-def promote_into(staged: Path, live: Path) -> None:
+def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
     """Replace the live cache with the staged one, keeping the old copy until it lands.
 
     The order matters and is the reason this is a function rather than four lines
-    inline. The live tree is renamed aside first so that a failure leaves a
-    complete cache under `.previous` instead of a half-populated one at `live`,
-    and the old copy is removed only after the staged tree has arrived.
+    inline. The staged tree is brought onto the destination volume first, as an
+    `.incoming` sibling of the cache, because that is the one step that can be a
+    copy rather than a rename: when the scratch sits on another filesystem a
+    move is a file-by-file copy that can fail part-way, and the staging design
+    exists precisely so that a partial tree never stands where Trivy reads. With
+    the copy done while `live` is untouched, everything after it is a rename
+    within one volume, cheap and atomic. The live tree is renamed aside next, so
+    that a failure leaves a complete cache under `.previous` instead of a
+    half-populated one at `live`, and if the final rename into place fails the
+    `.previous` copy is renamed straight back, so `live` is never left absent.
+
+    `keep` names child directories to carry forward from the outgoing cache
+    when the staged tree does not hold them: a run that deliberately skipped a
+    database must not delete the copy the cache already has. The carry is a
+    rename out of `.previous` after the swap, within one volume, so it moves no
+    data; a failure there is logged rather than raised, because the promotion
+    itself has already succeeded and the carried database is re-downloadable.
 
     This assumes the caller has established that `staged` is not inside `live`.
-    If it is, the first rename carries the staged tree away with the cache, the
-    move then names a path that no longer exists, and the run ends with no live
-    cache at all. That is what `is_inside` exists to prevent, at the call site,
+    The `.incoming` step happens to move such a tree out before the cache is
+    renamed aside, but that is an accident of ordering, not a contract: a
+    staged tree inside the cache still means the scratch base was configured
+    into the very directory being replaced, which is a mistake worth refusing.
+    That is what `is_inside` exists to prevent, at the call site,
     where the answer is still useful: a caller that gets True there picks a
     different scratch base and proceeds. Repeating the check here would run
     before the rename and so would prevent the damage, but `is_inside` answers
@@ -1116,11 +1142,42 @@ def promote_into(staged: Path, live: Path) -> None:
     live = live.resolve()
     live.parent.mkdir(parents=True, exist_ok=True)
     previous = live.with_name(live.name + ".previous")
+    incoming = live.with_name(live.name + ".incoming")
+    # A leftover .incoming is a promotion that died between the copy and the
+    # swap on an earlier run; it was never trusted, so it is cleared rather
+    # than adopted.
+    if incoming.exists():
+        shutil.rmtree(incoming)
+    try:
+        # Same volume: a rename, and the except clause never runs. Another
+        # volume: rename fails (EXDEV on POSIX, a not-same-device error on
+        # Windows), and the copy happens here, while the live cache is still
+        # complete and still in place.
+        os.replace(staged, incoming)
+    except OSError:
+        shutil.copytree(staged, incoming)
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():
         os.replace(live, previous)
-    shutil.move(str(staged), str(live))
+    try:
+        os.replace(incoming, live)
+    except OSError:
+        # Put the outgoing cache back before reporting, so a failed swap
+        # leaves the previous good databases where Trivy reads rather than
+        # nothing at all.
+        if previous.exists() and not live.exists():
+            os.replace(previous, live)
+        raise
+    for name in keep:
+        held = previous / name
+        if not held.is_dir() or (live / name).exists():
+            continue
+        try:
+            os.replace(held, live / name)
+        except OSError as exc:
+            log(f"WARNING: could not carry {name} forward from the previous cache "
+                f"({exc}); it will be downloaded again on the next run that needs it")
     shutil.rmtree(previous, ignore_errors=True)
 
 
@@ -1611,7 +1668,8 @@ def report_scratch_privacy(path: Path, sid: str | None) -> None:
 
 
 @contextlib.contextmanager
-def scratch_dir(label: str, near: Path | None = None):
+def scratch_dir(label: str, near: Path | None = None,
+                need: int = SCRATCH_MIN_FREE_BYTES):
     """Yield a private scratch directory on a volume with room, and remove it after.
 
     Trivy stages the Java index database, roughly 900 MB compressed and larger
@@ -1627,10 +1685,12 @@ def scratch_dir(label: str, near: Path | None = None):
     variables for the child process as well, TMPDIR for Unix and TMP and TEMP
     for Windows, since the two platforms read different ones.
 
-    A base is passed over unless it has SCRATCH_MIN_FREE_BYTES to spare, because
-    "a volume with room" is the whole point and is-it-a-directory does not
-    establish it. A base whose free space cannot be read is still used, since
-    the alternative is falling back to the volume already known to be too small.
+    A base is passed over unless it has `need` bytes to spare, because "a
+    volume with room" is the whole point and is-it-a-directory does not
+    establish it. The caller states `need` from what it will actually stage,
+    since a run that downloads less needs less; the default is the full-refresh
+    figure. A base whose free space cannot be read is still used, since the
+    alternative is falling back to the volume already known to be too small.
 
     No drive letter appears anywhere in this resolution. LOCKFILE_SENTINEL_SCRATCH
     wins when set; otherwise the scratch goes beside `near`, the directory the
@@ -1704,9 +1764,9 @@ def scratch_dir(label: str, near: Path | None = None):
                 "promotion and leave no live cache; passing over it")
             continue
         free = free_bytes(path)
-        if free is not None and free < SCRATCH_MIN_FREE_BYTES:
+        if free is not None and free < need:
             log(f"scratch base {value} from {origin} has {describe_free(free)}, under the "
-                f"{SCRATCH_MIN_FREE_BYTES / 1024 ** 3:.0f} GB a database refresh needs; "
+                f"{need / 1024 ** 3:.1f} GB this refresh needs; "
                 "passing over it")
             continue
         base = path
@@ -1833,10 +1893,14 @@ def target_trivy_db(args) -> int:
     # threw the result away as identical. Roughly 1 GB a night, plus 90 s of ClamAV
     # over it.
     #
-    # The decision is all-or-nothing rather than per database, and that is forced by
-    # the promotion step: it replaces the whole cache directory, so a staging cache
-    # holding only the database that was due would drop the other one from the live
-    # cache. If either is due, both are fetched.
+    # The decision is all-or-nothing rather than per database. The promotion
+    # step replaces the whole cache directory, and while it can now carry a
+    # database forward from the outgoing cache, that carry exists for the one
+    # database the operator deliberately excluded with --skip-java-db, where
+    # the alternative was deleting a copy the flag promised to leave alone.
+    # Widening it into a general per-database refresh would put every promotion
+    # in the business of deciding which halves of two caches to interleave; if
+    # either required database is due, both are fetched.
     required = ["vulnerability"] if args.skip_java_db else ["vulnerability", "java"]
     undated = [name for name in required
                if before.get(name, {}).get("next_update") is None]
@@ -1874,7 +1938,13 @@ def target_trivy_db(args) -> int:
     # databases before anything scanned them, so a rejected download was already
     # the copy every later Trivy run consumed, including this scanner's own
     # corroboration pass. Refusing to trust it after the fact changed nothing.
-    with scratch_dir("trivy databases", near=live) as staging:
+    # The space requirement follows what staging will hold, not which flags
+    # were passed: --skip-java-db stages a tenth the bytes, and the carried-
+    # forward Java index is a rename that stages nothing. Deriving the figure
+    # from `required` keeps it correct if that set ever changes for another
+    # reason.
+    need = sum(SCRATCH_NEED_BYTES[name] for name in required)
+    with scratch_dir("trivy databases", near=live, need=need) as staging:
         staged = staging / "cache"
         staged.mkdir(parents=True, exist_ok=True)
         # The temporary directory goes to the same scratch as the staging cache.
@@ -1917,7 +1987,12 @@ def target_trivy_db(args) -> int:
             return 1
 
         try:
-            promote_into(staged, live)
+            # A run that skipped the Java index still owes the cache the copy
+            # it already had: promotion replaces the whole directory, so the
+            # skipped database is named here to be carried forward rather than
+            # silently dropped, which is what --skip-java-db used to do.
+            promote_into(staged, live,
+                         keep=("java-db",) if args.skip_java_db else ())
         except OSError as exc:
             log(f"FAIL: could not promote the gated databases into {live} ({exc})")
             return 1
@@ -2035,7 +2110,8 @@ def main() -> int:
     parser.add_argument("--source-url", default=DATADOG_CSV_URL,
                         help="malicious-packages: the IOC feed to read.")
     parser.add_argument("--skip-java-db", action="store_true",
-                        help="trivy-db: refresh only the vulnerability database.")
+                        help="trivy-db: refresh only the vulnerability database; "
+                             "a cached Java index is left in place.")
     args = parser.parse_args()
 
     if not args.source_dir:

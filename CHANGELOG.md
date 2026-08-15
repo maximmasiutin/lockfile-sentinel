@@ -2,6 +2,14 @@
 
 All notable changes are recorded here. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html), and each release is tagged so a raw file URL can be pinned to it.
 
+## Unreleased
+
+### Fixed
+
+- Trivy database promotion is recoverable across filesystems: the staged cache is brought onto the destination volume as an `.incoming` sibling before the live cache is touched, every step after that copy is an atomic rename, and a failed final swap renames the previous cache straight back, so the live cache is never left absent or half written.
+- `--skip-java-db` no longer deletes the cached Java index: promotion carries a database the run deliberately skipped forward from the outgoing cache by rename, so the flag now costs nothing instead of a re-download on the following run.
+- The scratch free-space requirement is derived from the databases the run will actually stage, so a vulnerability-only refresh no longer demands the full 5 GB and no longer falls through to the unchecked system temporary directory on a base that had ample room.
+
 ## 0.1.0
 
 First public release.
