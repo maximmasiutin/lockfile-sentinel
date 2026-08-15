@@ -92,12 +92,20 @@ def ps_quote(text: str) -> str:
 
 
 def resolve_system_tool(name: str) -> str:
-    """Absolute path to a system executable, or the bare name if PATH has none.
+    """System32 path on Windows, PATH elsewhere, bare name as last resort.
 
-    Passing a bare name to subprocess leaves the resolution to PATH at run time,
-    which is a hijacking surface for a program that is often run elevated. The
-    bare name is kept as the fallback so a host with an unusual layout still
-    works and fails with the tool's own message rather than ours."""
+    shutil.which searches PATH, so on Windows it closes only the
+    current-directory hijack: a PATH entry ahead of System32 is exactly the
+    planting an unprivileged account can arrange against a program that
+    registers tasks elevated, measured with a decoy whoami.exe by the twin
+    resolver in update_scanners.py, which each file carries because both ship
+    alone. The fallback is the bare name, never a PATH search, and on Windows
+    `name` needs its extension since the file test sees no PATHEXT. Elsewhere
+    PATH is the system's own lookup for crontab, so which stands."""
+    if IS_WINDOWS:
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        candidate = Path(root) / "System32" / name
+        return str(candidate) if candidate.is_file() else name
     return shutil.which(name) or name
 
 SCRIPT_DIR = Path(__file__).resolve().parent

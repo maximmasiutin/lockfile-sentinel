@@ -37,9 +37,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import lockfile_sentinel as ls  # noqa: E402
-import schedule_tasks as st  # noqa: E402
-import update_scanners as us  # noqa: E402
+import lockfile_sentinel as ls  # noqa: E402  # pylint: disable=wrong-import-position
+import schedule_tasks as st  # noqa: E402  # pylint: disable=wrong-import-position
+import update_scanners as us  # noqa: E402  # pylint: disable=wrong-import-position
 
 
 # --------------------------------------------------------------------------
@@ -319,7 +319,6 @@ def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
         failure = kwargs.get("failure")
         if failure is not None:
             failure["cause"] = "unavailable"
-        return None
 
     monkeypatch.setattr(ls, "_run_osv_batch", timed_out)
     code = ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
@@ -854,6 +853,46 @@ def test_the_tool_resolver_falls_back_to_the_bare_name_not_to_path(
     assert us.resolve_system_tool("whoami.exe") == "whoami.exe"
 
 
+def test_the_scheduler_resolver_ignores_a_decoy_that_is_first_on_path(
+        tmp_path, monkeypatch) -> None:
+    """schtasks.exe registers the tasks, so its resolver must close the same
+    PATH-planting vector the updater's does. shutil.which, which this helper
+    used, passes every other test and fails this one, and the helper's own
+    docstring named PATH as the surface it closed while consulting it."""
+    system32 = tmp_path / "windows" / "System32"
+    system32.mkdir(parents=True)
+    (system32 / "schtasks.exe").write_bytes(b"")
+    decoy = tmp_path / "planted"
+    decoy.mkdir()
+    (decoy / "schtasks.exe").write_bytes(b"")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "windows"))
+    monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(st, "IS_WINDOWS", True)
+    assert st.resolve_system_tool("schtasks.exe") == str(system32 / "schtasks.exe")
+
+
+def test_the_scheduler_resolver_falls_back_to_the_bare_name_not_to_path(
+        tmp_path, monkeypatch) -> None:
+    """When System32 lacks the file the answer is the bare name, decoy and
+    all: a fallback that searched PATH would be the hijack with an extra
+    step."""
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "windows"))
+    decoy = tmp_path / "planted"
+    decoy.mkdir()
+    (decoy / "schtasks.exe").write_bytes(b"")
+    monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(st, "IS_WINDOWS", True)
+    assert st.resolve_system_tool("schtasks.exe") == "schtasks.exe"
+
+
+def test_the_scheduler_resolver_still_finds_crontab_through_path(monkeypatch) -> None:
+    """Off Windows the system lookup for crontab IS PATH, so which stands and
+    a System32-only resolver would break every cron host."""
+    monkeypatch.setattr(st, "IS_WINDOWS", False)
+    monkeypatch.setattr(st.shutil, "which", lambda _name: "/usr/bin/crontab")
+    assert st.resolve_system_tool("crontab") == "/usr/bin/crontab"
+
+
 def test_an_unreadable_sid_warns_and_still_produces_a_usable_scratch(
         tmp_path, monkeypatch) -> None:
     """The whole path with the real parser in it, rather than stubbed past.
@@ -1195,6 +1234,7 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
     monkeypatch.setattr(us, "open_https", unreachable)
 
     class Args:
+        """The argument surface target_malicious_packages reads."""
         output = str(overlay)
         source_url = "https://example.invalid/iocs.csv"
         skip_scan = True
@@ -1218,6 +1258,7 @@ def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monk
     monkeypatch.setattr(us, "open_https", must_not_open)
 
     class Args:
+        """The argument surface with the source deliberately blank."""
         output = str(tmp_path / "overlay.json")
         source_url = ""
         skip_scan = True
