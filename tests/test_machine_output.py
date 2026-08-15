@@ -358,6 +358,15 @@ def test_bounded_child_kills_output_one_byte_over_the_limit() -> None:
         )
 
 
+def test_bounded_child_rejects_invalid_utf8_stdout() -> None:
+    """Corrupt machine output cannot be repaired into valid JSON."""
+    with pytest.raises(ls.subprocess.SubprocessError, match="valid UTF-8"):
+        ls._run_bounded(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xff')"],
+            timeout=10,
+        )
+
+
 def test_bounded_child_drains_both_pipes_and_keeps_only_stderr_tail() -> None:
     """Full pipes cannot deadlock, and only the diagnostic tail is retained."""
     script = (

@@ -317,7 +317,12 @@ def _run_bounded(
         raise ChildOutputTooLarge(
             f"child stdout exceeded {stdout_limit} bytes"
         )
-    stdout_text = stdout.decode("utf-8", errors="replace")
+    try:
+        stdout_text = stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise subprocess.SubprocessError(
+            "child stdout was not valid UTF-8"
+        ) from exc
     stderr_text = stderr.decode("utf-8", errors="replace")
     if stderr_truncated.is_set():
         stderr_text = "[earlier stderr truncated]\n" + stderr_text
