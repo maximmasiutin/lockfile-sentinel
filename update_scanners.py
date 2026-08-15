@@ -258,6 +258,33 @@ def echo(output: str, prefix: str) -> None:
             log(f"  [{prefix}] {line.rstrip()}")
 
 
+def resolve_system_tool(name: str) -> str:
+    """The System32 path of a Windows utility, or the bare name if it is absent.
+
+    A bare name handed to subprocess is resolved by CreateProcess, which looks
+    in the application directory and the current directory before PATH, so an
+    executable planted in any of the three runs in place of the system copy.
+    This script is meant to run from a scheduled task, often as a more
+    privileged account than the ones that can write to those places, which is
+    what makes the substitution worth someone's while.
+
+    Resolved against %SystemRoot%\\System32 rather than with `shutil.which`,
+    because which searches PATH and therefore closes only the current-directory
+    vector. Measured on Python 3.13 with a decoy whoami.exe: a decoy in the
+    current directory lost to System32, and a decoy first on PATH won. A PATH
+    entry ahead of System32 is exactly the planting an unprivileged account can
+    arrange, so a resolver that consults PATH is a fix that reads as one and is
+    not.
+
+    The bare name is kept as the fallback when the file is not there, so a host
+    with an unusual layout still runs and fails with the tool's own message
+    rather than a fabricated one. `name` therefore needs its extension, since
+    the file test sees no PATHEXT."""
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = Path(root) / "System32" / name
+    return str(candidate) if candidate.is_file() else name
+
+
 # --------------------------------------------------------------------------
 # The ClamAV gate, one implementation for every target.
 # --------------------------------------------------------------------------
@@ -1074,7 +1101,8 @@ def current_user_sid() -> str | None:
     so that the interval between creating and hardening holds no process spawn,
     which means a raise here would abort the run before any directory exists
     rather than leaking one."""
-    code, output = run(["whoami", "/user", "/fo", "csv", "/nh"], timeout=30)
+    code, output = run([resolve_system_tool("whoami.exe"),
+                        "/user", "/fo", "csv", "/nh"], timeout=30)
     if code != 0:
         return None
     # Exit 0 with nothing on stdout is not a contradiction worth trusting: a
@@ -1227,7 +1255,7 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
     # Developer Mode on — which is a developer machine, and this is a developer's
     # tool. On an ordinary directory /L changes nothing.
     code, output = run(
-        ["icacls", str(path), "/L", "/inheritance:r",
+        [resolve_system_tool("icacls.exe"), str(path), "/L", "/inheritance:r",
          "/grant:r", f"*{sid}:(OI)(CI)F",
          "/grant:r", "*S-1-5-18:(OI)(CI)F",
          "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
@@ -1759,9 +1787,10 @@ def target_trivy_db(args) -> int:
 
     # Decide whether there is anything to do, before spending a gigabyte on finding
     # out there was not. The staging cache starts empty, so Trivy has no local copy
-    # to compare against and always concludes it needs to download: on 2026-08-07 it
-    # fetched both databases 2.8 hours before either was due, then threw the result
-    # away as identical. Roughly 1 GB a night, plus 90 s of ClamAV over it.
+    # to compare against and always concludes it needs to download: measured on a
+    # nightly run, it fetched both databases 2.8 hours before either was due, then
+    # threw the result away as identical. Roughly 1 GB a night, plus 90 s of ClamAV
+    # over it.
     #
     # The decision is all-or-nothing rather than per database, and that is forced by
     # the promotion step: it replaces the whole cache directory, so a staging cache
