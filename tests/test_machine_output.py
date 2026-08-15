@@ -249,6 +249,7 @@ def test_the_published_schema_and_example_match_what_the_code_writes() -> None:
     assert example == rendered
     assert set(schema["required"]) <= set(rendered)
     assert set(schema["properties"]["invocation"]["required"]) <= set(rendered["invocation"])
+    assert "source_revision" not in schema["properties"]["invocation"]["required"]
     assert set(schema["$defs"]["repository"]["required"]) <= set(rendered["repositories"][0])
     assert set(schema["$defs"]["finding"]["required"]) <= set(rendered["findings"][0])
     assert set(schema["$defs"]["error"]["required"]) <= set(rendered["errors"][0])

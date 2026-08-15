@@ -30,7 +30,6 @@
         "finished_utc",
         "complete",
         "roots",
-        "source_revision",
         "include_node_modules",
         "requested_layers"
       ],
