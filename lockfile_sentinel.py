@@ -1425,14 +1425,14 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
     whatever age the disk left it. The prose above the return sites is for the
     operator; the word is for the report.
 
-    Refreshes are serialised through an operating-system advisory lock on a
-    file beside the overlay, so two concurrent runs do not both download.
-    The OS releases the lock the moment its holder exits, killed or not,
-    which is why there is no staleness heuristic here: every timestamp-based
-    takeover protocol tried in review had a takeover race one level further
-    down, and the kernel's own lock has none. The lock file itself is inert
-    and stays on disk. The overlay is written to a temporary name and renamed
-    into place, so a reader never sees a half-written table."""
+    Refreshes are serialised through a lock file beside the overlay, held by
+    a mechanism the operating system itself releases the moment the holder
+    exits, killed or not: a non-blocking flock on POSIX, a delete-on-close
+    exclusive create on Windows. That release-on-exit is why there is no
+    staleness heuristic here: every timestamp-based takeover protocol tried
+    in review had a takeover race one level further down. The overlay is
+    written to a temporary name and renamed into place, so a reader never
+    sees a half-written table."""
     if min_interval > 0 and overlay_file.exists():
         age = (time.time() - overlay_file.stat().st_mtime) / 60.0
         if age < min_interval:
@@ -1480,57 +1480,82 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
 
 
 def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> int | None:
-    """Take the OS advisory lock on the lock file, or None when it is held.
+    """Take the refresh lock, or None when another refresh holds it.
 
-    The kernel is the arbiter: the exclusive lock is granted to exactly one
-    open descriptor across processes, and it evaporates when its holder
-    exits, cleanly or not. That is what no timestamp protocol can offer, and
-    why the file itself is opened rather than exclusively created; the file
-    persisting on disk means nothing."""
+    Both mechanisms are released by the operating system the moment their
+    holder exits, killed or not, which is why there is no staleness
+    heuristic here. POSIX takes a non-blocking flock on the lock file.
+    Windows creates the lock file with delete-on-close semantics, so the
+    file exists exactly as long as its holder lives and no other process
+    can open it meanwhile.
+
+    A platform branch is the strongly discouraged exception in this
+    codebase, never a pattern: it survives here only because no single
+    standard-library mechanism is released on kill on every platform, and
+    it is confined to this function so nothing else forks on sys.platform.
+    Any code that can be written once for Linux, Windows and macOS alike
+    must be.
+    """
     try:
         overlay_file.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            return _windows_delete_on_close_lock(lock_file)
         fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
     except OSError as exc:
         _progress(f"could not open the overlay lock ({exc}); using what is on disk")
         return None
-    if _lock_descriptor(fd):
+    if _flock_exclusive(fd):
         return fd
     os.close(fd)
     _progress("another refresh holds the overlay lock; using what is on disk")
     return None
 
 
-def _lock_descriptor(fd: int) -> bool:
-    """Take a non-blocking exclusive OS lock on an open descriptor."""
+def _windows_delete_on_close_lock(lock_file: Path) -> int | None:
+    """Exclusively create the lock file, deleted by the OS when its holder exits.
+
+    getattr rather than os.O_TEMPORARY, because the attribute exists only on
+    Windows and this file must compile and analyse everywhere. A lock file
+    left inert on disk by an earlier version would refuse the exclusive
+    create forever, so stale has to be told apart from held, and the probe
+    is measured rather than assumed: a plain reopen of a held delete-on-close
+    file is refused with permission denied, while a stale ordinary file opens
+    fine and is safe to remove and retry. Remove is never attempted without
+    that successful probe, because Windows does allow deleting the held file."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_TEMPORARY", 0)
     try:
-        if sys.platform == "win32":
-            import msvcrt  # pylint: disable=import-outside-toplevel
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            # fcntl exists only on POSIX, which the sys.platform guard above proves;
-            # the analysis host is Windows, so the import check is disabled here.
-            import fcntl  # pylint: disable=import-outside-toplevel,import-error
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return os.open(str(lock_file), flags)
+    except FileExistsError:
+        pass
+    try:
+        os.close(os.open(str(lock_file), os.O_RDWR))
+        os.remove(str(lock_file))
+        return os.open(str(lock_file), flags)
+    except OSError:
+        _progress("another refresh holds the overlay lock; using what is on disk")
+        return None
+
+
+def _flock_exclusive(fd: int) -> bool:
+    """Take a non-blocking exclusive flock; only the POSIX path calls this.
+
+    The guard repeats the caller's platform test for the analysers, not for
+    the machine: mypy narrows sys.platform and would otherwise reject
+    fcntl's attributes when checking as Windows. fcntl exists only on
+    POSIX, so the import check alone is disabled for a Windows pylint."""
+    if sys.platform == "win32":
+        return False
+    import fcntl  # pylint: disable=import-outside-toplevel,import-error
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
     except OSError:
         return False
 
 
 def _release_overlay_lock(fd: int) -> None:
-    """Release the advisory lock and close the descriptor."""
-    try:
-        if sys.platform == "win32":
-            import msvcrt  # pylint: disable=import-outside-toplevel
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            # fcntl exists only on POSIX, which the sys.platform guard above proves;
-            # the analysis host is Windows, so the import check is disabled here.
-            import fcntl  # pylint: disable=import-outside-toplevel,import-error
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-        pass
+    """Close the descriptor, which is the whole release on every platform:
+    closing drops a flock, and closing a delete-on-close file removes it."""
     try:
         os.close(fd)
     except OSError:
