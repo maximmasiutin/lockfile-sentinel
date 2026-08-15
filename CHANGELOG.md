@@ -22,6 +22,8 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ### Fixed
 
+- Child-tool stdout is now captured concurrently with stderr under explicit memory limits. Oversized JSON terminates the child, fails coverage with `child_output_too_large`, and can never be parsed as zero findings; stderr retains only a bounded diagnostic tail. The implementation creates no temporary files or directories.
+
 - A Trivy binary upgrade now makes the cached databases due regardless of their future `NextUpdate` stamps: the binary version that wrote each promoted cache is recorded, a mismatch forces exactly one refresh, and `status` reports the mismatch as stale, so an air-gapped host learns about a schema the new binary cannot read from the updater instead of from an obscure scan error. The metadata's own schema version is carried through freshness reporting instead of being discarded.
 
 - A refresh with nowhere to stage is refused before the download, exiting 2 with every candidate base and its free-space figure, instead of proceeding into the size-unchecked system temporary directory and dying a gigabyte later on an obscure write error from inside Trivy.
