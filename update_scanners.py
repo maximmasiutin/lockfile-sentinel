@@ -310,7 +310,21 @@ def clamd_max_file_size() -> int | None:
     """Read MaxFileSize from clamd.conf, in bytes, or None when unreadable.
 
     The daemon skips any file above this and reports it clean, so the value is
-    what decides whether clamdscan can honestly be used at all.
+    what decides whether clamdscan can honestly be used at all."""
+    return _clamd_directive_size("MaxFileSize")
+
+
+def clamd_max_scan_size() -> int | None:
+    """Read MaxScanSize from clamd.conf, in bytes, or None when unreadable.
+
+    A separate ceiling on the data scanned per input file, extracted content
+    included. It is not implied by MaxFileSize: the daemon accepts a file
+    under MaxFileSize, stops at MaxScanSize, and still reports it clean."""
+    return _clamd_directive_size("MaxScanSize")
+
+
+def _clamd_directive_size(name: str) -> int | None:
+    """One size directive from clamd.conf, in bytes, or None when unreadable.
 
     CLAMD_CONF names the file directly. Otherwise the Unix locations are tried,
     and on Windows the configuration sits beside the daemon binary, so the one
@@ -322,7 +336,7 @@ def clamd_max_file_size() -> int | None:
             continue
         for line in text.splitlines():
             parts = line.split()
-            if len(parts) == 2 and parts[0] == "MaxFileSize":
+            if len(parts) == 2 and parts[0] == name:
                 return _parse_clamd_size(parts[1])
     return None
 
@@ -376,13 +390,25 @@ def _refuse_oversized(files: list[Path], what: str) -> bool:
 
 def _scan_command(target: Path, largest: int, what: str) -> tuple[list[str], str] | None:
     """The scanner invocation the sizes allow, or None where nothing can read them."""
-    cap = clamd_max_file_size()
+    caps = {"MaxFileSize": clamd_max_file_size(), "MaxScanSize": clamd_max_scan_size()}
+    # Both ceilings, because either one stops the daemon short and neither
+    # implies the other: a file under MaxFileSize whose extracted content
+    # passes MaxScanSize is abandoned mid-scan and still reported clean. The
+    # on-disk size is only a lower bound on what MaxScanSize must allow, so
+    # this narrows the window rather than closing it; a directive that could
+    # not be read leaves the daemon untrusted, as an unknown ceiling is not
+    # a ceiling known to be high enough.
+    unknown = sorted(name for name, cap in caps.items() if cap is None)
+    exceeded = sorted(name for name, cap in caps.items()
+                      if cap is not None and largest > cap)
     clamdscan = resolve_clam("clamdscan")
-    use_daemon = bool(clamdscan) and cap is not None and largest <= cap
+    use_daemon = bool(clamdscan) and not unknown and not exceeded
     if clamdscan and not use_daemon:
-        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB against "
-            f"a clamd MaxFileSize of "
-            f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}")
+        against = ", ".join(
+            f"{name} {'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}"
+            for name, cap in sorted(caps.items()))
+        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB "
+            f"against clamd {against}")
     if use_daemon:
         return ([str(clamdscan), "--multiscan", "--infected", "--no-summary", str(target)],
                 "clamdscan")
