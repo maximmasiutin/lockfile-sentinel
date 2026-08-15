@@ -53,12 +53,13 @@
       "binary": "osv-scanner-not-actually-run",
       "version": null,
       "lockfiles_discovered": 2,
-      "submitted": 0,
+      "submitted": 2,
       "resolved": 2,
       "failed": 0,
+      "unavailable": 0,
       "skipped_empty": 0,
       "skipped_unreadable": 0,
-      "duration_ms": 0
+      "duration_ms": 1200
     },
     "trivy": {
       "requested": false,
@@ -75,11 +76,12 @@
   "inputs": {
     "manifests_discovered": 1,
     "lockfiles_discovered": 2,
-    "lockfiles_submitted": 0,
+    "lockfiles_submitted": 2,
     "lockfiles_resolved": 2,
     "lockfiles_failed": 0,
     "files_read": 2,
-    "files_unreadable": 1
+    "files_unreadable": 1,
+    "dirs_unreadable": 0
   },
   "totals": {
     "repositories": 2,
@@ -100,6 +102,7 @@
         "/t/clean-lib/package-lock.json"
       ],
       "unreadable_files": [],
+      "unreadable_dirs": [],
       "lockfiles": [
         "/t/clean-lib/package-lock.json"
       ],
@@ -108,7 +111,8 @@
         "lockfiles_discovered": 1,
         "files_read": 1,
         "files_unreadable": 0,
-        "lockfiles_unreadable": 0
+        "lockfiles_unreadable": 0,
+        "dirs_unreadable": 0
       },
       "present_versions": {},
       "range_only": {},
@@ -127,7 +131,9 @@
           "readable": 1,
           "submitted": 1,
           "resolved": 1,
-          "failed": 0
+          "empty": 0,
+          "failed": 0,
+          "unavailable": 0
         },
         "trivy": {
           "state": "not_requested",
@@ -155,6 +161,7 @@
       "unreadable_files": [
         "/t/vulnerable-app/package.json"
       ],
+      "unreadable_dirs": [],
       "lockfiles": [
         "/t/vulnerable-app/package-lock.json"
       ],
@@ -163,7 +170,8 @@
         "lockfiles_discovered": 1,
         "files_read": 1,
         "files_unreadable": 1,
-        "lockfiles_unreadable": 0
+        "lockfiles_unreadable": 0,
+        "dirs_unreadable": 0
       },
       "present_versions": {
         "keyv": [
@@ -200,7 +208,9 @@
           "readable": 1,
           "submitted": 1,
           "resolved": 1,
-          "failed": 0
+          "empty": 0,
+          "failed": 0,
+          "unavailable": 0
         },
         "trivy": {
           "state": "not_requested",
@@ -239,7 +249,7 @@
       "trivy_confirmed": []
     },
     {
-      "id": "ce57ae73ed1c2a65",
+      "id": "7327a5891e73c293",
       "kind": "payload_artifact",
       "ecosystem": "npm",
       "package": null,

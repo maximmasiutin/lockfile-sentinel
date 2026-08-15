@@ -18,7 +18,9 @@ as a clean scan, both times because the failure was legible only in prose."""
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -140,14 +142,24 @@ def example_report() -> dict[str, Any]:
     clean.read_files = ["/t/clean-lib/package-lock.json"]
 
     statuses = [vulnerable, clean]
-    layers = _layers(statuses, trivy_requested=False)
+    # The submitted list carries both lockfiles so the example reconciles:
+    # inputs.lockfiles_submitted must equal the sum of the per-repository
+    # coverage.osv.submitted counts, which is the documented invariant.
+    osv_run = ls.OsvRunReport(
+        submitted=[
+            "/t/vulnerable-app/package-lock.json",
+            "/t/clean-lib/package-lock.json",
+        ],
+        duration_ms=1200,
+    )
+    layers = _layers(statuses, trivy_requested=False, osv_run=osv_run)
     return ls.build_report(
         statuses,
         roots=["/t"],
         include_node_modules=False,
         layers=layers,
-        errors=ls.collect_errors(layers, statuses, ls.OsvRunReport()),
-        osv_run=ls.OsvRunReport(),
+        errors=ls.collect_errors(layers, statuses, osv_run),
+        osv_run=osv_run,
         invocation_id=INVOCATION_ID,
         started_utc=STARTED,
         finished_utc=FINISHED,
@@ -179,9 +191,9 @@ def test_the_json_report_is_an_envelope_not_a_bare_array() -> None:
 
 def test_a_snapshot_write_never_claims_to_be_final() -> None:
     """The report is rewritten after every OSV batch, so a killed run leaves
-    valid JSON behind. What made that dangerous was that the snapshot was
-    indistinguishable from a final report; complete false and a null finish
-    stamp are the distinction."""
+    valid JSON behind. A snapshot must be distinguishable from a final report
+    from the file alone: complete false and a null finish stamp are the
+    distinction a consumer checks."""
     report = _report([], complete=False, finished=None)
     assert report["invocation"]["complete"] is False
     assert report["invocation"]["finished_utc"] is None
@@ -306,8 +318,8 @@ def test_an_unreadable_file_makes_the_run_incomplete() -> None:
 
 def test_an_empty_lockfile_counts_as_resolved_not_as_a_gap(tmp_path: Path) -> None:
     """An empty lockfile has nothing to resolve, which is the verdict the
-    scanner itself returns for one submitted alone (exit 128). Counting it as
-    unresolved failed a whole scan over a scaffold file."""
+    scanner itself returns for one submitted alone (exit 128), so it counts
+    as resolved and a scaffold file cannot fail a whole scan."""
     empty = tmp_path / "package-lock.json"
     empty.write_text("", encoding="utf-8")
     run = ls.OsvRunReport()
@@ -464,6 +476,118 @@ def test_refresh_overlay_reports_throttled_when_the_copy_is_fresh(tmp_path: Path
     overlay = tmp_path / "compromised-npm-packages.json"
     overlay.write_text("{}", encoding="utf-8")
     assert ls.refresh_overlay(overlay, min_interval=60) == "throttled"
+
+
+# --------------------------------------------------------------------------
+# Coverage holes the report must not paper over.
+# --------------------------------------------------------------------------
+
+def test_an_unreadable_subtree_is_recorded_and_fails_completeness(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A directory the walk cannot enter hides everything beneath it, so it
+    must surface as incomplete coverage with its own error code rather than
+    read as a clean tree that happened to be small."""
+    locked = tmp_path / "app" / "locked"
+    locked.mkdir(parents=True)
+    (locked / "package-lock.json").write_text("{}", encoding="utf-8")
+    real = ls._list_directory
+
+    def deny(current: Path):
+        return None if current.name == "locked" else real(current)
+
+    monkeypatch.setattr(ls, "_list_directory", deny)
+    statuses, _index = ls.scan_root(tmp_path, include_node_modules=False)
+    status = statuses[tmp_path / "app"]
+    assert status.unreadable_dirs == [str(locked)]
+    assert ls.report_is_complete(_layers([status]), [status]) is False
+    errors = ls.collect_errors(_layers([status]), [status], ls.OsvRunReport())
+    assert any(e["code"] == "directory_unreadable" for e in errors)
+
+
+def test_empty_lockfile_submission_counts_reconcile() -> None:
+    """A vacuously-resolved empty lockfile is inside resolved and outside
+    submitted at both levels, so the run-level and repository-level counts
+    agree instead of contradicting the documented reconciliation rule."""
+    status = _resolved_repo()
+    path = ls._normalize_path(status.lockfiles[0])
+    ls.apply_osv_results({path: status}, {}, {path}, empty_paths={path})
+    coverage = ls._repo_osv_coverage(status, requested=True, available=True)
+    assert coverage["state"] == "completed"
+    assert coverage["resolved"] == 1
+    assert coverage["empty"] == 1
+    assert coverage["submitted"] == 0
+
+
+def test_a_scanner_outage_is_never_reported_as_a_rejected_lockfile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A timeout or spawn failure says nothing about the file in front of the
+    scanner, so it lands in the retryable unavailable bucket, not in failed,
+    and the reason code says the scanner did not answer."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text('{"lockfileVersion": 3}', encoding="utf-8")
+
+    def no_answer(_bin, _paths, _timeout, _debug=False, failure=None):
+        if failure is not None:
+            failure["cause"] = "unavailable"
+        return None
+
+    monkeypatch.setattr(ls, "_run_osv_batch", no_answer)
+    run = ls.OsvRunReport()
+    findings, processed = ls.run_osv_scanner(
+        "osv-scanner-never-invoked", [str(lockfile)], 10, 10, run_report=run
+    )
+    assert not findings
+    assert not processed
+    assert run.unavailable == [str(lockfile)]
+    assert not run.failed
+    layer = ls.osv_layer(True, "osv-scanner-never-invoked", run, 1, 0)
+    assert layer["reason_code"] == "scanner_unavailable"
+    errors = ls.collect_errors(_layers([]), [], run)
+    outage = [e for e in errors if e["code"] == "osv_scanner_unavailable"]
+    assert outage and outage[0]["retryable"] is True
+
+
+def test_repeated_payload_filenames_get_distinct_ids() -> None:
+    """One worm drops the same filename in several directories; two findings
+    sharing an id would deduplicate into one occurrence lost."""
+    status = ls.RepoStatus(name="app", path="/t/app")
+    status.payload_files = [
+        "/t/app/a/bun_environment.js", "/t/app/b/bun_environment.js",
+    ]
+    findings = ls.build_findings([status])
+    assert len(findings) == 2
+    assert findings[0]["id"] != findings[1]["id"]
+
+
+def test_the_tool_version_probe_runs_once_per_binary(monkeypatch) -> None:
+    """The layer objects are rebuilt per snapshot, so an unmemoised probe
+    would spawn a subprocess per OSV batch."""
+    calls: list[object] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        raise OSError("not runnable")
+
+    monkeypatch.setattr(ls.subprocess, "run", fake_run)
+    ls._TOOL_VERSION_CACHE.pop(("probe-once-binary", "v"), None)
+    assert ls._tool_version("probe-once-binary", "v") is None
+    assert ls._tool_version("probe-once-binary", "v") is None
+    assert len(calls) == 1
+
+
+def test_a_stale_lock_is_broken_by_exactly_one_taker(tmp_path: Path) -> None:
+    """Breaking a stale lock is an atomic rename, so of two processes that
+    both observe it, one wins and the other defers instead of unlinking the
+    winner's fresh lock and refreshing concurrently."""
+    overlay = tmp_path / "compromised-npm-packages.json"
+    lock = tmp_path / "compromised-npm-packages.json.lock"
+    lock.write_text("", encoding="utf-8")
+    stale = time.time() - 3600
+    os.utime(lock, (stale, stale))
+    assert ls._acquire_overlay_lock(overlay, lock) is True
+    assert ls._acquire_overlay_lock(overlay, lock) is False
 
 
 # --------------------------------------------------------------------------

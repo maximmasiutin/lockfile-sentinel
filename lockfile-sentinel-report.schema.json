@@ -75,7 +75,8 @@
         "lockfiles_resolved",
         "lockfiles_failed",
         "files_read",
-        "files_unreadable"
+        "files_unreadable",
+        "dirs_unreadable"
       ],
       "additionalProperties": { "type": "integer" }
     },
@@ -136,6 +137,7 @@
         "npm_files",
         "read_files",
         "unreadable_files",
+        "unreadable_dirs",
         "lockfiles",
         "counts",
         "present_versions",
@@ -158,6 +160,11 @@
         "npm_files": { "type": "array", "items": { "type": "string" } },
         "read_files": { "type": "array", "items": { "type": "string" } },
         "unreadable_files": { "type": "array", "items": { "type": "string" } },
+        "unreadable_dirs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Directories the walk could not enumerate. Anything beneath one was never seen, so a non-empty list here is incomplete coverage and the scan exits 2."
+        },
         "lockfiles": { "type": "array", "items": { "type": "string" } },
         "counts": {
           "type": "object",
@@ -166,7 +173,8 @@
             "lockfiles_discovered",
             "files_read",
             "files_unreadable",
-            "lockfiles_unreadable"
+            "lockfiles_unreadable",
+            "dirs_unreadable"
           ],
           "additionalProperties": { "type": "integer" }
         },
@@ -185,15 +193,26 @@
           "properties": {
             "osv": {
               "type": "object",
-              "required": ["state", "reason_codes", "discovered", "readable", "submitted", "resolved", "failed"],
+              "required": ["state", "reason_codes", "discovered", "readable", "submitted", "resolved", "empty", "failed", "unavailable"],
               "properties": {
                 "state": { "$ref": "#/$defs/coverage_state" },
                 "reason_codes": { "type": "array", "items": { "type": "string" } },
                 "discovered": { "type": "integer" },
                 "readable": { "type": "integer" },
-                "submitted": { "type": "integer" },
+                "submitted": {
+                  "type": "integer",
+                  "description": "What was actually handed to the scanner: resolved minus vacuously-resolved empty lockfiles, plus rejected and unanswered ones. Reconciles with the run-level submitted count."
+                },
                 "resolved": { "type": "integer" },
-                "failed": { "type": "integer" }
+                "empty": {
+                  "type": "integer",
+                  "description": "Lockfiles resolved vacuously without a submission, because a file with nothing in it has nothing to resolve."
+                },
+                "failed": { "type": "integer" },
+                "unavailable": {
+                  "type": "integer",
+                  "description": "Lockfiles the scanner never answered on: a timeout, spawn failure or unparsable output, which is a retryable fact about the tooling and never about the file."
+                }
               }
             },
             "trivy": {

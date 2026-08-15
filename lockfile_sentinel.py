@@ -363,6 +363,10 @@ class RepoStatus:
     path: str
     has_npm: bool = False
     npm_files: list[str] = field(default_factory=list)
+    # Directories the walk could not enumerate. Anything beneath one was never
+    # seen, so a repository carrying an entry here is incomplete coverage, not
+    # a clean tree that happened to be small.
+    unreadable_dirs: list[str] = field(default_factory=list)
     # npm_files records what the walk found; these two record whether it yielded
     # anything. unreadable_files covers both halves of that: a manifest whose
     # permissions deny access or which disappeared between enumeration and
@@ -390,6 +394,12 @@ class RepoStatus:
     # object state submitted and resolved as numbers instead of one boolean.
     osv_failed_count: int = 0
     osv_skipped_count: int = 0
+    # Lockfiles the scanner never answered on (timeout, spawn failure,
+    # unparsable output), and lockfiles that were empty and so resolved
+    # vacuously without a submission. Both are needed for the coverage counts
+    # to reconcile: submitted has to mean what was actually handed over.
+    osv_unavailable_count: int = 0
+    osv_empty_count: int = 0
     osv_malicious: dict[str, set[str]] = field(default_factory=dict)
     osv_advisory_ids: dict[str, set[str]] = field(default_factory=dict)
     trivy_checked: bool = False
@@ -867,13 +877,19 @@ def scan_payload_filename(path: Path, status: RepoStatus) -> None:
 
 
 def _walk(
-    root: Path, include_node_modules: bool
+    root: Path, include_node_modules: bool,
+    unreadable_dirs: list[Path] | None = None,
 ) -> WalkTriples:
     """Walk a directory tree, returning (dirpath, dirnames, filenames) triples.
 
     dirnames as returned includes ignored directory names (.git, and
     node_modules when excluded) so callers can still detect them; only the
     traversal itself skips descending into them.
+
+    A directory that cannot be enumerated is recorded in unreadable_dirs
+    rather than skipped in silence: everything beneath it goes unseen, and a
+    scan that cannot say so would report clean coverage over a subtree it
+    never entered.
     """
     results: WalkTriples = []
     stack = [root]
@@ -881,6 +897,8 @@ def _walk(
         current = stack.pop()
         listing = _list_directory(current)
         if listing is None:
+            if unreadable_dirs is not None:
+                unreadable_dirs.append(current)
             continue
         dirnames, filenames = listing
         results.append((current, dirnames, filenames))
@@ -1043,6 +1061,7 @@ def _attribute(
     extra_roots: list[Path],
     statuses: dict[Path, RepoStatus],
     lockfile_index: dict[str, RepoStatus],
+    unreadable_dirs: list[Path] | None = None,
 ) -> None:
     """Charge every file in these triples to the repository that owns it."""
     repo_roots = _find_repo_roots(triples) + list(extra_roots)
@@ -1054,6 +1073,11 @@ def _attribute(
         status = statuses[owner]
         for filename in filenames:
             _attribute_file(dirpath / filename, filename, status, lockfile_index)
+    for unreadable in unreadable_dirs or []:
+        owner = _owner_repo(unreadable, repo_roots, root)
+        if owner not in statuses:
+            statuses[owner] = RepoStatus(name=_repo_label(root, owner), path=str(owner))
+        statuses[owner].unreadable_dirs.append(str(unreadable))
 
 
 def _attribute_file(
@@ -1203,8 +1227,10 @@ def scan_root(
             if progress is not None:
                 progress.advance(_repo_label(root, unit), 0)
             before = len(statuses)
-            triples = _walk(unit, include_node_modules)
-            _attribute(triples, root, extra_roots, statuses, lockfile_index)
+            unreadable_dirs: list[Path] = []
+            triples = _walk(unit, include_node_modules, unreadable_dirs)
+            _attribute(triples, root, extra_roots, statuses, lockfile_index,
+                       unreadable_dirs)
             if progress is not None:
                 progress.advance(_repo_label(root, unit), len(statuses) - before)
         return statuses, lockfile_index
@@ -1274,6 +1300,7 @@ def _merge_statuses(into: StatusesByOwner, other: StatusesByOwner) -> None:
             continue
         dst.has_npm = dst.has_npm or src.has_npm
         dst.npm_files.extend(src.npm_files)
+        dst.unreadable_dirs.extend(src.unreadable_dirs)
         dst.read_files.extend(src.read_files)
         dst.unreadable_files.extend(src.unreadable_files)
         dst.lockfiles.extend(src.lockfiles)
@@ -1293,8 +1320,9 @@ def _scan_unit(
     """Walk and attribute one top-level unit into maps of its own."""
     statuses: dict[Path, RepoStatus] = {}
     lockfile_index: dict[str, RepoStatus] = {}
-    triples = _walk(unit, include_node_modules)
-    _attribute(triples, root, extra_roots, statuses, lockfile_index)
+    unreadable_dirs: list[Path] = []
+    triples = _walk(unit, include_node_modules, unreadable_dirs)
+    _attribute(triples, root, extra_roots, statuses, lockfile_index, unreadable_dirs)
     return statuses, lockfile_index
 
 
@@ -1459,8 +1487,21 @@ def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> bool:
         _progress("another refresh holds the overlay lock; using what is on disk")
         return False
     _progress("breaking an overlay lock older than fifteen minutes")
+    # The break is an atomic rename rather than an unlink, because two
+    # processes can both observe the same stale lock: with unlink, the loser
+    # would remove the winner's fresh lock and both would refresh at once.
+    # Only one rename of the same file can succeed, and the winner still has
+    # to win the exclusive create afterwards.
+    claimed = lock_file.with_name(f"{lock_file.name}.stale-{os.getpid()}")
     try:
-        lock_file.unlink()
+        os.replace(lock_file, claimed)
+    except OSError:
+        return False
+    try:
+        claimed.unlink()
+    except OSError:
+        pass
+    try:
         os.close(os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         return True
     except OSError:
@@ -2465,6 +2506,7 @@ def _report_osv_rejection(
 def _scan_with_isolation(
     osv_bin: str, paths: list[str], timeout: int,
     debug: bool = False, failures: list[str] | None = None,
+    outages: list[str] | None = None,
 ) -> tuple[dict[str, list[tuple[str, str, set[str]]]], set[str]]:
     """Scan the given lockfiles, isolating any bad file by binary search.
 
@@ -2473,25 +2515,43 @@ def _scan_with_isolation(
     isolated in O(log n) re-runs rather than the O(n) of a per-file retry,
     while every healthy file in the group is still scanned. Returns (malicious
     hits per lockfile, set of paths that were successfully scanned)."""
-    result = _run_osv_batch(osv_bin, paths, timeout, debug)
+    failure: dict[str, str] = {}
+    result = _run_osv_batch(osv_bin, paths, timeout, debug, failure=failure)
     if result is not None:
         return result, {_normalize_path(p) for p in paths}
     if len(paths) == 1:
-        # The end of the binary search, and the only place the offending file is
-        # known. Say which file and why, or the whole cascade above reads as an
-        # unexplained failure and the same question gets asked next run.
-        _progress(f"  unrecoverable, skipped: {paths[0]}")
-        _progress(f"    reason: {_describe_lockfile(paths[0])}")
-        for line in _verbose_lockfile_dump(paths[0]):
-            _progress(line)
-        if failures is not None:
-            failures.append(paths[0])
+        _record_isolated_failure(paths[0], failure, failures, outages)
         return {}, set()
     mid = len(paths) // 2
     _progress(f"  splitting failed group of {len(paths)} into {mid} + {len(paths) - mid}")
-    left_findings, left_ok = _scan_with_isolation(osv_bin, paths[:mid], timeout, debug, failures)
-    right_findings, right_ok = _scan_with_isolation(osv_bin, paths[mid:], timeout, debug, failures)
+    left_findings, left_ok = _scan_with_isolation(
+        osv_bin, paths[:mid], timeout, debug, failures, outages)
+    right_findings, right_ok = _scan_with_isolation(
+        osv_bin, paths[mid:], timeout, debug, failures, outages)
     return {**left_findings, **right_findings}, left_ok | right_ok
+
+
+def _record_isolated_failure(
+    path: str, failure: dict[str, str],
+    failures: list[str] | None, outages: list[str] | None,
+) -> None:
+    """The end of the binary search, and the only place the offending file is
+    known. A rejection is explained in full, because the cascade above reads
+    as an unexplained failure otherwise and the same question gets asked next
+    run. A scanner that never answered is recorded as an outage instead:
+    nothing is known about the file, and dumping its bytes as though it were
+    the suspect would send the reader after the wrong thing."""
+    if failure.get("cause") == "unavailable":
+        _progress(f"  no verdict, the scanner did not run against: {path}")
+        if outages is not None:
+            outages.append(path)
+        return
+    _progress(f"  unrecoverable, skipped: {path}")
+    _progress(f"    reason: {_describe_lockfile(path)}")
+    for line in _verbose_lockfile_dump(path):
+        _progress(line)
+    if failures is not None:
+        failures.append(path)
 
 
 @dataclass
@@ -2505,6 +2565,12 @@ class OsvRunReport:
 
     submitted: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    # Paths on which the scanner never reached a verdict: a timeout, a spawn
+    # failure or unparsable output. A rejected lockfile is a fact about the
+    # file; these are facts about the tooling, retryable and reported as such,
+    # because sending the operator to repair a sound lockfile is the exact
+    # misdirection the split exists to prevent.
+    unavailable: list[str] = field(default_factory=list)
     skipped_empty: list[str] = field(default_factory=list)
     skipped_unreadable: list[str] = field(default_factory=list)
     duration_ms: int = 0
@@ -2542,6 +2608,7 @@ def run_osv_scanner(
 
     batches = _chunked(lockfile_paths, batch_size)
     failures: list[str] = []
+    outages: list[str] = []
 
     # The OSV pass is where the wall clock goes, and it is the one phase whose
     # size is known in advance, so it is the phase worth tracking. Counting
@@ -2552,7 +2619,7 @@ def run_osv_scanner(
     for batch_num, batch in enumerate(batches, start=1):
         _progress(f"osv-scanner batch {batch_num}/{len(batches)}: {len(batch)} lockfile(s)...")
         batch_findings, batch_ok = _scan_with_isolation(
-            osv_bin, batch, timeout, debug, failures
+            osv_bin, batch, timeout, debug, failures, outages
         )
         combined.update(batch_findings)
         processed.update(batch_ok)
@@ -2568,6 +2635,7 @@ def run_osv_scanner(
         _write_failure_list(failures)
     if run_report is not None:
         run_report.failed.extend(failures)
+        run_report.unavailable.extend(outages)
         run_report.duration_ms = int((time.monotonic() - started) * 1000)
     return combined, processed
 
@@ -2624,6 +2692,8 @@ def apply_osv_results(
     processed_paths: set[str],
     failed_paths: frozenset[str] | set[str] = frozenset(),
     skipped_paths: frozenset[str] | set[str] = frozenset(),
+    unavailable_paths: frozenset[str] | set[str] = frozenset(),
+    empty_paths: frozenset[str] | set[str] = frozenset(),
 ) -> None:
     """Attach OSV-Scanner malicious-package hits back onto their owning repo,
     and mark osv_checked only for repos whose lockfiles were all actually,
@@ -2641,6 +2711,8 @@ def apply_osv_results(
         status.osv_resolved_count = sum(1 for p in owned if p in processed_paths)
         status.osv_failed_count = sum(1 for p in owned if p in failed_paths)
         status.osv_skipped_count = sum(1 for p in owned if p in skipped_paths)
+        status.osv_unavailable_count = sum(1 for p in owned if p in unavailable_paths)
+        status.osv_empty_count = sum(1 for p in owned if p in empty_paths)
         status.osv_checked = bool(owned) and status.osv_resolved_count == len(owned)
     for normalized_path, hits in osv_findings.items():
         found = lockfile_index.get(normalized_path)
@@ -2880,6 +2952,11 @@ def _scanned_lines(status: RepoStatus) -> list[str]:
         lines.append(
             "  found but unreadable: "
             f"{', '.join(_repo_relative(root, status.unreadable_files))}"
+        )
+    if status.unreadable_dirs:
+        lines.append(
+            "  directories that could not be entered (nothing beneath them was "
+            f"seen): {', '.join(_repo_relative(root, status.unreadable_dirs))}"
         )
     return lines
 
@@ -3195,14 +3272,18 @@ def _tool_version(binary: str | None, pattern: str) -> str | None:
         return None
     if (binary, pattern) in _TOOL_VERSION_CACHE:
         return _TOOL_VERSION_CACHE[(binary, pattern)]
+    version: str | None = None
     try:
         out = subprocess.run(  # nosec B603
             [binary, "--version"], capture_output=True, text=True, timeout=60, check=False
         )
     except (OSError, subprocess.SubprocessError):
-        return None
-    match = re.search(pattern, out.stdout + out.stderr)
-    return match.group(1) if match else None
+        out = None
+    if out is not None:
+        match = re.search(pattern, out.stdout + out.stderr)
+        version = match.group(1) if match else None
+    _TOOL_VERSION_CACHE[(binary, pattern)] = version
+    return version
 
 
 def _osv_version(osv_bin: str | None) -> str | None:
@@ -3239,7 +3320,13 @@ def _repo_osv_coverage(
     )
     resolved = status.osv_resolved_count
     failed = status.osv_failed_count
-    submitted = resolved + failed
+    unavailable = status.osv_unavailable_count
+    empty = status.osv_empty_count
+    # An empty lockfile resolves vacuously without ever being handed to the
+    # scanner, so it is inside resolved and outside submitted; submitted has
+    # to mean what actually crossed the process boundary or the counts here
+    # stop reconciling with the run-level ones.
+    submitted = resolved - empty + failed + unavailable
     reasons: list[str] = []
     if not requested:
         state = "not_requested"
@@ -3254,7 +3341,9 @@ def _repo_osv_coverage(
         state = "partial" if resolved else "failed"
         if failed:
             reasons.append("scanner_rejected_lockfile")
-        if submitted < discovered:
+        if unavailable:
+            reasons.append("scanner_unavailable")
+        if resolved + failed + unavailable < discovered:
             reasons.append("lockfile_not_submitted")
     return {
         "state": state,
@@ -3263,7 +3352,9 @@ def _repo_osv_coverage(
         "readable": discovered - unreadable,
         "submitted": submitted,
         "resolved": resolved,
+        "empty": empty,
         "failed": failed,
+        "unavailable": unavailable,
     }
 
 
@@ -3328,6 +3419,7 @@ def osv_layer(requested: bool, osv_bin: str | None,
         "submitted": len(run.submitted),
         "resolved": resolved,
         "failed": len(run.failed),
+        "unavailable": len(run.unavailable),
         "skipped_empty": len(run.skipped_empty),
         "skipped_unreadable": len(run.skipped_unreadable),
         "duration_ms": run.duration_ms,
@@ -3343,8 +3435,12 @@ def osv_layer(requested: bool, osv_bin: str | None,
         layer["state"] = "completed"
     else:
         layer["state"] = "partial" if resolved else "failed"
-        layer["reason_code"] = ("scanner_rejected_lockfile" if run.failed
-                                else "lockfile_not_submitted")
+        if run.failed:
+            layer["reason_code"] = "scanner_rejected_lockfile"
+        elif run.unavailable:
+            layer["reason_code"] = "scanner_unavailable"
+        else:
+            layer["reason_code"] = "lockfile_not_submitted"
     return layer
 
 
@@ -3476,8 +3572,12 @@ def _payload_findings(status: RepoStatus) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for payload in sorted(status.payload_files):
         artifact = os.path.basename(payload)
+        relative = _relative_posix(status.path, payload)
         findings.append({
-            "id": _finding_id(status.path, "payload_artifact", artifact, "", ""),
+            # The relative path joins the identity, because one worm drops the
+            # same filename in several directories and two findings sharing an
+            # id would deduplicate into one occurrence lost.
+            "id": _finding_id(status.path, "payload_artifact", artifact, relative, ""),
             "kind": "payload_artifact",
             "ecosystem": "npm",
             "package": None,
@@ -3486,7 +3586,7 @@ def _payload_findings(status: RepoStatus) -> list[dict[str, Any]]:
             "artifact": artifact,
             "repository": status.name,
             "repository_path": status.path,
-            "source_files": [_relative_posix(status.path, payload)],
+            "source_files": [relative],
             "advisories": [],
             "detection_layers": ["offline_table"],
             # The payload filenames are the worm's own, so the campaign tag
@@ -3543,6 +3643,13 @@ def collect_errors(
             "lockfile_unreadable", "file",
             "this lockfile could not be read at submission time", file=path,
         ))
+    for path in osv_run.unavailable:
+        errors.append(_error(
+            "osv_scanner_unavailable", "file",
+            "osv-scanner never reached a verdict here (timeout, spawn failure "
+            "or unparsable output); the lockfile itself may be sound",
+            file=path, retryable=True,
+        ))
     for status in sorted(statuses, key=lambda s: s.name.lower()):
         errors.extend(_repository_errors(status))
     if len(errors) > _ERROR_LIMIT:
@@ -3558,6 +3665,12 @@ def collect_errors(
 def _repository_errors(status: RepoStatus) -> list[dict[str, Any]]:
     """One repository's structured errors: unreadable files, Trivy failures."""
     errors: list[dict[str, Any]] = []
+    for path in sorted(status.unreadable_dirs):
+        errors.append(_error(
+            "directory_unreadable", "file",
+            "could not be enumerated; anything beneath it was never seen",
+            repository=status.name, file=path,
+        ))
     for path in sorted(status.unreadable_files):
         code = ("manifest_unreadable"
                 if os.path.basename(path) == MANIFEST_NAME
@@ -3591,6 +3704,7 @@ def repo_to_dict(status: RepoStatus, osv_requested: bool, osv_available: bool,
         # on its own rather than letting it forge a field.
         "read_files": status.read_files,
         "unreadable_files": status.unreadable_files,
+        "unreadable_dirs": status.unreadable_dirs,
         "lockfiles": status.lockfiles,
         "counts": {
             "manifests_discovered": sum(
@@ -3600,6 +3714,7 @@ def repo_to_dict(status: RepoStatus, osv_requested: bool, osv_available: bool,
             "files_read": len(status.read_files),
             "files_unreadable": len(status.unreadable_files),
             "lockfiles_unreadable": lockfile_unreadable,
+            "dirs_unreadable": len(status.unreadable_dirs),
         },
         "present_versions": {k: sorted(v) for k, v in status.present_versions.items()},
         "range_only": {k: sorted(v) for k, v in status.range_only.items()},
@@ -3674,6 +3789,7 @@ def build_report(
             "lockfiles_failed": len(osv_run.failed),
             "files_read": sum(len(s.read_files) for s in statuses),
             "files_unreadable": sum(len(s.unreadable_files) for s in statuses),
+            "dirs_unreadable": sum(len(s.unreadable_dirs) for s in statuses),
         },
         "totals": {
             "repositories": len(statuses),
@@ -3700,7 +3816,7 @@ def report_is_complete(layers: dict[str, dict[str, Any]],
         if layer.get("requested") and layer.get("state") not in ("completed",):
             return False
     for status in statuses:
-        if status.unreadable_files:
+        if status.unreadable_files or status.unreadable_dirs:
             return False
         if status.lockfiles and not status.osv_checked \
                 and layers.get("osv", {}).get("requested"):
@@ -4168,6 +4284,10 @@ class _Sweep:
             failed_paths={_normalize_path(p) for p in self.osv_run.failed},
             skipped_paths={_normalize_path(p)
                            for p in self.osv_run.skipped_unreadable},
+            unavailable_paths={_normalize_path(p)
+                               for p in self.osv_run.unavailable},
+            empty_paths={_normalize_path(p)
+                         for p in self.osv_run.skipped_empty},
         )
 
     def run_trivy_layer(self) -> None:
