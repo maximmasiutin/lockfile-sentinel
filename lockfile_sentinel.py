@@ -103,6 +103,7 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterable
@@ -156,6 +157,39 @@ type WalkTriples = list[tuple[Path, list[str], list[str]]]
 type StatusesByOwner = dict[Path, "RepoStatus"]
 type LockfileIndex = dict[str, "RepoStatus"]
 
+
+
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect that leaves https.
+
+    Every URL this program fetches is https, but a redirect is the server's
+    choice, not the caller's: a compromised or spoofed endpoint answering 301
+    with an http:// location would downgrade the fetch to cleartext and hand
+    the overlay or an advisory to whoever sits on the path. The same hole was
+    found and closed in update_scanners.py; this file is standalone by design,
+    so it carries its own copy."""
+
+    def redirect_request(
+        self, req: urllib.request.Request, fp: Any, code: int, msg: str,
+        headers: Any, newurl: str,
+    ) -> urllib.request.Request | None:
+        if not newurl.lower().startswith("https://"):
+            raise urllib.error.HTTPError(
+                newurl, code, "redirect to a non-https URL refused", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_https(request: urllib.request.Request, timeout: int) -> Any:
+    """Open one https request through the downgrade-refusing opener.
+
+    The opener is built per call rather than kept at module level, so a test
+    that stubs the network stubs one seam and a run pays three builds at
+    most: the overlay refresh, an advisory fetch, and the live check."""
+    if not request.full_url.lower().startswith("https://"):
+        raise ValueError(f"refusing to fetch a non-https URL: {request.full_url}")
+    opener = urllib.request.build_opener(_HttpsOnlyRedirects)
+    return opener.open(request, timeout=timeout)  # nosec B310
 
 
 def format_elapsed(seconds: float) -> str:
@@ -1374,7 +1408,7 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
             request = urllib.request.Request(
                 IOC_FEED_URL, headers={"User-Agent": f"lockfile-sentinel/{__version__}"}
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            with _open_https(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8", errors="replace")
             packages = _parse_ioc_csv(body)
         # A stale overlay beats no scan, so any fetch failure degrades quietly.
@@ -1634,7 +1668,7 @@ def _live_check(timeout: int = 10) -> dict[str, Any]:
             "https://api.osv.dev/v1/vulns/MAL-2025-21003",
             headers={"User-Agent": f"lockfile-sentinel/{__version__}"},
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+        with _open_https(request, timeout=timeout) as response:
             response.read(64)
     # The failure is the finding here, so every exception becomes the answer.
     except Exception as exc:  # noqa: BLE001
@@ -2677,7 +2711,7 @@ def fetch_advisory(advisory_id: str, timeout: int = 20) -> dict:
             f"https://api.osv.dev/v1/vulns/{advisory_id}",
             headers={"User-Agent": f"lockfile-sentinel/{__version__}"},
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+        with _open_https(request, timeout=timeout) as response:
             record = json.loads(response.read().decode("utf-8"))
     # Naming is an aid, never a gate, so any failure leaves the record empty.
     except Exception:  # noqa: BLE001

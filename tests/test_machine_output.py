@@ -438,10 +438,24 @@ def test_refresh_overlay_respects_a_live_lock(tmp_path: Path, monkeypatch) -> No
     def explode(*_args, **_kwargs):
         raise AssertionError("the locked path must not fetch")
 
-    monkeypatch.setattr(ls.urllib.request, "urlopen", explode)
+    monkeypatch.setattr(ls, "_open_https", explode)
     overlay = tmp_path / "compromised-npm-packages.json"
     (tmp_path / "compromised-npm-packages.json.lock").write_text("", encoding="utf-8")
     assert ls.refresh_overlay(overlay, min_interval=0) == "locked"
+
+
+def test_fetches_refuse_plain_http_and_downgrade_redirects() -> None:
+    """Every URL this program fetches is https, and a server's redirect must
+    not be able to quietly change that: a 301 to http:// would hand the
+    overlay or an advisory to whoever sits on the path."""
+    with pytest.raises(ValueError):
+        ls._open_https(ls.urllib.request.Request("http://example.invalid/x"), timeout=1)
+    handler = ls._HttpsOnlyRedirects()
+    with pytest.raises(ls.urllib.error.HTTPError):
+        handler.redirect_request(
+            ls.urllib.request.Request("https://example.invalid/x"),
+            None, 301, "Moved Permanently", {}, "http://example.invalid/y",
+        )
 
 
 def test_refresh_overlay_reports_throttled_when_the_copy_is_fresh(tmp_path: Path) -> None:
@@ -518,7 +532,7 @@ def test_status_makes_no_network_request_unless_asked(
     def explode(*_args, **_kwargs):
         raise AssertionError("plain status mode must not touch the network")
 
-    monkeypatch.setattr(ls.urllib.request, "urlopen", explode)
+    monkeypatch.setattr(ls, "_open_https", explode)
     monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
     doc = ls.gather_status(tmp_path / "missing.json", osv_bin=None)
     assert doc["sources"]["osv_live"]["live_check"] is None
@@ -531,7 +545,7 @@ def test_an_unreachable_live_check_is_unknown_not_fresh(
     def unreachable(*_args, **_kwargs):
         raise OSError("no route")
 
-    monkeypatch.setattr(ls.urllib.request, "urlopen", unreachable)
+    monkeypatch.setattr(ls, "_open_https", unreachable)
     monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
     doc = ls.gather_status(tmp_path / "missing.json", osv_bin=None, check_live=True)
     live = doc["sources"]["osv_live"]
