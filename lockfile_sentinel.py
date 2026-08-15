@@ -154,6 +154,7 @@ def _read_child_stream(
     limit: _CaptureLimit,
     overflow: threading.Event,
     truncated: threading.Event,
+    read_failed: threading.Event,
     process: subprocess.Popen[bytes],
 ) -> None:
     """Drain one pipe while retaining no more than its declared byte limit."""
@@ -178,7 +179,7 @@ def _read_child_stream(
         # The coordinator closes a pipe only when a child or descendant kept it
         # open after termination. The process result remains the authoritative
         # failure; a close used to unblock this reader is not a second one.
-        pass
+        read_failed.set()
 
 
 def _stop_child(process: subprocess.Popen[bytes]) -> None:
@@ -214,17 +215,18 @@ def _run_bounded(
     stderr = bytearray()
     overflow = threading.Event()
     stderr_truncated = threading.Event()
+    read_failed = threading.Event()
     readers = (
         threading.Thread(
             target=_read_child_stream,
             args=(process.stdout, stdout, _CaptureLimit(stdout_limit), overflow,
-                  threading.Event(), process),
+                  threading.Event(), read_failed, process),
             daemon=True,
         ),
         threading.Thread(
             target=_read_child_stream,
             args=(process.stderr, stderr, _CaptureLimit(stderr_limit, True),
-                  threading.Event(), stderr_truncated, process),
+                  threading.Event(), stderr_truncated, read_failed, process),
             daemon=True,
         ),
     )
@@ -248,6 +250,8 @@ def _run_bounded(
 
     if any(reader.is_alive() for reader in readers):
         raise subprocess.SubprocessError("child output pipes did not close")
+    if read_failed.is_set():
+        raise subprocess.SubprocessError("could not read complete child output")
     if overflow.is_set():
         raise ChildOutputTooLarge(
             f"child stdout exceeded {stdout_limit} bytes"
