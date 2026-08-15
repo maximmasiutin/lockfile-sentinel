@@ -337,6 +337,185 @@ def test_an_empty_lockfile_counts_as_resolved_not_as_a_gap(tmp_path: Path) -> No
 
 
 # --------------------------------------------------------------------------
+# Child output: bounded in memory, with no temporary pathname lifecycle.
+# --------------------------------------------------------------------------
+
+def test_bounded_child_accepts_the_exact_stdout_limit() -> None:
+    """The limit is inclusive, so a valid document at the boundary survives."""
+    result = ls._run_bounded(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 16)"],
+        timeout=10, stdout_limit=16,
+    )
+    assert result.stdout == "x" * 16
+
+
+def test_bounded_child_kills_output_one_byte_over_the_limit() -> None:
+    """One byte beyond the contract fails instead of being silently cut."""
+    with pytest.raises(ls.ChildOutputTooLarge):
+        ls._run_bounded(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 17)"],
+            timeout=10, stdout_limit=16,
+        )
+
+
+def test_bounded_child_rejects_invalid_utf8_stdout() -> None:
+    """Corrupt machine output cannot be repaired into valid JSON."""
+    with pytest.raises(ls.subprocess.SubprocessError, match="valid UTF-8"):
+        ls._run_bounded(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xff')"],
+            timeout=10,
+        )
+
+
+def test_bounded_child_drains_both_pipes_and_keeps_only_stderr_tail() -> None:
+    """Full pipes cannot deadlock, and only the diagnostic tail is retained."""
+    script = (
+        "import sys, threading; "
+        "a=threading.Thread(target=lambda:sys.stdout.buffer.write(b'o'*2000000)); "
+        "b=threading.Thread(target=lambda:sys.stderr.buffer.write(b'e'*2000000)); "
+        "a.start(); b.start(); a.join(); b.join()"
+    )
+    result = ls._run_bounded(
+        [sys.executable, "-c", script], timeout=10,
+        stdout_limit=2_000_000, stderr_limit=16,
+    )
+    assert len(result.stdout) == 2_000_000
+    assert result.stderr == "[earlier stderr truncated]\n" + "e" * 16
+
+
+def test_bounded_child_timeout_reaps_the_process() -> None:
+    """A silent child cannot outlive the timeout path."""
+    started = time.monotonic()
+    with pytest.raises(ls.subprocess.TimeoutExpired):
+        ls._run_bounded(
+            [sys.executable, "-c", "import time; time.sleep(60)"], timeout=1,
+        )
+    assert time.monotonic() - started < 5
+
+
+def test_child_exit_at_deadline_is_not_reported_as_timeout() -> None:
+    """The deadline check observes an exit that followed the loop poll."""
+    class ExitsOnSecondPoll:
+        """A child that exits between the loop and deadline polls."""
+
+        calls = 0
+
+        def poll(self):
+            """Return running once, then exited."""
+            self.calls += 1
+            return None if self.calls == 1 else 0
+
+    ls._wait_for_child(
+        ExitsOnSecondPoll(), ["scanner"], 0,
+        ls.threading.Event(), ls.threading.Event(),
+    )
+
+
+def test_bounded_child_does_not_wait_for_an_inherited_pipe() -> None:
+    """A background descendant holding the pipe cannot strand its reader."""
+    script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)']); "
+        "print('parent done')"
+    )
+    started = time.monotonic()
+    result = ls._run_bounded([sys.executable, "-c", script], timeout=30)
+    assert result.stdout.splitlines() == ["parent done"]
+    assert time.monotonic() - started < 4
+
+
+def test_bounded_child_stops_a_continuously_written_inherited_pipe() -> None:
+    """The post-parent deadline applies even while a descendant keeps writing."""
+    writer = (
+        "import sys, time; "
+        "[(sys.stdout.buffer.write(b'x'*4096), sys.stdout.buffer.flush(), "
+        "time.sleep(.001)) for _ in range(5000)]"
+    )
+    parent = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {writer!r}])"
+    )
+    started = time.monotonic()
+    ls._run_bounded([sys.executable, "-c", parent], timeout=30)
+    assert time.monotonic() - started < 4
+
+
+def test_bounded_child_escalates_overflow_before_the_normal_timeout() -> None:
+    """A child ignoring graceful termination is killed on overflow promptly."""
+    script = (
+        "import signal, sys; "
+        "signal.signal(signal.SIGTERM, lambda *_: None); "
+        "exec(\"while True: sys.stdout.buffer.write(b'x'*65536); "
+        "sys.stdout.buffer.flush()\")"
+    )
+    started = time.monotonic()
+    with pytest.raises(ls.ChildOutputTooLarge):
+        ls._run_bounded(
+            [sys.executable, "-c", script], timeout=10, stdout_limit=1024,
+        )
+    assert time.monotonic() - started < 4
+
+
+def test_bounded_child_reader_failure_wakes_the_coordinator(monkeypatch) -> None:
+    """A failed reader cannot leave a pipe-blocked child until tool timeout."""
+    def fail_reader(*args):
+        args[5].set()
+
+    monkeypatch.setattr(ls, "_read_child_stream", fail_reader)
+    started = time.monotonic()
+    with pytest.raises(ls.subprocess.SubprocessError, match="complete child output"):
+        ls._run_bounded(
+            [sys.executable, "-c", "import time; time.sleep(10)"], timeout=10,
+        )
+    assert time.monotonic() - started < 2
+
+
+def test_osv_output_overflow_is_a_structured_retryable_failure(monkeypatch) -> None:
+    """Oversized JSON is an outage, never a clean scanner response."""
+    def overflow(*_args, **_kwargs):
+        raise ls.ChildOutputTooLarge("too much")
+
+    monkeypatch.setattr(ls, "_run_bounded", overflow)
+    failure: dict[str, str] = {}
+    assert ls._run_osv_batch("osv-scanner", ["one.lock"], 10, failure=failure) is None
+    assert failure == {"cause": "output_too_large"}
+    run = ls.OsvRunReport(
+        unavailable=["one.lock"], output_too_large=["one.lock"]
+    )
+    errors = ls.collect_errors(_layers([]), [], run)
+    oversized = [error for error in errors if error["code"] == "child_output_too_large"]
+    assert oversized and oversized[0]["retryable"] is True
+
+
+def test_trivy_output_overflow_is_distinct_from_an_ordinary_failure(monkeypatch) -> None:
+    """Trivy overflow receives the same stable structured error code."""
+    def overflow(*_args, **_kwargs):
+        raise ls.ChildOutputTooLarge("too much")
+
+    monkeypatch.setattr(ls, "_run_bounded", overflow)
+    status = ls.RepoStatus(name="app", path="/app")
+    status.flagged_lockfiles = {"/app/package-lock.json"}
+    ls._trivy_recheck_repo(status, "trivy", 10)
+    errors = ls._repository_errors(status)
+    assert status.trivy_output_too_large_count == 1
+    assert [error["code"] for error in errors] == ["child_output_too_large"]
+
+
+def test_mixed_trivy_failures_report_both_reason_codes() -> None:
+    """Coverage reasons agree with the repository error records."""
+    status = ls.RepoStatus(name="app", path="/app")
+    status.flagged_lockfiles = {"one", "two"}
+    status.trivy_submitted_count = 2
+    status.trivy_failed_count = 2
+    status.trivy_output_too_large_count = 1
+
+    coverage = ls._repo_trivy_coverage(status, requested=True, available=True)
+    assert coverage["reason_codes"] == [
+        "child_output_too_large", "trivy_scan_failed",
+    ]
+
+
+# --------------------------------------------------------------------------
 # Findings: one fact, however many layers saw it.
 # --------------------------------------------------------------------------
 
@@ -595,7 +774,7 @@ def test_the_tool_version_probe_runs_once_per_binary(monkeypatch) -> None:
         calls.append(cmd)
         raise OSError("not runnable")
 
-    monkeypatch.setattr(ls.subprocess, "run", fake_run)
+    monkeypatch.setattr(ls, "_run_bounded", fake_run)
     ls._TOOL_VERSION_CACHE.pop(("probe-once-binary", "v"), None)
     assert ls._tool_version("probe-once-binary", "v") is None
     assert ls._tool_version("probe-once-binary", "v") is None
