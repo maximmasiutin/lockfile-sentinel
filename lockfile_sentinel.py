@@ -103,6 +103,7 @@ import shutil
 import subprocess  # nosec B404
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -112,7 +113,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 __version__ = "0.2.0"
 
@@ -126,6 +127,203 @@ REPORT_SCHEMA_NAME = "lockfile-sentinel-report"
 REPORT_SCHEMA_VERSION = 1
 STATUS_SCHEMA_NAME = "lockfile-sentinel-status"
 STATUS_SCHEMA_VERSION = 1
+
+# Child tools return one JSON document, so truncation can never be treated as a
+# usable result. Keep it in memory, but put a hard ceiling under the memory a
+# broken tool can consume. Diagnostics retain only their tail: the last line is
+# normally the useful one and no report needs an unbounded child log.
+_CHILD_STDOUT_LIMIT = 128 * 1024 * 1024
+_CHILD_STDERR_LIMIT = 1024 * 1024
+_CHILD_READ_SIZE = 64 * 1024
+_CHILD_STOP_GRACE = 2.0
+_CHILD_READ_POLL = 0.01
+_CHILD_DRAIN_GRACE = 0.1
+
+
+class ChildOutputTooLarge(subprocess.SubprocessError):
+    """A child exceeded the machine-output contract before it completed."""
+
+
+@dataclass(frozen=True)
+class _CaptureLimit:
+    size: int
+    retain_tail: bool = False
+
+
+def _read_child_stream(
+    stream: BinaryIO,
+    capture: bytearray,
+    limit: _CaptureLimit,
+    overflow: threading.Event,
+    truncated: threading.Event,
+    read_failed: threading.Event,
+    stop_reading: threading.Event,
+) -> None:
+    """Drain one pipe while retaining no more than its declared byte limit."""
+    stopped_at: float | None = None
+    try:
+        while True:
+            chunk = stream.read(_CHILD_READ_SIZE)
+            if chunk is None:
+                should_stop, stopped_at = _reader_idle(stop_reading, stopped_at)
+                if should_stop:
+                    return
+                continue
+            if not chunk:
+                return
+            stopped_at = _reader_drain_started(stop_reading, stopped_at)
+            if stopped_at is not None and time.monotonic() - stopped_at >= _CHILD_DRAIN_GRACE:
+                return
+            _retain_child_chunk(chunk, capture, limit, overflow, truncated)
+    except (OSError, ValueError):
+        read_failed.set()
+
+
+def _reader_idle(
+    stop_reading: threading.Event, stopped_at: float | None,
+) -> tuple[bool, float | None]:
+    """Wait for data, or finish after the direct child has stopped."""
+    if not stop_reading.is_set():
+        stop_reading.wait(_CHILD_READ_POLL)
+        return False, None
+    stopped_at = stopped_at or time.monotonic()
+    if time.monotonic() - stopped_at >= _CHILD_DRAIN_GRACE:
+        return True, stopped_at
+    time.sleep(_CHILD_READ_POLL)
+    return False, stopped_at
+
+
+def _reader_drain_started(
+    stop_reading: threading.Event, stopped_at: float | None,
+) -> float | None:
+    """Start one fixed drain window even while inherited pipes stay busy."""
+    if not stop_reading.is_set():
+        return None
+    return stopped_at or time.monotonic()
+
+
+def _retain_child_chunk(
+    chunk: bytes, capture: bytearray, limit: _CaptureLimit,
+    overflow: threading.Event, truncated: threading.Event,
+) -> None:
+    """Retain one bounded chunk, as a tail or as complete machine output."""
+    if limit.retain_tail:
+        capture.extend(chunk)
+        if len(capture) > limit.size:
+            del capture[:len(capture) - limit.size]
+            truncated.set()
+        return
+    available = limit.size - len(capture)
+    if available > 0:
+        capture.extend(chunk[:available])
+    if len(chunk) <= available:
+        return
+    overflow.set()
+
+
+def _stop_child(process: subprocess.Popen[bytes]) -> None:
+    """Terminate, then kill, and always reap one child process."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=_CHILD_STOP_GRACE)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+
+
+def _wait_for_child(
+    process: subprocess.Popen[bytes], command: list[str], timeout: int,
+    overflow: threading.Event, read_failed: threading.Event,
+) -> None:
+    """Wait until exit, timeout, or an overflow that needs immediate killing."""
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if overflow.is_set() or read_failed.is_set():
+            _stop_child(process)
+            return
+        overflow.wait(_CHILD_READ_POLL)
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(command, timeout)
+
+
+def _run_bounded(
+    command: list[str], *, timeout: int,
+    stdout_limit: int = _CHILD_STDOUT_LIMIT,
+    stderr_limit: int = _CHILD_STDERR_LIMIT,
+) -> subprocess.CompletedProcess[str]:
+    """Run a child with concurrent, explicitly bounded output retention."""
+    process = subprocess.Popen(  # nosec B603  # pylint: disable=consider-using-with
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, bufsize=0,
+    )
+    if process.stdout is None or process.stderr is None:  # pragma: no cover
+        _stop_child(process)
+        raise subprocess.SubprocessError("could not create child pipes")
+
+    stdout = bytearray()
+    stderr = bytearray()
+    overflow = threading.Event()
+    stderr_truncated = threading.Event()
+    read_failed = threading.Event()
+    stop_reading = threading.Event()
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        os.set_blocking(process.stderr.fileno(), False)
+    except OSError:
+        _stop_child(process)
+        process.stdout.close()
+        process.stderr.close()
+        raise
+    readers = (
+        threading.Thread(
+            target=_read_child_stream,
+            args=(process.stdout, stdout, _CaptureLimit(stdout_limit), overflow,
+                  threading.Event(), read_failed, stop_reading),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_read_child_stream,
+            args=(process.stderr, stderr, _CaptureLimit(stderr_limit, True),
+                  threading.Event(), stderr_truncated, read_failed, stop_reading),
+            daemon=True,
+        ),
+    )
+    for reader in readers:
+        reader.start()
+    try:
+        _wait_for_child(process, command, timeout, overflow, read_failed)
+    except subprocess.TimeoutExpired as exc:
+        _stop_child(process)
+        raise subprocess.TimeoutExpired(command, timeout) from exc
+    finally:
+        stop_reading.set()
+        for reader in readers:
+            reader.join(_CHILD_STOP_GRACE)
+        for stream, reader in zip((process.stdout, process.stderr), readers, strict=True):
+            if not reader.is_alive():
+                stream.close()
+        _stop_child(process)
+
+    if any(reader.is_alive() for reader in readers):
+        raise subprocess.SubprocessError("child output pipes did not close")
+    if read_failed.is_set():
+        raise subprocess.SubprocessError("could not read complete child output")
+    if overflow.is_set():
+        raise ChildOutputTooLarge(
+            f"child stdout exceeded {stdout_limit} bytes"
+        )
+    stdout_text = stdout.decode("utf-8", errors="replace")
+    stderr_text = stderr.decode("utf-8", errors="replace")
+    if stderr_truncated.is_set():
+        stderr_text = "[earlier stderr truncated]\n" + stderr_text
+    return subprocess.CompletedProcess(
+        command, process.returncode, stdout_text, stderr_text
+    )
 
 # name -> every version known poisoned for that package. This built-in table is
 # the offline floor, and the campaign overlay fetched from the indicator feed is
@@ -423,6 +621,7 @@ class RepoStatus:
     trivy_confirmed: dict[str, set[str]] = field(default_factory=dict)
     trivy_submitted_count: int = 0
     trivy_failed_count: int = 0
+    trivy_output_too_large_count: int = 0
     # Which file produced each poisoned coordinate, keyed (kind, name,
     # version-or-spec) with kind "resolved" or "range". The findings array names
     # its evidence, and without this the best a finding could claim is "one of
@@ -1447,9 +1646,7 @@ def _go_built_scanner() -> str | None:
         return None
     for var in ("GOBIN", "GOPATH"):
         try:
-            result = subprocess.run(  # nosec B603
-                [go, "env", var], capture_output=True, text=True, timeout=60, check=False
-            )
+            result = _run_bounded([go, "env", var], timeout=60)
             out = result.stdout.strip()
         except (OSError, subprocess.SubprocessError):
             out = ""
@@ -1720,16 +1917,23 @@ def run_selftest(osv_bin: str | None, timeout: int) -> int:
     return 0
 
 
-def _trivy_findings(trivy: str, lockfile: str, timeout: int) -> dict[str, set[str]] | None:
+def _trivy_findings(
+    trivy: str, lockfile: str, timeout: int,
+    failure: dict[str, str] | None = None,
+) -> dict[str, set[str]] | None:
     """Scan one lockfile with Trivy, returning {package@version: {advisory ids}}.
 
     None means Trivy could not be asked, which is different from Trivy having
     nothing to say and must not be reported as the latter."""
     try:
-        proc = subprocess.run(  # nosec B603
+        proc = _run_bounded(
             [trivy, "fs", "--scanners", "vuln", "--format", "json", "--quiet", lockfile],
-            capture_output=True, text=True, timeout=timeout, check=False,
+            timeout=timeout,
         )
+    except ChildOutputTooLarge:
+        if failure is not None:
+            failure["cause"] = "output_too_large"
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode not in (0, 1):
@@ -1793,9 +1997,12 @@ def _trivy_recheck_repo(status: RepoStatus, trivy: str, timeout: int) -> None:
     """Submit one repository's flagged lockfiles to Trivy and record matches."""
     for lockfile in sorted(status.flagged_lockfiles):
         status.trivy_submitted_count += 1
-        findings = _trivy_findings(trivy, lockfile, timeout)
+        failure: dict[str, str] = {}
+        findings = _trivy_findings(trivy, lockfile, timeout, failure)
         if findings is None:
             status.trivy_failed_count += 1
+            if failure.get("cause") == "output_too_large":
+                status.trivy_output_too_large_count += 1
             _progress(f"  [trivy] could not scan {lockfile}")
             continue
         status.trivy_checked = True
@@ -2640,18 +2847,18 @@ def _run_osv_batch(
         cmd.extend(["--lockfile", lockfile_path])
     cmd.extend(["--format", "json"])
     try:
-        proc = subprocess.run(  # nosec B603
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
-        )
+        proc = _run_bounded(cmd, timeout=timeout)
+    except ChildOutputTooLarge as exc:
+        _progress(f"osv-scanner output exceeded its safety limit: {exc}")
+        _set_failure_cause(failure, "output_too_large")
+        return None
     except subprocess.TimeoutExpired as exc:
         _progress(f"osv-scanner timed out after {timeout}s: {exc}")
-        if failure is not None:
-            failure["cause"] = "unavailable"
+        _set_failure_cause(failure, "unavailable")
         return None
     except (OSError, subprocess.SubprocessError) as exc:
         _progress(f"osv-scanner failed to start: {exc}")
-        if failure is not None:
-            failure["cause"] = "unavailable"
+        _set_failure_cause(failure, "unavailable")
         return None
     # 128 is "No package sources found", which is not a failure: the file
     # extracted and simply declared no dependencies, which is what a scaffold
@@ -2671,6 +2878,12 @@ def _run_osv_batch(
     if parsed is None and failure is not None:
         failure["cause"] = "unavailable"
     return parsed
+
+
+def _set_failure_cause(failure: dict[str, str] | None, cause: str) -> None:
+    """Record why a scanner returned no verdict when its caller asked."""
+    if failure is not None:
+        failure["cause"] = cause
 
 
 def _parse_osv_output(
@@ -2727,7 +2940,7 @@ def _report_osv_rejection(
 def _scan_with_isolation(
     osv_bin: str, paths: list[str], timeout: int,
     debug: bool = False, failures: list[str] | None = None,
-    outages: list[str] | None = None,
+    outages: list[str] | None = None, oversized: list[str] | None = None,
 ) -> tuple[dict[str, list[tuple[str, str, set[str]]]], set[str]]:
     """Scan the given lockfiles, isolating any bad file by binary search.
 
@@ -2750,20 +2963,21 @@ def _scan_with_isolation(
             outages.extend(paths)
         return {}, set()
     if len(paths) == 1:
-        _record_isolated_failure(paths[0], failure, failures, outages)
+        _record_isolated_failure(paths[0], failure, failures, outages, oversized)
         return {}, set()
     mid = len(paths) // 2
     _progress(f"  splitting failed group of {len(paths)} into {mid} + {len(paths) - mid}")
     left_findings, left_ok = _scan_with_isolation(
-        osv_bin, paths[:mid], timeout, debug, failures, outages)
+        osv_bin, paths[:mid], timeout, debug, failures, outages, oversized)
     right_findings, right_ok = _scan_with_isolation(
-        osv_bin, paths[mid:], timeout, debug, failures, outages)
+        osv_bin, paths[mid:], timeout, debug, failures, outages, oversized)
     return {**left_findings, **right_findings}, left_ok | right_ok
 
 
 def _record_isolated_failure(
     path: str, failure: dict[str, str],
     failures: list[str] | None, outages: list[str] | None,
+    oversized: list[str] | None,
 ) -> None:
     """The end of the binary search, and the only place the offending file is
     known. A rejection is explained in full, because the cascade above reads
@@ -2771,10 +2985,12 @@ def _record_isolated_failure(
     run. A scanner that never answered is recorded as an outage instead:
     nothing is known about the file, and dumping its bytes as though it were
     the suspect would send the reader after the wrong thing."""
-    if failure.get("cause") == "unavailable":
+    if failure.get("cause") in ("unavailable", "output_too_large"):
         _progress(f"  no verdict, the scanner did not run against: {path}")
         if outages is not None:
             outages.append(path)
+        if failure.get("cause") == "output_too_large" and oversized is not None:
+            oversized.append(path)
         return
     _progress(f"  unrecoverable, skipped: {path}")
     _progress(f"    reason: {_describe_lockfile(path)}")
@@ -2801,6 +3017,7 @@ class OsvRunReport:
     # because sending the operator to repair a sound lockfile is the exact
     # misdirection the split exists to prevent.
     unavailable: list[str] = field(default_factory=list)
+    output_too_large: list[str] = field(default_factory=list)
     skipped_empty: list[str] = field(default_factory=list)
     skipped_unreadable: list[str] = field(default_factory=list)
     duration_ms: int = 0
@@ -2837,6 +3054,7 @@ def run_osv_scanner(
     batches = _chunked(lockfile_paths, batch_size)
     failures: list[str] = []
     outages: list[str] = []
+    oversized: list[str] = []
 
     # The OSV pass is where the wall clock goes, and it is the one phase whose
     # size is known in advance, so it is the phase worth tracking. Counting
@@ -2847,7 +3065,7 @@ def run_osv_scanner(
     for batch_num, batch in enumerate(batches, start=1):
         _progress(f"osv-scanner batch {batch_num}/{len(batches)}: {len(batch)} lockfile(s)...")
         batch_findings, batch_ok = _scan_with_isolation(
-            osv_bin, batch, timeout, debug, failures, outages
+            osv_bin, batch, timeout, debug, failures, outages, oversized
         )
         combined.update(batch_findings)
         processed.update(batch_ok)
@@ -2860,6 +3078,7 @@ def run_osv_scanner(
             run_report.submitted.extend(batch)
             run_report.failed[:] = failures
             run_report.unavailable[:] = outages
+            run_report.output_too_large[:] = oversized
         if tracker is not None:
             tracker.advance(f"{len(combined)} lockfile(s) with findings", count=len(batch))
         if on_batch_done is not None:
@@ -2873,6 +3092,7 @@ def run_osv_scanner(
     if run_report is not None:
         run_report.failed[:] = failures
         run_report.unavailable[:] = outages
+        run_report.output_too_large[:] = oversized
         run_report.duration_ms = int((time.monotonic() - started) * 1000)
     return combined, processed
 
@@ -3523,9 +3743,7 @@ def _tool_version(binary: str | None, pattern: str) -> str | None:
         return _TOOL_VERSION_CACHE[(binary, pattern)]
     version: str | None = None
     try:
-        out = subprocess.run(  # nosec B603
-            [binary, "--version"], capture_output=True, text=True, timeout=60, check=False
-        )
+        out = _run_bounded([binary, "--version"], timeout=60)
     except (OSError, subprocess.SubprocessError):
         out = None
     if out is not None:
@@ -3628,7 +3846,11 @@ def _repo_trivy_coverage(
         reasons.append("binary_not_found")
     elif status.trivy_failed_count:
         state = "partial"
-        reasons.append("trivy_scan_failed")
+        reasons.append(
+            "child_output_too_large"
+            if status.trivy_output_too_large_count == status.trivy_failed_count
+            else "trivy_scan_failed"
+        )
     elif status.trivy_submitted_count < flagged:
         # Mirrors the layer-level rule: a snapshot written before the Trivy
         # pass must not report a repository's corroboration as done.
@@ -3939,10 +4161,13 @@ def collect_errors(
             "this lockfile could not be read at submission time", file=path,
         ))
     for path in osv_run.unavailable:
+        oversized = path in osv_run.output_too_large
         errors.append(_error(
-            "osv_scanner_unavailable", "file",
-            "osv-scanner never reached a verdict here (timeout, spawn failure "
-            "or unparsable output); the lockfile itself may be sound",
+            "child_output_too_large" if oversized else "osv_scanner_unavailable", "file",
+            ("osv-scanner exceeded its output limit"
+             if oversized else
+             "osv-scanner never reached a verdict here (timeout, spawn failure "
+             "or unparsable output); the lockfile itself may be sound"),
             file=path, retryable=True,
         ))
     for status in sorted(statuses, key=lambda s: s.name.lower()):
@@ -3975,9 +4200,19 @@ def _repository_errors(status: RepoStatus) -> list[dict[str, Any]]:
             repository=status.name, file=path,
         ))
     if status.trivy_failed_count:
+        if status.trivy_output_too_large_count:
+            errors.append(_error(
+                "child_output_too_large", "repository",
+                f"trivy exceeded its output limit for "
+                f"{status.trivy_output_too_large_count} lockfile(s)",
+                repository=status.name, retryable=True,
+            ))
+        other_failures = status.trivy_failed_count - status.trivy_output_too_large_count
+        if not other_failures:
+            return errors
         errors.append(_error(
             "trivy_failed", "repository",
-            f"trivy could not scan {status.trivy_failed_count} flagged "
+            f"trivy could not scan {other_failures} flagged "
             "lockfile(s)", repository=status.name, retryable=True,
         ))
     return errors
