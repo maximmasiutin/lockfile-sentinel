@@ -6,6 +6,8 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 
 ### Fixed
 
+- A Trivy binary upgrade now makes the cached databases due regardless of their future `NextUpdate` stamps: the binary version that wrote each promoted cache is recorded, a mismatch forces exactly one refresh, and `status` reports the mismatch as stale, so an air-gapped host learns about a schema the new binary cannot read from the updater instead of from an obscure scan error. The metadata's own schema version is carried through freshness reporting instead of being discarded.
+
 - A refresh with nowhere to stage is refused before the download, exiting 2 with every candidate base and its free-space figure, instead of proceeding into the size-unchecked system temporary directory and dying a gigabyte later on an obscure write error from inside Trivy.
 - A missing cache parent no longer disqualifies the cache volume as a scratch base: it is created up front, as promotion would have moments later, so a first run on a fresh host stages on the roomy volume instead of falling through to the small one.
 - A refresh whose scratch directory could not be removed exits 3, distinct from success and from failure, so a scheduled run turns amber instead of leaking up to a gigabyte per night behind an exit 0; pre-existing `temp-*` leftovers in the chosen base are counted and reported at the start of each run.
