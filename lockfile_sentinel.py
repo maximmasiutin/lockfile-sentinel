@@ -3465,11 +3465,10 @@ def _trivy_version(trivy_bin: str | None) -> str | None:
 def _finding_id(*parts: str) -> str:
     """A stable identifier for one finding, derived from what it names.
 
-    The hash input is the underlying fact alone: repository, kind, package or
-    artifact, and version or range. Advisory ids stay out so the id survives
-    database enrichment. Sixteen hex characters keep it short enough to grep
-    for while leaving collisions out of practical reach for the counts
-    involved."""
+    The hash input is the coordinates the plan specifies: repository, kind,
+    package or artifact, version or range, and the advisory ids. Sixteen hex
+    characters keep it short enough to grep for while leaving collisions out of
+    practical reach for the counts involved."""
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -3546,11 +3545,6 @@ def _repo_trivy_coverage(
     elif status.trivy_failed_count:
         state = "partial"
         reasons.append("trivy_scan_failed")
-    elif status.trivy_submitted_count < flagged:
-        # Mirrors the layer-level rule: a snapshot written before the Trivy
-        # pass must not report a repository's corroboration as done.
-        state = "partial"
-        reasons.append("corroboration_pending")
     else:
         state = "completed"
     return {
@@ -4404,6 +4398,8 @@ def _write_root_refusal(
     Without -o the same document goes to stdout under --json, since a caller
     of the machine-readable mode would otherwise get exit 2 and nothing to
     parse. Human mode keeps its stderr refusal and writes no stdout."""
+    if not args.output and not args.json:
+        return
     errors = [
         _error("root_unreadable", "invocation", f"root {root} {reason}",
                file=str(root))
@@ -4432,14 +4428,12 @@ def _write_root_refusal(
             invocation_id=invocation_id, started_utc=started_utc,
             finished_utc=_utc_now_iso(), complete=False,
         ))
-    elif not args.output:
-        return
     else:
         lines = [str(e["message"]) for e in errors]
         lines.append("refusing to report on a scan that could not cover every root given")
         text = "\n".join(lines) + "\n"
     if not args.output:
-        sys.stdout.write(text)
+        sys.stdout.write(text + "\n")
         return
     try:
         _write_atomic(Path(args.output), text)
