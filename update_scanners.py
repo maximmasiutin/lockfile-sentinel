@@ -298,8 +298,12 @@ def resolve_system_tool(name: str) -> str:
     The bare name is kept as the fallback when the file is not there, so a host
     with an unusual layout still runs and fails with the tool's own message
     rather than a fabricated one. `name` therefore needs its extension, since
-    the file test sees no PATHEXT."""
-    root = os.environ.get("SystemRoot", r"C:\Windows")
+    the file test sees no PATHEXT. With SystemRoot unset, the usual Unix case,
+    the bare name is returned at once: a hardcoded default would be a relative
+    path there, reopening the current-directory vector."""
+    root = os.environ.get("SystemRoot")
+    if not root:
+        return name
     candidate = Path(root) / "System32" / name
     return str(candidate) if candidate.is_file() else name
 
