@@ -74,6 +74,8 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -85,6 +87,17 @@ from pathlib import Path
 __version__ = "0.1.0"
 
 IS_WINDOWS = os.name == "nt"
+
+
+def user_cache_base() -> Path:
+    """The per-user cache root the platform convention names.
+
+    One resolver for every cache path this program computes, because the
+    fallback spellings were drifting candidates: a base spelled differently in
+    one resolver is a cache written where the others never look."""
+    if IS_WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local"))
+    return Path(os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache"))
 OSV_EXE = "osv-scanner.exe" if IS_WINDOWS else "osv-scanner"
 TRIVY_EXE = "trivy.exe" if IS_WINDOWS else "trivy"
 
@@ -114,11 +127,7 @@ def cache_dir() -> Path:
     explicit = os.environ.get("LOCKFILE_SENTINEL_CACHE")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(base) / "lockfile-sentinel"
+    return user_cache_base() / "lockfile-sentinel"
 
 
 LOG_DIR = cache_dir() / "logs"
@@ -256,6 +265,33 @@ def echo(output: str, prefix: str) -> None:
     for line in output.splitlines():
         if line.strip():
             log(f"  [{prefix}] {line.rstrip()}")
+
+
+def resolve_system_tool(name: str) -> str:
+    """The System32 path of a Windows utility, or the bare name if it is absent.
+
+    A bare name handed to subprocess is resolved by CreateProcess, which looks
+    in the application directory and the current directory before PATH, so an
+    executable planted in any of the three runs in place of the system copy.
+    This script is meant to run from a scheduled task, often as a more
+    privileged account than the ones that can write to those places, which is
+    what makes the substitution worth someone's while.
+
+    Resolved against %SystemRoot%\\System32 rather than with `shutil.which`,
+    because which searches PATH and therefore closes only the current-directory
+    vector. Measured on Python 3.13 with a decoy whoami.exe: a decoy in the
+    current directory lost to System32, and a decoy first on PATH won. A PATH
+    entry ahead of System32 is exactly the planting an unprivileged account can
+    arrange, so a resolver that consults PATH is a fix that reads as one and is
+    not.
+
+    The bare name is kept as the fallback when the file is not there, so a host
+    with an unusual layout still runs and fails with the tool's own message
+    rather than a fabricated one. `name` therefore needs its extension, since
+    the file test sees no PATHEXT."""
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = Path(root) / "System32" / name
+    return str(candidate) if candidate.is_file() else name
 
 
 # --------------------------------------------------------------------------
@@ -412,7 +448,7 @@ def osv_version(exe: Path | None) -> str | None:
     code, out = run([str(exe), "--version"], timeout=60)
     if code == 127:
         return None
-    match = re.search(r"osv-scanner version:\s*([0-9]\S*)", out)
+    match = re.search(r"osv-scanner version:\s*(\d\S*)", out)
     return match.group(1) if match else None
 
 
@@ -455,11 +491,7 @@ def trivy_cache_dir_default() -> Path:
     explicit = os.environ.get("TRIVY_CACHE_DIR")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(base) / "trivy"
+    return user_cache_base() / "trivy"
 
 
 def trivy_cache_dir() -> Path | None:
@@ -470,11 +502,7 @@ def trivy_cache_dir() -> Path | None:
     explicit = os.environ.get("TRIVY_CACHE_DIR")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    candidate = Path(base) / "trivy"
+    candidate = user_cache_base() / "trivy"
     return candidate if candidate.exists() else None
 
 
@@ -492,12 +520,17 @@ def latest_osv_version(timeout: int = 30) -> str | None:
             request = urllib.request.Request(
                 url, headers={"User-Agent": "update-scanners", "Accept": "application/json"}
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            # The URL is one of two module-level https constants, and the
+            # https-only opener keeps a redirect from carrying the connection
+            # somewhere those constants do not name.
+            with open_https(request, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
             value = data.get(key)
             if value:
                 return str(value)
-        except Exception as exc:  # noqa: BLE001 - try the next source, then fail
+        # Broad on purpose: whatever this source's failure was, the next
+        # source is the answer, and only after both comes the None.
+        except Exception as exc:  # noqa: BLE001
             log(f"{url} lookup failed ({exc})")
     return None
 
@@ -753,6 +786,30 @@ def parse_datadog_csv(text: str) -> dict[str, set[str]]:
     return packages
 
 
+class HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect whose target leaves https.
+
+    urlopen follows redirects across schemes, so a checked https URL can still
+    hand the connection to cleartext one hop later: the feed host answers 302
+    with an http location, the downgrade is followed silently, and the scheme
+    gate above the call never sees it. Raised as URLError so the caller's
+    existing failure path reports it and keeps the previous overlay."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise urllib.error.URLError(f"refusing a redirect off https: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_https(request: urllib.request.Request, timeout: int):
+    """Open an https request through an opener that cannot be redirected off it.
+
+    The scheme of the request's own URL is the caller's gate; this closes the
+    hop that gate cannot see."""
+    opener = urllib.request.build_opener(HttpsOnlyRedirects())
+    return opener.open(request, timeout=timeout)  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+
+
 def target_malicious_packages(args) -> int:
     """Refresh the campaign overlay from the consolidated IOC feed."""
     output = Path(args.output) if args.output else overlay_path()
@@ -761,6 +818,20 @@ def target_malicious_packages(args) -> int:
     ):
         return 0
 
+    # The feed URL is operator-supplied, and urlopen would happily read a
+    # file:// or http:// source. A local file is not a feed, and a cleartext
+    # fetch invites the substitution this overlay exists to catch, so anything
+    # but https is refused before a request is built. urlsplit itself raises on
+    # a malformed authority such as an unmatched bracket, and a mistyped URL
+    # deserves the same one-line refusal as a wrong scheme, not a traceback.
+    try:
+        scheme = urllib.parse.urlsplit(args.source_url).scheme
+    except ValueError:
+        scheme = ""
+    if scheme != "https":
+        log(f"refusing a non-https IOC feed URL: {args.source_url}")
+        return 1
+
     log(f"fetching campaign IOC feed: {args.source_url}")
     packages: dict[str, set[str]] = {}
     sources: list[str] = []
@@ -768,7 +839,7 @@ def target_malicious_packages(args) -> int:
         request = urllib.request.Request(
             args.source_url, headers={"User-Agent": "update-scanners"}
         )
-        with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310
+        with open_https(request, timeout=60) as response:
             body = response.read()
         # Stage the download beside the overlay in the cache, never in the
         # scripts directory, so a crash between the write and the gate leaves
@@ -1074,7 +1145,8 @@ def current_user_sid() -> str | None:
     so that the interval between creating and hardening holds no process spawn,
     which means a raise here would abort the run before any directory exists
     rather than leaking one."""
-    code, output = run(["whoami", "/user", "/fo", "csv", "/nh"], timeout=30)
+    code, output = run([resolve_system_tool("whoami.exe"),
+                        "/user", "/fo", "csv", "/nh"], timeout=30)
     if code != 0:
         return None
     # Exit 0 with nothing on stdout is not a contradiction worth trusting: a
@@ -1226,13 +1298,10 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
     # case to an account holding SeCreateSymbolicLinkPrivilege or a machine with
     # Developer Mode on — which is a developer machine, and this is a developer's
     # tool. On an ordinary directory /L changes nothing.
-    code, output = run(
-        ["icacls", str(path), "/L", "/inheritance:r",
-         "/grant:r", f"*{sid}:(OI)(CI)F",
-         "/grant:r", "*S-1-5-18:(OI)(CI)F",
-         "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
-        timeout=60,
-    )
+    command = [resolve_system_tool("icacls.exe"), str(path), "/L", "/inheritance:r"]
+    for grant in (f"*{sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"):
+        command += ["/grant:r", grant]
+    code, output = run(command, timeout=60)
     if code != 0:
         log(f"WARNING: could not restrict the permissions on the scratch directory {path}. "
             "Whether that leaves it exposed is reported separately, from the ACL itself.")
@@ -1759,9 +1828,10 @@ def target_trivy_db(args) -> int:
 
     # Decide whether there is anything to do, before spending a gigabyte on finding
     # out there was not. The staging cache starts empty, so Trivy has no local copy
-    # to compare against and always concludes it needs to download: on 2026-08-07 it
-    # fetched both databases 2.8 hours before either was due, then threw the result
-    # away as identical. Roughly 1 GB a night, plus 90 s of ClamAV over it.
+    # to compare against and always concludes it needs to download: measured on a
+    # nightly run, it fetched both databases 2.8 hours before either was due, then
+    # threw the result away as identical. Roughly 1 GB a night, plus 90 s of ClamAV
+    # over it.
     #
     # The decision is all-or-nothing rather than per database, and that is forced by
     # the promotion step: it replaces the whole cache directory, so a staging cache
