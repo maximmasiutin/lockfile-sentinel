@@ -523,6 +523,18 @@ def test_punctuation_inside_a_bare_scalar_does_not_open_a_string() -> None:
         assert "keyv@6.0.0" not in ls._strip_hash_comments(text), text
 
 
+def test_an_unclosed_quote_after_whitespace_is_an_apostrophe() -> None:
+    """Whitespace alone does not make a value start: mid plain scalar an
+    apostrophe follows a space too, and a scalar opened there never closes on
+    its line. An unclosed quote is therefore an apostrophe, not an opener,
+    and the comment behind it is still stripped."""
+    for text in (
+        "  note: remember the '90s # keyv@6.0.0\n",
+        "  note: 'til next time # keyv@6.0.0\n",
+    ):
+        assert "keyv@6.0.0" not in ls._strip_hash_comments(text), text
+
+
 def test_an_apostrophe_before_a_quoted_value_still_opens_that_value() -> None:
     """The narrowing must not cost the quoting it exists beside: a quote that
     does start a value keeps protecting the `#` inside it."""
