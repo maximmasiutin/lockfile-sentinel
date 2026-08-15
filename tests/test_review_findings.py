@@ -32,7 +32,6 @@ Findings not represented here, and why:
 from __future__ import annotations
 
 import json
-import subprocess  # nosec B404
 import sys
 import time
 from pathlib import Path
@@ -449,7 +448,7 @@ def test_the_tool_version_probe_runs_once_per_binary(monkeypatch) -> None:
         calls.append(cmd)
         raise OSError("not runnable")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(ls, "_run_bounded", fake_run)
     ls._TOOL_VERSION_CACHE.pop(("probe-binary", "v"), None)
     assert ls._tool_version("probe-binary", "v") is None
     assert ls._tool_version("probe-binary", "v") is None
