@@ -380,8 +380,8 @@ def _scan_command(target: Path, largest: int, what: str) -> tuple[list[str], str
             f"a clamd MaxFileSize of "
             f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}")
     if use_daemon:
-        return [str(clamdscan), "--multiscan", "--infected", "--no-summary", str(target)], \
-            "clamdscan"
+        return ([str(clamdscan), "--multiscan", "--infected", "--no-summary", str(target)],
+                "clamdscan")
     clamscan = resolve_clam("clamscan")
     if not clamscan:
         log(f"FAIL: no ClamAV scanner able to read files this size; refusing to trust {what}")
