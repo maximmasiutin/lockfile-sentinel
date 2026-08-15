@@ -4,7 +4,7 @@ Development rules for this repository, stated by the operator on 2026-08-15.
 
 ## Branching
 
-Every feature is implemented in a git worktree on its own branch; the main checkout at `G:\q\lockfile-sentinel` always stays on `master` and is never switched to a feature branch. Worktrees live on the temp-drive scratchpad, not inside the repository. Pull requests target `master`; PR titles and bodies are very concise, the body at or under 150 characters.
+Every feature is implemented in a git worktree on its own branch; the main checkout at `G:\q\lockfile-sentinel` always stays on `master` and is never switched to a feature branch. Worktrees live on the temp-drive scratchpad, not inside the repository. Pull requests target `master`; PR titles and bodies are very concise, the body at or under 150 characters. History is never rebased: when a branch falls behind `master`, `master` is merged into it with a merge commit, and divergence between open branches is resolved the same way.
 
 ## Coordination
 
