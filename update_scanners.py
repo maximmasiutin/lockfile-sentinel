@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import errno
 import io
 import json
 import os
@@ -77,7 +78,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1229,7 +1230,140 @@ def is_inside(path: Path, container: Path) -> bool:
         return True
 
 
-def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
+class ScratchSwappedError(RuntimeError):
+    """The staged tree is not the one that was scanned.
+
+    A distinct type so the caller can report a substituted directory as a
+    refusal with its own message rather than as a malfunction."""
+
+
+def dir_identity(path: Path) -> tuple[int, int]:
+    """The (device, inode) of the entry at `path`, not of what it points at.
+
+    lstat, so a link left where the directory was answers for itself and fails
+    the comparison. Following it would report the identity of the moved-aside
+    original and pass. st_ino is meaningful on Windows too: since 3.5 CPython
+    fills it from the NTFS file index, which is what GetFileInformationByHandle
+    reports."""
+    info = path.lstat()
+    return info.st_dev, info.st_ino
+
+
+SCRATCH_MARKER = ".lockfile-sentinel-scratch-id"
+
+
+def _mark_scratch(staged: Path) -> str:
+    """Write a random token into the staged tree and return it.
+
+    The token is what an identity comparison cannot supply: two stats taken
+    either side of a copy agree again if the original directory is renamed back
+    before the second one, so a tree substituted only for the duration of the
+    copy passes. A copy carrying this token came from the directory that held
+    it, and the directory's ACL is what keeps the token unreadable."""
+    token = secrets.token_hex(16)
+    (staged / SCRATCH_MARKER).write_text(token, encoding="utf-8")
+    return token
+
+
+def _require_marker(copied: Path, token: str) -> None:
+    """Refuse a copy that does not carry the token the source was marked with."""
+    try:
+        found = (copied / SCRATCH_MARKER).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ScratchSwappedError(
+            f"the copy at {copied} carries no scratch marker ({exc}), so it did not "
+            "come from the tree the scanner passed") from exc
+    if found != token:
+        raise ScratchSwappedError(
+            f"the copy at {copied} carries a different scratch marker, so its source "
+            "was substituted while it was being copied")
+
+
+def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None,
+                       when: str = "before the promotion") -> None:
+    """Refuse when `staged` is no longer the directory `identity` came from.
+
+    Narrows the window rather than closing it: an account able to rename the
+    scratch aside can still do so between this stat and the operation that
+    follows. A handle held open across the whole interval would close it, but
+    the call that opens a directory handle is Windows-only, and portable code
+    here is worth more than the remaining microseconds.
+
+    A reparse point at the name is refused outright rather than compared. It
+    cannot match an lstat identity recorded for a real directory, but saying so
+    in its own words names what happened."""
+    if identity is None:
+        return
+    if is_reparse_point(staged):
+        raise ScratchSwappedError(
+            f"the staged tree {staged} is a link rather than the directory that was "
+            "scanned, so another account replaced it after the gate")
+    try:
+        current = dir_identity(staged)
+    except OSError as exc:
+        raise ScratchSwappedError(
+            f"the staged tree {staged} could not be stat'd {when} ({exc}), so it "
+            "cannot be shown to be the tree the scanner passed") from exc
+    if current != identity:
+        raise ScratchSwappedError(
+            f"the staged tree {staged} is not the directory that was scanned: it was "
+            f"{identity} when it was created and is {current} now, so another account "
+            f"replaced it after the gate and {when}")
+
+
+def _bring_onto_volume(staged: Path, incoming: Path,
+                       identity: tuple[int, int] | None,
+                       rescan: Callable[[Path], bool] | None = None) -> None:
+    """Move the staged tree to `incoming`, checked all the way across.
+
+    The identity is verified here rather than at the caller's top: the restore
+    and cleanup that precede this can take a while on a large leftover tree,
+    and a check before them leaves that interval unguarded. Same volume, the
+    rename is atomic and the question ends there. Another volume, the copy
+    reads the source by pathname for as long as a gigabyte takes, and three
+    checks answer it because each covers what the one before cannot. The
+    identity answers for the name and misses an ABA rename, aside during the
+    copy and back before the check, which restores the inode. The token
+    answers that, since the substituted tree cannot read it, and misses a swap
+    made part-way through, which leaves the token copied from the real tree
+    beside files from another. Scanning the copy answers that, because it asks
+    about the bytes that will be promoted rather than where they came from,
+    and it runs only here: a same-volume promotion renames the very inode the
+    gate already read."""
+    _refuse_if_swapped(staged, identity)
+    token = _mark_scratch(staged) if identity is not None else None
+    try:
+        os.replace(staged, incoming)
+    except OSError as exc:
+        # Only a not-same-device rename earns the copy. Falling back on any
+        # OSError turned a permission or missing-path failure into a copy that
+        # half-writes the incoming tree and then reports its own error in place
+        # of the real cause. Windows raises error 17 here rather than EXDEV.
+        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+            raise
+        shutil.copytree(staged, incoming)
+        try:
+            _refuse_if_swapped(staged, identity, when="during the copy")
+            if token is not None:
+                _require_marker(incoming, token)
+            if rescan is not None and not rescan(incoming):
+                # from None: the cross-device error is why this path runs, not
+                # why the scan refused, and chaining it would name the wrong
+                # cause in the traceback the operator reads.
+                raise ScratchSwappedError(
+                    f"the copy of {staged} at {incoming} did not pass the scan that "
+                    "the staged tree passed, so what would be promoted is not what "
+                    "was gated; the live cache is untouched") from None
+        except (ScratchSwappedError, OSError):
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise
+    # The marker belongs to the transfer, not to the cache Trivy reads.
+    (incoming / SCRATCH_MARKER).unlink(missing_ok=True)
+
+
+def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
+                 staged_identity: tuple[int, int] | None = None,
+                 rescan: Callable[[Path], bool] | None = None) -> None:
     """Replace the live cache with the staged one, keeping the old copy until it lands.
 
     The order matters and is the reason this is a function rather than four lines
@@ -1264,8 +1398,18 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
     promotion that was about to succeed on a cache which merely could not be
     stat'd at that moment.
 
+    `staged_identity` is the (device, inode) the caller recorded when it made
+    the staged tree. It is re-read immediately before the tree leaves the
+    scratch, and again after a cross-device copy, which also has to carry the
+    marker token written just before it, since an identity restored after a
+    substitution passes a comparison and cannot forge a token. A failure of
+    either refuses the promotion: between the ClamAV gate and the rename the tree is otherwise
+    trusted by pathname alone, and a base that grants another account
+    DELETE_CHILD lets that account rename the scanned tree aside and leave its
+    own at the same name.
+
     OSError propagates. The caller reports it, because it is the caller that
-    knows the run this was part of.
+    knows the run this was part of. ScratchSwappedError propagates the same way.
     """
     # The real directory, not the name that reached us, for the same reason
     # is_inside resolves: a rename acts on the location rather than the spelling.
@@ -1293,14 +1437,10 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
     # than adopted.
     if incoming.exists():
         shutil.rmtree(incoming)
-    try:
-        # Same volume: a rename, and the except clause never runs. Another
-        # volume: rename fails (EXDEV on POSIX, a not-same-device error on
-        # Windows), and the copy happens here, while the live cache is still
-        # complete and still in place.
-        os.replace(staged, incoming)
-    except OSError:
-        shutil.copytree(staged, incoming)
+    # Here rather than at the top of the function: the restore and the rmtree
+    # above can take a while on a large leftover tree, and a check that ran
+    # before them would leave that whole interval unguarded.
+    _bring_onto_volume(staged, incoming, staged_identity, rescan)
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():
@@ -2280,6 +2420,10 @@ def target_trivy_db(args) -> int:
     with scratch_dir("trivy databases", near=live, need=need, leaks=leaked) as staging:
         staged = staging / "cache"
         staged.mkdir(parents=True, exist_ok=True)
+        # Recorded here, checked again by promote_into just before the tree
+        # leaves the scratch, so a directory substituted for this one after the
+        # ClamAV gate is refused rather than promoted.
+        staged_identity = dir_identity(staged)
         # The temporary directory goes to the same scratch as the staging cache.
         # Trivy's OCI downloader writes the compressed artifact into its own
         # temporary directory before unpacking it into the cache, so pointing
@@ -2316,7 +2460,16 @@ def target_trivy_db(args) -> int:
             # skipped database is named here to be carried forward rather than
             # silently dropped, which is what --skip-java-db used to do.
             promote_into(staged, live,
-                         keep=("java-db",) if args.skip_java_db else ())
+                         keep=("java-db",) if args.skip_java_db else (),
+                         staged_identity=staged_identity,
+                         # Called only by a cross-device promotion, after the
+                         # copy, so the tree the cache receives is one this
+                         # run scanned rather than one it inferred.
+                         rescan=lambda copy: gate(
+                             copy, "the copied Trivy databases", args.skip_scan))
+        except ScratchSwappedError as exc:
+            log(f"FAIL: {exc}; the live cache is untouched")
+            return 1
         except OSError as exc:
             log(f"FAIL: could not promote the gated databases into {live} ({exc})")
             return 1

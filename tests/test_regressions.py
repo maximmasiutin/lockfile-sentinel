@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1653,6 +1654,296 @@ def test_an_interrupted_promotion_is_restored_before_anything_is_deleted(tmp_pat
 
     assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
     assert not previous.exists(), "the only good cache was left renamed aside"
+
+
+def test_a_staged_tree_swapped_after_the_gate_is_not_promoted(tmp_path) -> None:
+    """The tree promoted has to be the tree the scanner passed.
+
+    A base that grants another account DELETE_CHILD lets it rename the scanned
+    directory aside and leave its own at the same name; promotion by pathname
+    then installs a tree nothing scanned."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    staged.rename(tmp_path / "moved-aside")
+    hostile = tmp_path / "temp-abc123"
+    (hostile / "db").mkdir(parents=True)
+    (hostile / "db" / "trivy.db").write_text("hostile", encoding="utf-8")
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_staged_tree_that_cannot_be_stated_is_not_promoted(tmp_path) -> None:
+    """An identity that cannot be read is not an identity that matches.
+
+    Treating the failure as a pass would restore the pathname trust the check
+    exists to remove, in the case where something is already wrong."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    identity = us.dir_identity(staged)
+    shutil.rmtree(staged)
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_link_left_where_the_staged_tree_was_is_not_promoted(tmp_path) -> None:
+    """A link at the staged name answers for itself, not for its target.
+
+    Reading the identity through the link would report the moved-aside
+    original's device and inode, pass the comparison, and then promote the link
+    itself, leaving the cache pointing at a location the other account still
+    controls and that scratch cleanup is about to remove."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    moved_aside = tmp_path / "moved-aside"
+    staged.rename(moved_aside)
+    try:
+        staged.symlink_to(moved_aside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or account cannot create symlinks")
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_source_swapped_during_a_cross_device_copy_is_not_promoted(
+        tmp_path, monkeypatch) -> None:
+    """The copy path reads the source by pathname for as long as it runs.
+
+    A single check before the rename covers none of a gigabyte-sized copy, so
+    a scratch renamed aside part-way through would otherwise leave `.incoming`
+    holding unscanned or mixed content that the swap then installs."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def swap_the_source_mid_copy(_src, dst):
+        # The copy lands, and the source is renamed aside while it runs and
+        # another directory left at the same name, as a rename of the scratch
+        # by another account would look.
+        Path(dst).mkdir()
+        staged.rename(tmp_path / "moved-aside")
+        (staged / "db").mkdir(parents=True)
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", swap_the_source_mid_copy)
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not live.with_name(live.name + ".incoming").exists()
+
+
+def test_a_source_restored_after_a_swap_is_still_refused(tmp_path, monkeypatch) -> None:
+    """An ABA rename restores the inode and passes the comparison.
+
+    The attacker renames the validated tree aside once the copy starts, serves
+    its own at the pathname while files are read, and renames the original back
+    before the post-copy check. Both stats then agree while the copy holds
+    unscanned content, so identity alone cannot answer this; the token can,
+    because the substituted tree cannot read it."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def copy_a_hostile_tree(_src, dst):
+        # What the copy reads is the attacker's tree, which never held the
+        # token. The rename back is modelled by the identity below, which keeps
+        # answering as it did before the copy.
+        landed = Path(dst)
+        (landed / "db").mkdir(parents=True)
+        (landed / "db" / "trivy.db").write_text("hostile", encoding="utf-8")
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", copy_a_hostile_tree)
+    monkeypatch.setattr(us, "dir_identity", lambda _path: identity)
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not live.with_name(live.name + ".incoming").exists()
+
+
+def test_a_copy_the_scan_rejects_is_not_promoted(tmp_path, monkeypatch) -> None:
+    """The identity read answers for a name, the token for the tree, the scan
+    for the bytes, and only the last covers a swap made part-way through.
+
+    A copy that begins on the scanned tree and finishes on another carries the
+    genuine token beside content nothing read, and its source identity still
+    matches. Scanning what will be promoted is what refuses that."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def copy_a_mixture(src, dst):
+        # The marker is copied from the real tree, as it would be when the
+        # swap lands after the copy has begun, and the rest is the attacker's.
+        landed = Path(dst)
+        landed.mkdir()
+        shutil.copy2(Path(src) / us.SCRATCH_MARKER, landed / us.SCRATCH_MARKER)
+        (landed / "planted.db").write_text("unscanned", encoding="utf-8")
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", copy_a_mixture)
+
+    scanned: list[Path] = []
+
+    def reject_the_copy(path: Path) -> bool:
+        scanned.append(path)
+        return False
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity,
+                        rescan=reject_the_copy)
+
+    assert scanned == [live.with_name(live.name + ".incoming")]
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not live.with_name(live.name + ".incoming").exists()
+
+
+def test_a_same_volume_promotion_does_not_scan_twice(tmp_path) -> None:
+    """The rename path promotes the very inode the gate already read, so a
+    second scan would cost a gigabyte to learn what is known."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    def must_not_run(_path: Path) -> bool:
+        raise AssertionError("a same-volume promotion rescanned the tree")
+
+    us.promote_into(staged, live, staged_identity=us.dir_identity(staged),
+                    rescan=must_not_run)
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+
+
+def test_the_scratch_marker_does_not_reach_the_promoted_cache(tmp_path) -> None:
+    """The token belongs to the transfer, not to the databases Trivy reads."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live, staged_identity=us.dir_identity(staged))
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert not (live / us.SCRATCH_MARKER).exists()
+
+
+def test_an_unswapped_tree_still_promotes(tmp_path) -> None:
+    """The check must not refuse the ordinary case it guards."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live, staged_identity=us.dir_identity(staged))
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+
+
+def test_a_rename_error_that_is_not_cross_device_is_not_retried_as_a_copy(
+        tmp_path, monkeypatch) -> None:
+    """Only a not-same-device rename earns the copy path.
+
+    Falling back on any OSError turned a permission or missing-path failure
+    into a copytree that half-writes the incoming tree and reports its own
+    error in place of the real cause."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+
+    real_replace = os.replace
+
+    def refuse_with_a_permission_error(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(13, "Permission denied")
+        return real_replace(src, dst, **kwargs)
+
+    def must_not_run(_src, _dst):
+        raise AssertionError("a permission error was retried as a copy")
+
+    monkeypatch.setattr(us.os, "replace", refuse_with_a_permission_error)
+    monkeypatch.setattr(us.shutil, "copytree", must_not_run)
+
+    with pytest.raises(OSError) as caught:
+        us.promote_into(staged, live)
+
+    assert caught.value.errno == 13
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
 
 
 def test_the_space_requirement_follows_what_is_staged(tmp_path, monkeypatch) -> None:
