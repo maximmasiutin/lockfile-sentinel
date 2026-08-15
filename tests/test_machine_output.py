@@ -846,6 +846,25 @@ def test_a_timestamp_materially_in_the_future_reads_as_unknown() -> None:
     assert ls._as_unix_time(time.time() + 60) is not None
 
 
+def test_a_future_overlay_generation_stamp_reads_as_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The overlay's own ISO stamp goes through the same plausibility bound
+    as the numeric state fields: a year-2100 generated_utc over a valid
+    packages map must not read as fresh forever."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    overlay = tmp_path / "compromised-npm-packages.json"
+    overlay.write_text(json.dumps({
+        "generated_utc": "2100-01-01T00:00:00Z",
+        "packages": {"keyv": ["6.0.0"]},
+    }), encoding="utf-8")
+    doc = ls.gather_status(overlay, osv_bin=None)
+    source = doc["sources"]["overlay"]
+    assert source["generated_unix"] is None
+    assert source["state"] == "unknown"
+    assert doc["overall"]["exit_code"] == 2
+
+
 def test_an_overlay_the_sweep_would_reject_is_not_reported_fresh(
     tmp_path: Path, monkeypatch
 ) -> None:

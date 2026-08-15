@@ -1804,15 +1804,20 @@ def _status_engine(osv_bin: str | None) -> dict[str, Any]:
 
 
 def _overlay_generated_unix(overlay: dict[str, Any]) -> float | None:
-    """The overlay's own generation stamp as a unix time, or None."""
+    """The overlay's own generation stamp as a unix time, or None.
+
+    Routed through the same plausibility bound as the numeric state fields,
+    because a hand-edited stamp in the year 2100 parses cleanly, ages
+    negatively, and would read as fresh forever."""
     generated = overlay.get("generated_utc")
     if not isinstance(generated, str):
         return None
     try:
-        return datetime.strptime(generated, ISO_UTC_FORMAT).replace(
+        parsed = datetime.strptime(generated, ISO_UTC_FORMAT).replace(
             tzinfo=timezone.utc).timestamp()
     except ValueError:
         return None
+    return _as_unix_time(parsed)
 
 
 def _overlay_refresh_unix(overlay_file: Path) -> float | None:
