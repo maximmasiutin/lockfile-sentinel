@@ -2161,9 +2161,9 @@ def _trivy_binary_changed(trivy: str) -> str | None:
 
     None means no refresh is owed on this ground: the versions match, or the
     binary will not say its version, in which case a mismatch cannot be
-    claimed. A cache written before this record existed reports the mismatch
-    until a full refresh records the baseline; --skip-java-db runs do not
-    record it, so they keep reporting it."""
+    claimed. A cache written before this record existed answers with the
+    unrecorded wording; the record is written only by a full refresh, so a
+    --skip-java-db run keeps answering that way until one runs."""
     installed = trivy_binary_version(trivy)
     if not installed:
         return None
