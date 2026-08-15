@@ -690,6 +690,44 @@ def test_snapshot_outcomes_never_mention_batches_that_have_not_run(
     assert seen[1] == ([str(good), str(bad)], [str(bad)])
 
 
+def test_trivy_stays_pending_in_snapshots_until_every_flagged_file_was_submitted() -> None:
+    """A snapshot written before the Trivy pass must not claim completed
+    corroboration with zero submissions; the layer completes only once every
+    flagged lockfile actually went in."""
+    flagged = ls.RepoStatus(name="t", path="/t")
+    flagged.flagged_lockfiles = {"/t/package-lock.json"}
+    pending = ls.trivy_layer(True, "trivy-not-actually-run", [flagged])
+    assert pending["state"] == "partial"
+    assert pending["reason_code"] == "corroboration_pending"
+    flagged.trivy_submitted_count = 1
+    done = ls.trivy_layer(True, "trivy-not-actually-run", [flagged])
+    assert done["state"] == "completed"
+
+
+def test_refused_roots_invalidate_a_stale_report_on_disk(
+    tmp_path: Path,
+) -> None:
+    """A consumer polling -o must never keep reading the previous run's
+    complete: true after a run that refused its roots; the refusal envelope
+    replaces it, finished, incomplete, and naming each refused root."""
+    target = tmp_path / "report.json"
+    target.write_text('{"invocation": {"complete": true}}', encoding="utf-8")
+    args = ls._build_parser().parse_args(
+        ["--json", "-o", str(target), "--no-osv", "--no-trivy",
+         "--no-overlay", "--no-refresh"]
+    )
+    missing = tmp_path / "missing-root"
+    ls._write_root_refusal(
+        args, [missing], [(missing, "does not exist")],
+        _overlay_layer("not_requested"), INVOCATION_ID, STARTED,
+    )
+    report = json.loads(target.read_text(encoding="utf-8"))
+    assert report["invocation"]["complete"] is False
+    assert report["invocation"]["finished_utc"] is not None
+    assert report["errors"][0]["code"] == "root_unreadable"
+    assert str(missing) in report["errors"][0]["message"]
+
+
 def test_a_tree_with_no_lockfiles_completes_the_osv_layer_without_a_scanner() -> None:
     """Nothing to scan completes the layer whatever is installed, the same
     way Trivy completes with nothing to confirm; a lockfile-free tree must

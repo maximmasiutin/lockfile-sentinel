@@ -3604,6 +3604,7 @@ def trivy_layer(requested: bool, trivy_bin: str | None,
     }
     if not requested:
         return layer
+    flagged_lockfiles = sum(len(s.flagged_lockfiles) for s in flagged_repos)
     if not flagged_repos:
         layer["state"] = "completed"
         layer["reason_code"] = "nothing_to_confirm"
@@ -3615,6 +3616,12 @@ def trivy_layer(requested: bool, trivy_bin: str | None,
     elif failed:
         layer["state"] = "partial"
         layer["reason_code"] = "trivy_scan_failed"
+    elif submitted < flagged_lockfiles:
+        # No failure recorded is not the same as corroboration having run: a
+        # snapshot written before the Trivy pass would otherwise claim
+        # completed coverage with zero submissions.
+        layer["state"] = "partial"
+        layer["reason_code"] = "corroboration_pending"
     else:
         layer["state"] = "completed"
     return layer
@@ -4243,7 +4250,10 @@ def _run_sweep(args: argparse.Namespace) -> int:
     # passes it, and the walk then swallows the scandir error and reports an
     # empty tree with exit 0. So each root is opened here, which is the only
     # test that distinguishes "empty" from "unreadable".
-    if not _roots_are_usable(roots):
+    unusable = _unusable_roots(roots)
+    if unusable:
+        _write_root_refusal(args, roots, unusable, overlay_info,
+                            invocation_id, started_utc)
         return 2
 
     all_statuses, lockfile_index = _walk_all_roots(roots, args)
@@ -4302,8 +4312,9 @@ def _deduplicate_roots(roots: list[Path]) -> list[Path]:
     return kept
 
 
-def _roots_are_usable(roots: list[Path]) -> bool:
-    """Refuse the sweep unless every named root can actually be enumerated.
+def _unusable_roots(roots: list[Path]) -> list[tuple[Path, str]]:
+    """Every named root that cannot be enumerated, with its reason; empty
+    means the sweep may proceed.
 
     A root that does not resolve is fatal, not skippable. Skipping it left
     the status list empty, printed "Repositories scanned: 0" and exited 0, so
@@ -4331,7 +4342,60 @@ def _roots_are_usable(roots: list[Path]) -> bool:
         _progress(f"FAIL: root {root} {reason}")
     if unusable:
         _progress("refusing to report on a scan that could not cover every root given")
-    return not unusable
+    return unusable
+
+
+def _write_root_refusal(
+    args: argparse.Namespace, roots: list[Path],
+    unusable: list[tuple[Path, str]], overlay_info: dict[str, Any],
+    invocation_id: str, started_utc: str,
+) -> None:
+    """Overwrite a stale requested report when the roots are refused.
+
+    Without this, a consumer polling the -o path keeps reading the previous
+    invocation's complete: true forever while every new run exits 2 before
+    writing anything. The refusal is a finished, incomplete document naming
+    each refused root in errors; the layer objects are built as for an empty
+    tree, since nothing was asked of them, and the complete flag plus the
+    error codes carry the verdict."""
+    if not args.output:
+        return
+    errors = [
+        _error("root_unreadable", "invocation", f"root {root} {reason}",
+               file=str(root))
+        for root, reason in unusable
+    ]
+    if args.json:
+        osv_requested = not args.no_osv
+        trivy_requested = not args.no_trivy
+        layers: dict[str, dict[str, Any]] = {
+            "builtin": builtin_layer(),
+            "overlay": overlay_info,
+            "osv": osv_layer(
+                osv_requested,
+                find_osv_scanner(args.osv_scanner_bin) if osv_requested else None,
+                OsvRunReport(), 0, 0,
+            ),
+            "trivy": trivy_layer(
+                trivy_requested,
+                resolve_trivy() if trivy_requested else None, [],
+            ),
+        }
+        text = render_json(build_report(
+            [], roots=[str(r) for r in roots],
+            include_node_modules=args.include_node_modules,
+            layers=layers, errors=errors, osv_run=OsvRunReport(),
+            invocation_id=invocation_id, started_utc=started_utc,
+            finished_utc=_utc_now_iso(), complete=False,
+        ))
+    else:
+        lines = [str(e["message"]) for e in errors]
+        lines.append("refusing to report on a scan that could not cover every root given")
+        text = "\n".join(lines) + "\n"
+    try:
+        _write_atomic(Path(args.output), text)
+    except OSError as exc:
+        _progress(f"could not overwrite the stale report at {args.output} ({exc})")
 
 
 def _count_all_repositories(roots: list[Path], include_node_modules: bool) -> int:
