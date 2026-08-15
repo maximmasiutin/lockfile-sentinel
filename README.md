@@ -61,7 +61,6 @@ Where a finding belongs to a known campaign, the campaign is named rather than d
 python lockfile_sentinel.py --root .                      # sweep one tree
 python lockfile_sentinel.py --root a --root b --jobs 16   # several, in parallel
 python lockfile_sentinel.py --status                      # what is current, scan nothing
-python lockfile_sentinel.py --json -o findings.json       # machine-readable
 python lockfile_sentinel.py --json -o findings.json --source-revision "$GITHUB_SHA"
 python lockfile_sentinel.py --lockfile path/package-lock.json   # one file, verbosely
 python lockfile_sentinel.py --osv source -r ./app         # pass through to osv-scanner
