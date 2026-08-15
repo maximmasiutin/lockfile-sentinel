@@ -307,18 +307,22 @@ def _status_with_state(tmp_path: Path, monkeypatch, payload: str) -> dict[str, A
     return ls.gather_status(tmp_path / "missing.json", osv_bin=None)
 
 
-@pytest.mark.parametrize("literal", ["true", "1e309", "1e300", "-5", "4102444800"])
+@pytest.mark.parametrize(
+    "literal", ["true", "NaN", "1e309", "1e300", "-5", "4102444800"])
 def test_an_implausible_stamp_reads_as_unknown(
     tmp_path: Path, monkeypatch, literal: str
 ) -> None:
     """Booleans pass an int check, NaN and 1e309 pass a finite one, 1e300
     overflows the renderer, a negative predates every run, and a future stamp
-    reads as fresh forever. Each of the five arrived as its own finding."""
+    reads as fresh forever. Each of the six arrived as its own finding.
+
+    allow_nan=False because the default emits bare NaN and reads it back, so
+    the round trip would accept a document no other JSON parser will."""
     doc = _status_with_state(tmp_path, monkeypatch, f'{{"lastCheckUnix": {literal}}}')
     engine = doc["sources"]["osv_scanner"]
     assert engine["version_checked_unix"] is None
     assert engine["state"] == "unknown"
-    json.loads(json.dumps(doc))
+    json.loads(json.dumps(doc, allow_nan=False))
     assert ls.render_status_human(doc)
 
 
@@ -360,7 +364,7 @@ def test_overlay_counts_and_stamp_are_never_echoed_unvalidated(
     source = ls.gather_status(overlay, osv_bin=None)["sources"]["overlay"]
     assert (source["package_count"], source["version_count"]) == (1, 2)
     assert source["generated_utc"] is None
-    json.loads(json.dumps({"sources": source}))
+    json.loads(json.dumps({"sources": source}, allow_nan=False))
 
 
 def test_a_future_overlay_stamp_reads_as_unknown(tmp_path: Path, monkeypatch) -> None:
