@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import errno
 import io
 import json
 import os
@@ -77,7 +78,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -329,11 +330,38 @@ def clamd_max_file_size() -> int | None:
     """Read MaxFileSize from clamd.conf, in bytes, or None when unreadable.
 
     The daemon skips any file above this and reports it clean, so the value is
-    what decides whether clamdscan can honestly be used at all.
+    what decides whether clamdscan can honestly be used at all."""
+    return _clamd_directive_size("MaxFileSize")
+
+
+def clamd_scan_size_is_unlimited() -> bool:
+    """Whether MaxScanSize is configured 0, which clamd defines as no limit.
+
+    The daemon is trusted on this ground and no other, because MaxScanSize
+    counts recursively extracted content: a file whose compressed size sits
+    under a finite ceiling can expand past it, and the daemon then stops and
+    still reports it clean. The expansion cannot be known before the scan, so
+    a finite ceiling of any size is a ceiling this program cannot prove the
+    input stays under. Unreadable reads as finite, since a limit that could
+    not be read is not a limit known to be absent."""
+    return _clamd_directive_size("MaxScanSize", zero_is_ceiling=False) == 0
+
+
+def _clamd_directive_size(name: str, zero_is_ceiling: bool = True) -> int | None:
+    """One size directive from clamd.conf, in bytes, or None when unreadable.
 
     CLAMD_CONF names the file directly. Otherwise the Unix locations are tried,
     and on Windows the configuration sits beside the daemon binary, so the one
-    found on PATH points at it."""
+    found on PATH points at it.
+
+    The first readable file answers, whether or not it carries the directive.
+    Searching on would read one ceiling from the operator's configuration and
+    the other from a stale file elsewhere on the host, and a pair of limits
+    from two different daemons describes no daemon at all.
+
+    zero_is_ceiling maps clamd's 0 to the libclamav ceiling, which is what a
+    file-size limit means. A caller that has to tell an unlimited setting from
+    a large one passes False and gets the 0 back."""
     for candidate in _clamd_conf_candidates():
         try:
             text = candidate.read_text(encoding="utf-8", errors="ignore")
@@ -341,8 +369,9 @@ def clamd_max_file_size() -> int | None:
             continue
         for line in text.splitlines():
             parts = line.split()
-            if len(parts) == 2 and parts[0] == "MaxFileSize":
-                return _parse_clamd_size(parts[1])
+            if len(parts) == 2 and parts[0] == name:
+                return _parse_clamd_size(parts[1], zero_is_ceiling)
+        return None
     return None
 
 
@@ -360,15 +389,21 @@ def _clamd_conf_candidates() -> list[Path]:
     return candidates
 
 
-def _parse_clamd_size(value: str) -> int | None:
-    """A clamd.conf size value in bytes, or None where it does not parse."""
+def _parse_clamd_size(value: str, zero_is_ceiling: bool = True) -> int | None:
+    """A clamd.conf size value in bytes, or None where it does not parse.
+
+    clamd defines 0 as no limit, which for a file-size limit is the libclamav
+    ceiling, the true upper bound whatever the configuration says. A caller
+    that must tell unlimited from merely large passes zero_is_ceiling False,
+    since collapsing the two makes a configured 2G look like no limit."""
     raw = value.upper()
     multiplier = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}.get(raw[-1:], 1)
     digits = raw[:-1] if multiplier > 1 else raw
     try:
-        return int(digits) * multiplier
+        parsed = int(digits) * multiplier
     except ValueError:
         return None
+    return CLAMSCAN_FILE_CEILING if parsed == 0 and zero_is_ceiling else parsed
 
 
 def _refuse_oversized(files: list[Path], what: str) -> bool:
@@ -391,13 +426,25 @@ def _refuse_oversized(files: list[Path], what: str) -> bool:
 
 def _scan_command(target: Path, largest: int, what: str) -> tuple[list[str], str] | None:
     """The scanner invocation the sizes allow, or None where nothing can read them."""
+    # Two ceilings, each disqualifying the daemon on its own, and each judged
+    # by what can actually be proved. MaxFileSize is a size against a size, so
+    # the largest staged file answers it. MaxScanSize counts recursively
+    # extracted content, which no on-disk size bounds, so the only setting
+    # that proves the scan completes is no limit at all; comparing it against
+    # the largest file would be comparing a lower bound with a ceiling and
+    # calling the result proof. An unreadable directive counts as a limit,
+    # since one that could not be read is not one known to be absent.
     cap = clamd_max_file_size()
+    unlimited_scan = clamd_scan_size_is_unlimited()
     clamdscan = resolve_clam("clamdscan")
-    use_daemon = bool(clamdscan) and cap is not None and largest <= cap
+    use_daemon = (bool(clamdscan) and cap is not None
+                  and largest <= cap and unlimited_scan)
     if clamdscan and not use_daemon:
-        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB against "
-            f"a clamd MaxFileSize of "
-            f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}")
+        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB "
+            f"against a clamd MaxFileSize of "
+            f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}, "
+            f"and MaxScanSize is {'unlimited' if unlimited_scan else 'set'}, which "
+            "extracted content can exceed unnoticed")
     if use_daemon:
         return ([str(clamdscan), "--multiscan", "--infected", "--no-summary", str(target)],
                 "clamdscan")
@@ -1183,7 +1230,140 @@ def is_inside(path: Path, container: Path) -> bool:
         return True
 
 
-def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
+class ScratchSwappedError(RuntimeError):
+    """The staged tree is not the one that was scanned.
+
+    A distinct type so the caller can report a substituted directory as a
+    refusal with its own message rather than as a malfunction."""
+
+
+def dir_identity(path: Path) -> tuple[int, int]:
+    """The (device, inode) of the entry at `path`, not of what it points at.
+
+    lstat, so a link left where the directory was answers for itself and fails
+    the comparison. Following it would report the identity of the moved-aside
+    original and pass. st_ino is meaningful on Windows too: since 3.5 CPython
+    fills it from the NTFS file index, which is what GetFileInformationByHandle
+    reports."""
+    info = path.lstat()
+    return info.st_dev, info.st_ino
+
+
+SCRATCH_MARKER = ".lockfile-sentinel-scratch-id"
+
+
+def _mark_scratch(staged: Path) -> str:
+    """Write a random token into the staged tree and return it.
+
+    The token is what an identity comparison cannot supply: two stats taken
+    either side of a copy agree again if the original directory is renamed back
+    before the second one, so a tree substituted only for the duration of the
+    copy passes. A copy carrying this token came from the directory that held
+    it, and the directory's ACL is what keeps the token unreadable."""
+    token = secrets.token_hex(16)
+    (staged / SCRATCH_MARKER).write_text(token, encoding="utf-8")
+    return token
+
+
+def _require_marker(copied: Path, token: str) -> None:
+    """Refuse a copy that does not carry the token the source was marked with."""
+    try:
+        found = (copied / SCRATCH_MARKER).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ScratchSwappedError(
+            f"the copy at {copied} carries no scratch marker ({exc}), so it did not "
+            "come from the tree the scanner passed") from exc
+    if found != token:
+        raise ScratchSwappedError(
+            f"the copy at {copied} carries a different scratch marker, so its source "
+            "was substituted while it was being copied")
+
+
+def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None,
+                       when: str = "before the promotion") -> None:
+    """Refuse when `staged` is no longer the directory `identity` came from.
+
+    Narrows the window rather than closing it: an account able to rename the
+    scratch aside can still do so between this stat and the operation that
+    follows. A handle held open across the whole interval would close it, but
+    the call that opens a directory handle is Windows-only, and portable code
+    here is worth more than the remaining microseconds.
+
+    A reparse point at the name is refused outright rather than compared. It
+    cannot match an lstat identity recorded for a real directory, but saying so
+    in its own words names what happened."""
+    if identity is None:
+        return
+    if is_reparse_point(staged):
+        raise ScratchSwappedError(
+            f"the staged tree {staged} is a link rather than the directory that was "
+            "scanned, so another account replaced it after the gate")
+    try:
+        current = dir_identity(staged)
+    except OSError as exc:
+        raise ScratchSwappedError(
+            f"the staged tree {staged} could not be stat'd {when} ({exc}), so it "
+            "cannot be shown to be the tree the scanner passed") from exc
+    if current != identity:
+        raise ScratchSwappedError(
+            f"the staged tree {staged} is not the directory that was scanned: it was "
+            f"{identity} when it was created and is {current} now, so another account "
+            f"replaced it after the gate and {when}")
+
+
+def _bring_onto_volume(staged: Path, incoming: Path,
+                       identity: tuple[int, int] | None,
+                       rescan: Callable[[Path], bool] | None = None) -> None:
+    """Move the staged tree to `incoming`, checked all the way across.
+
+    The identity is verified here rather than at the caller's top: the restore
+    and cleanup that precede this can take a while on a large leftover tree,
+    and a check before them leaves that interval unguarded. Same volume, the
+    rename is atomic and the question ends there. Another volume, the copy
+    reads the source by pathname for as long as a gigabyte takes, and three
+    checks answer it because each covers what the one before cannot. The
+    identity answers for the name and misses an ABA rename, aside during the
+    copy and back before the check, which restores the inode. The token
+    answers that, since the substituted tree cannot read it, and misses a swap
+    made part-way through, which leaves the token copied from the real tree
+    beside files from another. Scanning the copy answers that, because it asks
+    about the bytes that will be promoted rather than where they came from,
+    and it runs only here: a same-volume promotion renames the very inode the
+    gate already read."""
+    _refuse_if_swapped(staged, identity)
+    token = _mark_scratch(staged) if identity is not None else None
+    try:
+        os.replace(staged, incoming)
+    except OSError as exc:
+        # Only a not-same-device rename earns the copy. Falling back on any
+        # OSError turned a permission or missing-path failure into a copy that
+        # half-writes the incoming tree and then reports its own error in place
+        # of the real cause. Windows raises error 17 here rather than EXDEV.
+        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+            raise
+        shutil.copytree(staged, incoming)
+        try:
+            _refuse_if_swapped(staged, identity, when="during the copy")
+            if token is not None:
+                _require_marker(incoming, token)
+            if rescan is not None and not rescan(incoming):
+                # from None: the cross-device error is why this path runs, not
+                # why the scan refused, and chaining it would name the wrong
+                # cause in the traceback the operator reads.
+                raise ScratchSwappedError(
+                    f"the copy of {staged} at {incoming} did not pass the scan that "
+                    "the staged tree passed, so what would be promoted is not what "
+                    "was gated; the live cache is untouched") from None
+        except (ScratchSwappedError, OSError):
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise
+    # The marker belongs to the transfer, not to the cache Trivy reads.
+    (incoming / SCRATCH_MARKER).unlink(missing_ok=True)
+
+
+def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
+                 staged_identity: tuple[int, int] | None = None,
+                 rescan: Callable[[Path], bool] | None = None) -> None:
     """Replace the live cache with the staged one, keeping the old copy until it lands.
 
     The order matters and is the reason this is a function rather than four lines
@@ -1218,8 +1398,18 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
     promotion that was about to succeed on a cache which merely could not be
     stat'd at that moment.
 
+    `staged_identity` is the (device, inode) the caller recorded when it made
+    the staged tree. It is re-read immediately before the tree leaves the
+    scratch, and again after a cross-device copy, which also has to carry the
+    marker token written just before it, since an identity restored after a
+    substitution passes a comparison and cannot forge a token. A failure of
+    either refuses the promotion: between the ClamAV gate and the rename the tree is otherwise
+    trusted by pathname alone, and a base that grants another account
+    DELETE_CHILD lets that account rename the scanned tree aside and leave its
+    own at the same name.
+
     OSError propagates. The caller reports it, because it is the caller that
-    knows the run this was part of.
+    knows the run this was part of. ScratchSwappedError propagates the same way.
     """
     # The real directory, not the name that reached us, for the same reason
     # is_inside resolves: a rename acts on the location rather than the spelling.
@@ -1247,14 +1437,10 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = ()) -> None:
     # than adopted.
     if incoming.exists():
         shutil.rmtree(incoming)
-    try:
-        # Same volume: a rename, and the except clause never runs. Another
-        # volume: rename fails (EXDEV on POSIX, a not-same-device error on
-        # Windows), and the copy happens here, while the live cache is still
-        # complete and still in place.
-        os.replace(staged, incoming)
-    except OSError:
-        shutil.copytree(staged, incoming)
+    # Here rather than at the top of the function: the restore and the rmtree
+    # above can take a while on a large leftover tree, and a check that ran
+    # before them would leave that whole interval unguarded.
+    _bring_onto_volume(staged, incoming, staged_identity, rescan)
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():
@@ -2234,6 +2420,10 @@ def target_trivy_db(args) -> int:
     with scratch_dir("trivy databases", near=live, need=need, leaks=leaked) as staging:
         staged = staging / "cache"
         staged.mkdir(parents=True, exist_ok=True)
+        # Recorded here, checked again by promote_into just before the tree
+        # leaves the scratch, so a directory substituted for this one after the
+        # ClamAV gate is refused rather than promoted.
+        staged_identity = dir_identity(staged)
         # The temporary directory goes to the same scratch as the staging cache.
         # Trivy's OCI downloader writes the compressed artifact into its own
         # temporary directory before unpacking it into the cache, so pointing
@@ -2270,7 +2460,16 @@ def target_trivy_db(args) -> int:
             # skipped database is named here to be carried forward rather than
             # silently dropped, which is what --skip-java-db used to do.
             promote_into(staged, live,
-                         keep=("java-db",) if args.skip_java_db else ())
+                         keep=("java-db",) if args.skip_java_db else (),
+                         staged_identity=staged_identity,
+                         # Called only by a cross-device promotion, after the
+                         # copy, so the tree the cache receives is one this
+                         # run scanned rather than one it inferred.
+                         rescan=lambda copy: gate(
+                             copy, "the copied Trivy databases", args.skip_scan))
+        except ScratchSwappedError as exc:
+            log(f"FAIL: {exc}; the live cache is untouched")
+            return 1
         except OSError as exc:
             log(f"FAIL: could not promote the gated databases into {live} ({exc})")
             return 1
