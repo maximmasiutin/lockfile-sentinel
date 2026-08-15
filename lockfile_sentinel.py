@@ -1474,10 +1474,11 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
                   f"{payload['version_count']} versions")
         return "refreshed"
     finally:
-        try:
-            lock_file.unlink()
-        except OSError:
-            pass
+        for held in (lock_file, _adoption_marker(lock_file)):
+            try:
+                held.unlink()
+            except OSError:
+                pass
 
 
 def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> bool:
@@ -1498,23 +1499,51 @@ def _acquire_overlay_lock(overlay_file: Path, lock_file: Path) -> bool:
     if held_for <= 15 * 60:
         _progress("another refresh holds the overlay lock; using what is on disk")
         return False
-    # A stale lock is adopted in place by freshening its timestamp, never
-    # removed and recreated: any remove-then-recreate protocol leaves an
-    # interval where the path is vacant, a third process acquires it, and the
-    # promised serialisation is gone. Adoption keeps the path continuously
-    # occupied, so nobody can ever destroy a lock another process just took.
-    # Two processes that both observe the same stale lock can both adopt it
-    # and refresh concurrently, and that is accepted on purpose: the lock is
-    # a bandwidth saver, not a correctness device, because the overlay itself
-    # is written atomically and every observable copy is complete whichever
-    # refresh lands last.
     _progress("adopting an overlay lock older than fifteen minutes")
+    return _adopt_stale_lock(lock_file)
+
+
+def _adopt_stale_lock(lock_file: Path) -> bool:
+    """Take over a stale lock in place, with exactly one adopter.
+
+    The lock is adopted by freshening its timestamp, never removed and
+    recreated: any remove-then-recreate protocol leaves an interval where the
+    path is vacant, a third process acquires it, and the serialisation is
+    gone. Which adopter wins is decided by an exclusive create of an adoption
+    marker beside the lock, so of any number of processes that observed the
+    same stale lock, one proceeds and the rest defer. The marker lives only
+    for the adopted refresh and is removed with the lock; a marker left by a
+    crashed adopter goes stale on the same fifteen-minute rule and is cleared
+    by the next candidate before it races for its own."""
+    marker = _adoption_marker(lock_file)
+    try:
+        marker_age = time.time() - marker.stat().st_mtime
+        if marker_age <= 15 * 60:
+            _progress("another process is adopting the overlay lock; deferring")
+            return False
+        marker.unlink()
+    except OSError:
+        pass
+    try:
+        os.close(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except OSError:
+        _progress("another process won the overlay lock adoption; deferring")
+        return False
     try:
         now = time.time()
         os.utime(lock_file, (now, now))
         return True
     except OSError:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
         return False
+
+
+def _adoption_marker(lock_file: Path) -> Path:
+    """The exclusive-create file that arbitrates stale-lock adoption."""
+    return lock_file.with_name(lock_file.name + ".adopt")
 
 
 def resolve_trivy() -> str | None:

@@ -592,6 +592,20 @@ def test_a_stale_lock_is_adopted_in_place_never_vacated(tmp_path: Path) -> None:
     assert ls._acquire_overlay_lock(overlay, lock) is False
 
 
+def test_exactly_one_of_two_stale_lock_observers_adopts(tmp_path: Path) -> None:
+    """Two processes that both passed the staleness check race for the
+    adoption marker, whose exclusive create admits exactly one; the loser
+    defers rather than refreshing concurrently, and the winner's adoption
+    leaves the lock path continuously occupied."""
+    lock = tmp_path / "compromised-npm-packages.json.lock"
+    lock.write_text("", encoding="utf-8")
+    stale = time.time() - 3600
+    os.utime(lock, (stale, stale))
+    assert ls._adopt_stale_lock(lock) is True
+    assert ls._adopt_stale_lock(lock) is False
+    assert lock.exists()
+
+
 def test_unreadable_dirs_are_stored_as_a_bounded_preview_with_a_full_total(
     tmp_path: Path,
 ) -> None:
