@@ -1265,6 +1265,41 @@ def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None,
             f"replaced it after the gate and {when}")
 
 
+def _bring_onto_volume(staged: Path, incoming: Path,
+                       identity: tuple[int, int] | None) -> None:
+    """Move the staged tree to `incoming`, checked all the way across.
+
+    The identity is verified here rather than at the caller's top: the restore
+    and cleanup that precede this can take a while on a large leftover tree,
+    and a check before them leaves that interval unguarded. Same volume, the
+    rename is atomic and the question ends there. Another volume, the copy
+    reads the source by pathname for as long as a gigabyte takes, so the copy
+    must also carry the token written just above: an ABA rename, aside during
+    the copy and back before the check, restores the inode and defeats the
+    comparison alone, but not a token the substituted tree could not read."""
+    _refuse_if_swapped(staged, identity)
+    token = _mark_scratch(staged) if identity is not None else None
+    try:
+        os.replace(staged, incoming)
+    except OSError as exc:
+        # Only a not-same-device rename earns the copy. Falling back on any
+        # OSError turned a permission or missing-path failure into a copy that
+        # half-writes the incoming tree and then reports its own error in place
+        # of the real cause. Windows raises error 17 here rather than EXDEV.
+        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+            raise
+        shutil.copytree(staged, incoming)
+        try:
+            _refuse_if_swapped(staged, identity, when="during the copy")
+            if token is not None:
+                _require_marker(incoming, token)
+        except ScratchSwappedError:
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise
+    # The marker belongs to the transfer, not to the cache Trivy reads.
+    (incoming / SCRATCH_MARKER).unlink(missing_ok=True)
+
+
 def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
                  staged_identity: tuple[int, int] | None = None) -> None:
     """Replace the live cache with the staged one, keeping the old copy until it lands.
@@ -1343,39 +1378,7 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
     # Here rather than at the top of the function: the restore and the rmtree
     # above can take a while on a large leftover tree, and a check that ran
     # before them would leave that whole interval unguarded.
-    _refuse_if_swapped(staged, staged_identity)
-    # Marked after the identity check and before the copy, so the token names
-    # this tree at the moment it was last shown to be the scanned one.
-    token = _mark_scratch(staged) if staged_identity is not None else None
-    try:
-        # Same volume: a rename, and the except clause never runs. Another
-        # volume: rename fails (EXDEV on POSIX, a not-same-device error on
-        # Windows), and the copy happens here, while the live cache is still
-        # complete and still in place.
-        os.replace(staged, incoming)
-    except OSError as exc:
-        # Only a not-same-device rename earns the copy. Falling back on any
-        # OSError turned a permission or missing-path failure into a copy that
-        # half-writes the incoming tree and then reports its own error in place
-        # of the real cause. Windows raises error 17 here rather than EXDEV.
-        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
-            raise
-        # The cross-device path reads the source by pathname for as long as a
-        # gigabyte takes to copy, so the check above covers none of it. The
-        # copy is required to carry the token as well as the source to still
-        # have the identity: an ABA rename, aside during the copy and back
-        # before the check, restores the inode and defeats the comparison
-        # alone, but not a token the substituted tree could not read.
-        shutil.copytree(staged, incoming)
-        try:
-            _refuse_if_swapped(staged, staged_identity, when="during the copy")
-            if token is not None:
-                _require_marker(incoming, token)
-        except ScratchSwappedError:
-            shutil.rmtree(incoming, ignore_errors=True)
-            raise
-    # The marker belongs to the transfer, not to the cache Trivy reads.
-    (incoming / SCRATCH_MARKER).unlink(missing_ok=True)
+    _bring_onto_volume(staged, incoming, staged_identity)
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():
