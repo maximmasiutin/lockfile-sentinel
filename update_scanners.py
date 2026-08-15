@@ -1783,7 +1783,11 @@ def target_trivy_db(args) -> int:
         stamps = [before[name]["next_update"] for name in required]
         dated = [stamp for stamp in stamps if stamp is not None]
         if len(dated) != len(stamps):
-            raise RuntimeError("a required database has no next-update time here")
+            missing = [name for name in required if before[name]["next_update"] is None]
+            raise RuntimeError(
+                "no next-update time for: " + ", ".join(missing) + ", which the "
+                "`undated` guard above should have excluded; taking the soonest of "
+                "the rest would report a wrong answer as a right one")
         soonest = min(dated)
         log(f"nothing is due yet, next at {describe_age(soonest)}; skipping the download. "
             "Pass --force to refresh anyway")
