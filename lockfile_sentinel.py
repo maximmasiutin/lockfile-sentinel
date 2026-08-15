@@ -1902,7 +1902,10 @@ def _status_overlay(overlay_file: Path) -> dict[str, Any]:
         "present": bool(packages),
         "package_count": package_count,
         "version_count": version_count,
-        "generated_utc": generated if isinstance(generated, str) else None,
+        # Only when it parsed: the schema promises a date-time or null, so a
+        # malformed stamp echoed back would make the document reporting the
+        # malformed input the one a validating consumer rejects.
+        "generated_utc": generated if generated_unix is not None else None,
         "generated_unix": generated_unix,
         "last_refresh_unix": last_refresh,
         "stale_after_seconds": 24 * 3600,

@@ -985,6 +985,23 @@ def test_an_overlay_the_sweep_would_reject_is_not_reported_fresh(
     assert doc["overall"]["exit_code"] == 2
 
 
+def test_a_malformed_overlay_stamp_is_nulled_not_echoed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The schema promises a date-time or null, so echoing an unparseable
+    stamp would make the document reporting the malformed input the one a
+    validating consumer rejects."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    overlay = tmp_path / "compromised-npm-packages.json"
+    overlay.write_text(json.dumps({
+        "generated_utc": "not-a-date", "packages": {"keyv": ["6.0.0"]},
+    }), encoding="utf-8")
+    source = ls.gather_status(overlay, osv_bin=None)["sources"]["overlay"]
+    assert source["generated_utc"] is None
+    assert source["generated_unix"] is None
+    assert source["state"] == "unknown"
+
+
 def test_overlay_counts_are_recomputed_never_trusted(
     tmp_path: Path, monkeypatch
 ) -> None:

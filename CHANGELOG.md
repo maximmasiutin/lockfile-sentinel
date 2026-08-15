@@ -20,6 +20,16 @@ All notable changes are recorded here. Versions follow [Semantic Versioning](htt
 - `--status --json`, a machine-readable status document (`lockfile-sentinel-status` version 1) with semantic parity to the human status report: tool and database versions and paths, ages and thresholds in seconds, a state per source and an overall state with its exit code. `--status --check-live` adds one explicit probe of api.osv.dev; plain status mode never touches the network.
 - `lockfile-sentinel-report.schema.json`, a JSON Schema for the report, and `lockfile-sentinel-report.example.json`, a worked example, both pinned to the renderer by tests; `lockfile-sentinel-status.schema.json` for the status document, pinned likewise.
 
+### Fixed
+
+- A refresh with nowhere to stage is refused before the download, exiting 2 with every candidate base and its free-space figure, instead of proceeding into the size-unchecked system temporary directory and dying a gigabyte later on an obscure write error from inside Trivy.
+- A missing cache parent no longer disqualifies the cache volume as a scratch base: it is created up front, as promotion would have moments later, so a first run on a fresh host stages on the roomy volume instead of falling through to the small one.
+- A refresh whose scratch directory could not be removed exits 3, distinct from success and from failure, so a scheduled run turns amber instead of leaking up to a gigabyte per night behind an exit 0; pre-existing `temp-*` leftovers in the chosen base are counted and reported at the start of each run.
+
+- Trivy database promotion is recoverable across filesystems: the staged cache is brought onto the destination volume as an `.incoming` sibling before the live cache is touched, every step after that copy is an atomic rename, and a failed final swap renames the previous cache straight back, so the live cache is never left absent or half written.
+- `--skip-java-db` no longer deletes the cached Java index: promotion carries a database the run deliberately skipped forward from the outgoing cache by rename, so the flag now costs nothing instead of a re-download on the following run.
+- The scratch free-space requirement is derived from the databases the run will actually stage, so a vulnerability-only refresh no longer demands the full 5 GB and no longer falls through to the unchecked system temporary directory on a base that had ample room.
+
 ## 0.1.0
 
 First public release.
