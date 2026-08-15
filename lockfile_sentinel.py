@@ -11,7 +11,7 @@ both reported, and worm payload artifacts are found by name wherever they sit.
 Reports, per repository (a directory containing a .git entry, or a
 top-level directory under a scanned root when no .git is present):
 
-1. Does npm/pnpm/yarn tooling exist at all (package.json or a lockfile)?
+1. Does npm/pnpm/yarn/bun tooling exist at all (package.json or a lockfile)?
 2. If yes, is any watched package (keyv, cacheable, and related) present
    in any version at all, declared or resolved?
 3. If yes, is any version present or reachable the actual poisoned one?
@@ -253,12 +253,31 @@ PAYLOAD_FILENAMES: frozenset[str] = frozenset(
     }
 )
 
-NPM_MARKER_FILES: frozenset[str] = frozenset(
-    {"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
-)
+# The five LOCKFILE_NAMES entries get scan_lockfile's text pass, one code
+# path for all of them, and the names ending .json get the structural JSON
+# pass on top of it.
+# npm-shrinkwrap.json shares package-lock.json's schema outright, so it takes
+# the same structural path; bun.lock does not end .json, so the JSON pass is
+# never dispatched to it, and extending that pass to it would need a JSONC
+# parser since bun writes trailing commas. Its "name@version" resolution
+# strings are exactly what the token patterns match. The campaign's own
+# payload marker is bun_environment.js, so a scanner that finds the Bun
+# payload by filename had no business walking past Bun's lockfile.
 LOCKFILE_NAMES: frozenset[str] = frozenset(
-    {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+    }
 )
+# Derived rather than restated, so a lockfile added to the set above marks npm
+# tooling without a second edit: the original coverage gap was exactly a name
+# present in one hand-kept list and absent from the other. package.json is the
+# one member that is not a lockfile, being a marker and a range source only,
+# and it never passes through scan_lockfile.
+NPM_MARKER_FILES: frozenset[str] = LOCKFILE_NAMES | {"package.json"}
 ALWAYS_SKIP_DIRS: frozenset[str] = frozenset({".git"})
 DEPENDENCY_FIELDS: tuple[str, ...] = (
     "dependencies",
@@ -593,15 +612,72 @@ def scan_npm_lockfile_json(text: str, status: RepoStatus) -> None:
         walk_v1(data.get("dependencies"))
 
 
+def _strip_jsonc_comments(text: str) -> str:
+    """Remove // and /* */ comments from JSONC, leaving string contents alone.
+
+    String awareness is the whole job. Every registry URL carries the line
+    comment marker inside a string, `https://` and all, so a stripper that did
+    not track string state would truncate the exact lines the tarball patterns
+    match and silently lose every finding in the file. Escapes are honoured so
+    a quote written as \\" inside a string cannot end it early.
+
+    Newlines inside a block comment are kept, so removing one never joins two
+    lines into a token that neither line carried."""
+    out: list[str] = []
+    position = 0
+    length = len(text)
+    in_string = False
+    while position < length:
+        char = text[position]
+        if in_string:
+            out.append(char)
+            if char == "\\" and position + 1 < length:
+                out.append(text[position + 1])
+                position += 2
+                continue
+            if char == '"':
+                in_string = False
+            position += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            position += 1
+            continue
+        if char == "/" and position + 1 < length and text[position + 1] == "/":
+            while position < length and text[position] != "\n":
+                position += 1
+            continue
+        if char == "/" and position + 1 < length and text[position + 1] == "*":
+            position += 2
+            while position + 1 < length and not (
+                text[position] == "*" and text[position + 1] == "/"
+            ):
+                if text[position] == "\n":
+                    out.append("\n")
+                position += 1
+            position += 2
+            continue
+        out.append(char)
+        position += 1
+    return "".join(out)
+
+
 def scan_lockfile(path: Path, status: RepoStatus) -> bool:
     """Record every watched-package version actually resolved in a lockfile.
 
     Two passes, because neither alone is complete. The text pass covers every
-    lockfile format with one code path, npm, pnpm and yarn alike, and catches a
-    version wherever it appears. The JSON pass reads npm lockfiles structurally
-    and catches entries the text pass cannot see, such as a v3 entry with no
-    `resolved` URL. Recording the same version twice is harmless, since versions
-    are collected into sets.
+    lockfile format with one code path, npm, pnpm, yarn and bun alike, and
+    catches a version wherever it appears. The JSON pass is dispatched on the
+    .json suffix and reads npm-schema lockfiles structurally,
+    package-lock.json and npm-shrinkwrap.json both since shrinkwrap is the
+    same document under another name, and catches entries the text pass
+    cannot see, such as a v3 entry with no `resolved` URL. bun.lock does not
+    carry that suffix, so it gets the text pass alone, which suffices: its
+    resolution strings carry the name@version tokens the patterns match, and
+    the strict JSON pass could not read it anyway, bun writing JSONC with
+    trailing commas. Recording the same version twice is harmless, since
+    versions are collected into sets.
 
     A lockfile that contributes a poisoned version is remembered by name, so a
     later re-check can submit that file alone rather than every lockfile the
@@ -620,6 +696,12 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
+    if path.name.lower() == "bun.lock":
+        # JSONC admits comments, and the token patterns match raw text, so a
+        # commented-out entry naming a poisoned version would otherwise be
+        # recorded as a resolved pin the effective tree does not contain. A
+        # comment installs nothing, so stripping it loses no real pin.
+        text = _strip_jsonc_comments(text)
     before = _poison_count(status)
     if path.name.lower().endswith(".json"):
         scan_npm_lockfile_json(text, status)
@@ -1754,6 +1836,19 @@ def _verbose_lockfile_dump(path: str) -> list[str]:
     elif name == "yarn.lock":
         lines.append("      yarn berry format (__metadata present)" if "__metadata:" in text
                      else "      yarn classic v1 format")
+    elif name == "bun.lock":
+        # JSONC rather than JSON: bun writes trailing commas, so failing the
+        # strict parser is this format's healthy state, not a defect to report.
+        match = re.search(r'"lockfileVersion"\s*:\s*(\d+)', text)
+        # An absent field is not proof of a foreign file: this dump prints for a
+        # file the scanner refused, and a truncated bun.lock has lost exactly
+        # the head this regex looks in, so certainty here would send the reader
+        # away from the corruption that is the actual finding.
+        lines.append(
+            f"      bun JSONC format, lockfileVersion: {match.group(1)}" if match
+            else "      no lockfileVersion field found: truncated, malformed, "
+                 "or not a bun lockfile"
+        )
     return lines
 
 
