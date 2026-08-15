@@ -1265,6 +1265,56 @@ def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None,
             f"replaced it after the gate and {when}")
 
 
+def _bring_onto_volume(staged: Path, incoming: Path,
+                       identity: tuple[int, int] | None,
+                       rescan: Callable[[Path], bool] | None = None) -> None:
+    """Move the staged tree to `incoming`, checked all the way across.
+
+    The identity is verified here rather than at the caller's top: the restore
+    and cleanup that precede this can take a while on a large leftover tree,
+    and a check before them leaves that interval unguarded. Same volume, the
+    rename is atomic and the question ends there. Another volume, the copy
+    reads the source by pathname for as long as a gigabyte takes, and three
+    checks answer it because each covers what the one before cannot. The
+    identity answers for the name and misses an ABA rename, aside during the
+    copy and back before the check, which restores the inode. The token
+    answers that, since the substituted tree cannot read it, and misses a swap
+    made part-way through, which leaves the token copied from the real tree
+    beside files from another. Scanning the copy answers that, because it asks
+    about the bytes that will be promoted rather than where they came from,
+    and it runs only here: a same-volume promotion renames the very inode the
+    gate already read."""
+    _refuse_if_swapped(staged, identity)
+    token = _mark_scratch(staged) if identity is not None else None
+    try:
+        os.replace(staged, incoming)
+    except OSError as exc:
+        # Only a not-same-device rename earns the copy. Falling back on any
+        # OSError turned a permission or missing-path failure into a copy that
+        # half-writes the incoming tree and then reports its own error in place
+        # of the real cause. Windows raises error 17 here rather than EXDEV.
+        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+            raise
+        shutil.copytree(staged, incoming)
+        try:
+            _refuse_if_swapped(staged, identity, when="during the copy")
+            if token is not None:
+                _require_marker(incoming, token)
+            if rescan is not None and not rescan(incoming):
+                # from None: the cross-device error is why this path runs, not
+                # why the scan refused, and chaining it would name the wrong
+                # cause in the traceback the operator reads.
+                raise ScratchSwappedError(
+                    f"the copy of {staged} at {incoming} did not pass the scan that "
+                    "the staged tree passed, so what would be promoted is not what "
+                    "was gated; the live cache is untouched") from None
+        except (ScratchSwappedError, OSError):
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise
+    # The marker belongs to the transfer, not to the cache Trivy reads.
+    (incoming / SCRATCH_MARKER).unlink(missing_ok=True)
+
+
 def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
                  staged_identity: tuple[int, int] | None = None,
                  rescan: Callable[[Path], bool] | None = None) -> None:
@@ -1312,16 +1362,6 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
     DELETE_CHILD lets that account rename the scanned tree aside and leave its
     own at the same name.
 
-    `rescan` is what makes the cross-device path safe rather than merely
-    watched. Two identity reads cannot see a swap that was reverted between
-    them, and neither sees a swap made part-way through, which leaves a copy
-    of half the scanned tree and half another. The copy is therefore scanned
-    itself before it is promoted, so the bytes that land in the cache are the
-    bytes something looked at, by construction rather than by inference. It
-    runs only where the copy runs: a same-volume promotion is a rename of the
-    tree that was already gated, and rescanning it would be scanning the same
-    inode twice.
-
     OSError propagates. The caller reports it, because it is the caller that
     knows the run this was part of. ScratchSwappedError propagates the same way.
     """
@@ -1354,54 +1394,7 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
     # Here rather than at the top of the function: the restore and the rmtree
     # above can take a while on a large leftover tree, and a check that ran
     # before them would leave that whole interval unguarded.
-    _refuse_if_swapped(staged, staged_identity)
-    # Marked after the identity check and before the copy, so the token names
-    # this tree at the moment it was last shown to be the scanned one.
-    token = _mark_scratch(staged) if staged_identity is not None else None
-    try:
-        # Same volume: a rename, and the except clause never runs. Another
-        # volume: rename fails (EXDEV on POSIX, a not-same-device error on
-        # Windows), and the copy happens here, while the live cache is still
-        # complete and still in place.
-        os.replace(staged, incoming)
-    except OSError as exc:
-        # Only a not-same-device rename earns the copy. Falling back on any
-        # OSError turned a permission or missing-path failure into a copy that
-        # half-writes the incoming tree and then reports its own error in place
-        # of the real cause. Windows raises error 17 here rather than EXDEV.
-        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
-            raise
-        # The cross-device path reads the source by pathname for as long as a
-        # gigabyte takes to copy, so the check above covers none of it. The
-        # copy is required to carry the token as well as the source to still
-        # have the identity: an ABA rename, aside during the copy and back
-        # before the check, restores the inode and defeats the comparison
-        # alone, but not a token the substituted tree could not read.
-        shutil.copytree(staged, incoming)
-        try:
-            _refuse_if_swapped(staged, staged_identity, when="during the copy")
-            if token is not None:
-                _require_marker(incoming, token)
-            # Three checks because each answers what the one before cannot.
-            # The identity read answers for the name and misses a rename
-            # reverted before it runs; the token answers that, and misses a
-            # swap made part-way through, which leaves the token copied from
-            # the real tree beside files from another. Only scanning the copy
-            # asks about the bytes that will be promoted rather than about
-            # where they came from.
-            if rescan is not None and not rescan(incoming):
-                # from None: the cross-device error is why this path runs, not
-                # why the scan refused, and chaining it would name the wrong
-                # cause in the traceback the operator reads.
-                raise ScratchSwappedError(
-                    f"the copy of {staged} at {incoming} did not pass the scan that "
-                    "the staged tree passed, so what would be promoted is not what "
-                    "was gated; the live cache is untouched") from None
-        except (ScratchSwappedError, OSError):
-            shutil.rmtree(incoming, ignore_errors=True)
-            raise
-    # The marker belongs to the transfer, not to the cache Trivy reads.
-    (incoming / SCRATCH_MARKER).unlink(missing_ok=True)
+    _bring_onto_volume(staged, incoming, staged_identity, rescan)
     if previous.exists():
         shutil.rmtree(previous, ignore_errors=True)
     if live.exists():
@@ -2423,9 +2416,9 @@ def target_trivy_db(args) -> int:
             promote_into(staged, live,
                          keep=("java-db",) if args.skip_java_db else (),
                          staged_identity=staged_identity,
-                         # Only a cross-device promotion calls this, and only
-                         # after the copy, so the tree that reaches the cache
-                         # is one this run scanned rather than one it inferred.
+                         # Called only by a cross-device promotion, after the
+                         # copy, so the tree the cache receives is one this
+                         # run scanned rather than one it inferred.
                          rescan=lambda copy: gate(
                              copy, "the copied Trivy databases", args.skip_scan))
         except ScratchSwappedError as exc:
