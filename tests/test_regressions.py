@@ -1189,8 +1189,9 @@ def test_an_offsetless_trivy_stamp_is_read_as_utc_not_local_time() -> None:
     overdue and describe_age both call astimezone(timezone.utc) on these
     values, and on a naive one that call assumes the host's zone, shifting
     every freshness judgement by the local UTC offset while reporting nothing.
-    The assertion is on the attached offset rather than on wall-clock fields,
-    so it fails on a host in any zone, including UTC."""
+    The offset assertion is what makes the failure host-independent: a check
+    on wall-clock fields after astimezone() would still pass on a UTC host.
+    The equality then pins the instant the stamp names."""
     parsed = us.parse_stamp("2026-08-15T12:00:00")
     assert parsed is not None
     assert parsed.utcoffset() == timedelta(0)
