@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/master/lockfile-sentinel-status.schema.json",
+  "title": "lockfile-sentinel-status",
+  "description": "Freshness document written by lockfile-sentinel --status --json. A pipeline reads it to decide whether a scan is worth trusting before running one. Fields may be added within schema version 1 without notice; a consumer rejects a schema name or version it does not know rather than guessing. Exit codes are the status command's own: 0 fresh, 1 stale, 2 unknown, and they are documented apart from the scan's exit codes. Plain status mode makes no network request; the live check appears only under --check-live.",
+  "type": "object",
+  "required": ["schema", "tool", "generated_utc", "sources", "overall"],
+  "properties": {
+    "schema": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "lockfile-sentinel-status" },
+        "version": { "const": 1 }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "lockfile-sentinel" },
+        "version": { "type": "string" }
+      }
+    },
+    "generated_utc": { "type": "string", "format": "date-time" },
+    "sources": {
+      "type": "object",
+      "required": ["osv_scanner", "overlay", "builtin_table", "osv_live", "osv_offline_db"],
+      "properties": {
+        "osv_scanner": {
+          "type": "object",
+          "required": ["path", "version", "built_from_commit", "version_checked_unix", "stale_after_seconds", "state"],
+          "properties": {
+            "path": { "type": ["string", "null"] },
+            "version": { "type": ["string", "null"] },
+            "built_from_commit": { "type": ["string", "null"] },
+            "version_checked_unix": { "type": ["number", "null"] },
+            "stale_after_seconds": { "type": "number" },
+            "state": { "$ref": "#/$defs/source_state" }
+          }
+        },
+        "overlay": {
+          "type": "object",
+          "required": ["path", "present", "package_count", "version_count", "generated_utc", "generated_unix", "last_refresh_unix", "stale_after_seconds", "state"],
+          "properties": {
+            "path": { "type": "string" },
+            "present": { "type": "boolean" },
+            "package_count": { "type": ["integer", "null"] },
+            "version_count": { "type": ["integer", "null"] },
+            "generated_utc": { "type": ["string", "null"] },
+            "generated_unix": { "type": ["number", "null"] },
+            "last_refresh_unix": { "type": ["number", "null"] },
+            "stale_after_seconds": { "type": "number" },
+            "state": { "$ref": "#/$defs/source_state" }
+          }
+        },
+        "builtin_table": {
+          "type": "object",
+          "required": ["package_version_pairs", "state"],
+          "properties": {
+            "package_version_pairs": { "type": "integer" },
+            "state": { "$ref": "#/$defs/source_state" }
+          }
+        },
+        "osv_live": {
+          "type": "object",
+          "required": ["mode", "note", "live_check", "state"],
+          "properties": {
+            "mode": { "const": "online" },
+            "note": { "type": "string" },
+            "live_check": {
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "required": ["attempted", "reachable", "latency_ms", "error"],
+                  "properties": {
+                    "attempted": { "type": "boolean" },
+                    "reachable": { "type": "boolean" },
+                    "latency_ms": { "type": "integer" },
+                    "error": { "type": ["string", "null"] }
+                  }
+                }
+              ]
+            },
+            "state": { "$ref": "#/$defs/source_state" }
+          }
+        },
+        "osv_offline_db": {
+          "type": "object",
+          "required": ["path", "present", "newest_file_unix", "stale_after_seconds", "state"],
+          "properties": {
+            "path": { "type": "string" },
+            "present": { "type": "boolean" },
+            "newest_file_unix": { "type": ["number", "null"] },
+            "stale_after_seconds": { "type": "number" },
+            "state": { "$ref": "#/$defs/source_state" }
+          }
+        }
+      }
+    },
+    "overall": {
+      "type": "object",
+      "required": ["state", "exit_code"],
+      "properties": {
+        "state": { "enum": ["fresh", "stale", "unknown"] },
+        "exit_code": { "enum": [0, 1, 2] }
+      }
+    }
+  },
+  "$defs": {
+    "source_state": {
+      "enum": ["fresh", "stale", "unknown", "absent"],
+      "description": "absent applies only to optional local copies, such as the offline database, whose absence is a mode rather than a fault; it never contributes to staleness or unknownness."
+    }
+  }
+}

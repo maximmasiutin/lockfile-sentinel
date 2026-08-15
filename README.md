@@ -1,4 +1,4 @@
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 
 Copyright (c) 2026 Maxim Masiutin. Released under [GPL-3.0-only](LICENSE.txt).
 
@@ -36,7 +36,7 @@ Two optional companions keep its inputs current and are not needed to scan: `upd
 ## Quick Start
 
 ```bash
-curl -O https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/v0.1.0/lockfile_sentinel.py
+curl -O https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/v0.2.0/lockfile_sentinel.py
 python lockfile_sentinel.py --selftest
 python lockfile_sentinel.py --root /path/to/repositories
 ```
@@ -66,7 +66,17 @@ python lockfile_sentinel.py --lockfile path/package-lock.json   # one file, verb
 python lockfile_sentinel.py --osv source -r ./app         # pass through to osv-scanner
 ```
 
-Exit codes are 0 when nothing was found, 1 when something was, and 2 when the scan could not be performed. A check that could not run never reports health.
+Exit codes state coverage, not just findings: 0 means complete requested coverage and nothing found, 1 means complete requested coverage with findings, and 2 means the scan or its requested coverage was incomplete, whether or not findings exist. A requested layer that is missing or partial, an unreadable applicable input, or a report that could not be written all return 2, and the findings gathered before the gap are still in the report. A layer declined with `--no-osv`, `--no-overlay` or `--no-trivy` is a recorded policy choice, never a failure. A check that could not run never reports health.
+
+## Machine-Readable Output
+
+`--json` writes a versioned envelope rather than a bare list. `schema` names the format, `lockfile-sentinel-report` version 1, and a consumer rejects a name or version it does not know rather than guessing; field additions within version 1 are non-breaking. `tool` names the producer and its version. `invocation` records the run's id, start and finish stamps, resolved roots, `--include-node-modules`, and the layers the caller requested, so a layer declined by a `--no-*` flag reads as policy rather than as a layer that broke.
+
+Coverage is data, not prose and not a boolean. `layers` carries one state object per detection layer, `builtin`, `overlay`, `osv` and `trivy`, each with `requested`, a `state` from `completed`, `partial`, `not_requested`, `unavailable` or `failed`, a stable `reason_code`, and the counts and provenance behind it, binary paths and versions, the overlay's digest and generation stamp, submitted and resolved counts, and duration. Each repository carries the same model in `coverage`, with `not_applicable` for a repository the layer had nothing to do in, so non-applicability and failure never share a value and a consumer never reconstructs coverage from other fields. `inputs` and `totals` reconcile the discovered, read, submitted and resolved counts at the top level.
+
+`findings` is the canonical flat array a pipeline consumes: one entry per fact with a stable id, a `kind` from `malicious_resolved`, `malicious_range` or `payload_artifact`, the package and version or range, the evidencing files relative to their repository, advisory ids, a campaign tag where one is known, and every `detection_layers` entry that saw it, so the offline table and OSV flagging the same resolved version is one finding with two layers rather than an equivalence every consumer rediscovers. `errors` is a bounded list of structured entries with stable codes, scope, and a retryable flag; when it is cut, the cut is the last entry.
+
+With `--output` set, in-progress snapshots go to `<output>.partial`, written atomically, and the requested path is written once, atomically, at the end; a consumer polling the final path never sees half-written JSON, and a killed run leaves the partial behind as parseable evidence marked incomplete. Snapshots carry `invocation.complete: false` with a null finish stamp. The final report sets the finish stamp and sets `complete` true only when every requested layer completed over every input, so a finished run with a coverage gap is `complete: false` with exit 2. On success the partial is removed. The format is pinned by `lockfile-sentinel-report.schema.json`, with a worked example in `lockfile-sentinel-report.example.json`; `--status --json` emits its own document, `lockfile-sentinel-status` version 1, pinned by `lockfile-sentinel-status.schema.json`, whose exit codes (0 fresh, 1 stale, 2 unknown) are documented apart from the scan's. Plain status mode makes no network request; `--status --check-live` adds one explicit probe of api.osv.dev and reports reachability and latency.
 
 ## Which Lockfiles Are Scanned
 
@@ -82,7 +92,7 @@ The payload artifact match by filename is applied to every file the walk visits,
 
 Every repository with npm tooling carries a `read:` line naming the manifests and lockfiles that were opened, as paths relative to that repository, so the enumeration can be checked against the tree rather than taken on trust. A file that was found and could not be read is named separately rather than listed as read, long lists are capped, and the remainder is counted rather than dropped.
 
-`--lockfile` and `--lockfiles-from` bypass the name check entirely and check whatever path they are given, so an unscanned format can be checked by hand. Both layers run and each file's line names the one that spoke, so a version the offline table knows is reported whether or not the live database has caught up, and the offline table runs even where osv-scanner is absent. Diagnosis mode has its own exit codes: 1 when anything was found or any file could not be read or extracted, 0 when every file was read, extracted and came back clean, and 2 when nothing was found but a layer that should have run did not, such as an osv-scanner that is absent or times out. `--no-osv` is a deliberate scoping rather than a failure, so a clean run under it returns 0. The sweep differs here, and returns 0 after a clean offline-only run whatever the reason the live layer did not run.
+`--lockfile` and `--lockfiles-from` bypass the name check entirely and check whatever path they are given, so an unscanned format can be checked by hand. Both layers run and each file's line names the one that spoke, so a version the offline table knows is reported whether or not the live database has caught up, and the offline table runs even where osv-scanner is absent. Diagnosis mode has its own exit codes: 1 when anything was found or any file could not be read or extracted, 0 when every file was read, extracted and came back clean, and 2 when nothing was found but a layer that should have run did not, such as an osv-scanner that is absent or times out. `--no-osv` is a deliberate scoping rather than a failure, so a clean run under it returns 0; a requested live layer that could not run returns 2, in diagnosis mode and in the sweep alike.
 
 ```bash
 python lockfile_sentinel.py --lockfile path/npm-shrinkwrap.json

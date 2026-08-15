@@ -29,7 +29,7 @@ Usage:
     python schedule_tasks.py --all --elevate --path-var MY_REPOS_DIR
 """
 
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel
@@ -63,7 +63,7 @@ from typing import TypedDict
 # Carried per file rather than imported, because each of these three runs on its
 # own and an imported version would tie a standalone copy back to a checkout it
 # may not have. tests/test_headers.py is what keeps the three from drifting.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def escape(text: str) -> str:
@@ -92,21 +92,22 @@ def ps_quote(text: str) -> str:
 
 
 def resolve_system_tool(name: str) -> str:
-    """System32 path on Windows, PATH elsewhere, bare name as last resort.
+    """The System32 path of a system executable, or the bare name if absent.
 
-    shutil.which searches PATH, so on Windows it closes only the
-    current-directory hijack: a PATH entry ahead of System32 is exactly the
-    planting an unprivileged account can arrange against a program that
-    registers tasks elevated, measured with a decoy whoami.exe by the twin
-    resolver in update_scanners.py, which each file carries because both ship
-    alone. The fallback is the bare name, never a PATH search, and on Windows
-    `name` needs its extension since the file test sees no PATHEXT. Elsewhere
-    PATH is the system's own lookup for crontab, so which stands."""
-    if IS_WINDOWS:
-        root = os.environ.get("SystemRoot", r"C:\Windows")
-        candidate = Path(root) / "System32" / name
-        return str(candidate) if candidate.is_file() else name
-    return shutil.which(name) or name
+    Mirrors the resolver in update_scanners.py: resolving against
+    %SystemRoot%\\System32 closes both the current-directory and the PATH
+    planting vectors for a program that is often run elevated, where
+    `shutil.which` closed only the first. The bare-name fallback keeps an
+    unusual layout, and every Unix tool such as crontab, working with the
+    tool's own failure message; it never consults PATH itself. `name` needs
+    its extension, since the file test sees no PATHEXT. With SystemRoot unset,
+    the usual Unix case, the bare name is returned at once: a hardcoded default
+    would be a relative path there, reopening the current-directory vector."""
+    root = os.environ.get("SystemRoot")
+    if not root:
+        return name
+    candidate = Path(root) / "System32" / name
+    return str(candidate) if candidate.is_file() else name
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UPDATER = SCRIPT_DIR / "update_scanners.py"
