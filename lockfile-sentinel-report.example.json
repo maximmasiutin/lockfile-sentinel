@@ -8,33 +8,265 @@
     "version": "0.1.0"
   },
   "invocation": {
-    "id": "3f6cbe9e-3a3f-4a3e-9a3d-2f1e0d9c8b7a",
-    "started_utc": "2026-08-15T09:12:44Z",
-    "finished_utc": "2026-08-15T09:12:47Z",
-    "complete": true,
-    "roots": ["/scans/tree"],
+    "id": "00000000-0000-0000-0000-000000000000",
+    "started_utc": "2026-08-15T00:00:00Z",
+    "finished_utc": "2026-08-15T00:00:05Z",
+    "complete": false,
+    "roots": [
+      "/t"
+    ],
     "include_node_modules": false,
-    "requested_layers": ["builtin", "overlay", "osv", "trivy"]
+    "requested_layers": [
+      "builtin",
+      "overlay",
+      "osv"
+    ]
+  },
+  "layers": {
+    "builtin": {
+      "requested": true,
+      "state": "completed",
+      "reason_code": null,
+      "message": null,
+      "package_count": 10,
+      "version_count": 10
+    },
+    "overlay": {
+      "requested": true,
+      "state": "completed",
+      "reason_code": null,
+      "message": null,
+      "path": "/cache/compromised-npm-packages.json",
+      "generated_utc": "2026-08-15T00:00:00Z",
+      "digest_sha256": null,
+      "package_count": 900,
+      "version_count": 1500,
+      "refresh_requested": true,
+      "refresh_outcome": "throttled",
+      "stale_after_hours": 24.0
+    },
+    "osv": {
+      "requested": true,
+      "state": "completed",
+      "reason_code": null,
+      "message": null,
+      "binary": "osv-scanner-not-actually-run",
+      "version": null,
+      "lockfiles_discovered": 2,
+      "submitted": 0,
+      "resolved": 2,
+      "failed": 0,
+      "skipped_empty": 0,
+      "skipped_unreadable": 0,
+      "duration_ms": 0
+    },
+    "trivy": {
+      "requested": false,
+      "state": "not_requested",
+      "reason_code": null,
+      "message": null,
+      "binary": null,
+      "version": null,
+      "repositories_flagged": 1,
+      "lockfiles_submitted": 0,
+      "lockfiles_failed": 0
+    }
+  },
+  "inputs": {
+    "manifests_discovered": 1,
+    "lockfiles_discovered": 2,
+    "lockfiles_submitted": 0,
+    "lockfiles_resolved": 2,
+    "lockfiles_failed": 0,
+    "files_read": 2,
+    "files_unreadable": 1
+  },
+  "totals": {
+    "repositories": 2,
+    "with_npm_tooling": 2,
+    "with_watched_packages": 1,
+    "vulnerable": 1,
+    "findings": 2
   },
   "repositories": [
     {
-      "name": "app",
-      "path": "/scans/tree/app",
+      "name": "clean-lib",
+      "path": "/t/clean-lib",
       "has_npm": true,
-      "npm_files": ["package.json"],
-      "read_files": ["package.json", "package-lock.json"],
+      "npm_files": [
+        "/t/clean-lib/package-lock.json"
+      ],
+      "read_files": [
+        "/t/clean-lib/package-lock.json"
+      ],
       "unreadable_files": [],
-      "lockfiles": ["package-lock.json"],
-      "present_versions": { "keyv": ["6.0.0"] },
+      "lockfiles": [
+        "/t/clean-lib/package-lock.json"
+      ],
+      "counts": {
+        "manifests_discovered": 0,
+        "lockfiles_discovered": 1,
+        "files_read": 1,
+        "files_unreadable": 0,
+        "lockfiles_unreadable": 0
+      },
+      "present_versions": {},
       "range_only": {},
-      "poisoned_versions": { "keyv": ["6.0.0"] },
+      "poisoned_versions": {},
       "poisoned_ranges": {},
       "payload_files": [],
       "osv_checked": true,
-      "osv_malicious": { "keyv": ["6.0.0"] },
-      "osv_advisory_ids": { "keyv": ["MAL-2026-00001"] },
+      "osv_malicious": {},
+      "osv_advisory_ids": {},
+      "trivy_confirmed": {},
+      "coverage": {
+        "osv": {
+          "state": "completed",
+          "reason_codes": [],
+          "discovered": 1,
+          "readable": 1,
+          "submitted": 1,
+          "resolved": 1,
+          "failed": 0
+        },
+        "trivy": {
+          "state": "not_requested",
+          "reason_codes": [],
+          "flagged_lockfiles": 0,
+          "submitted": 0,
+          "failed": 0,
+          "confirmed_packages": 0
+        }
+      },
+      "package_present": false,
+      "vulnerable": false
+    },
+    {
+      "name": "vulnerable-app",
+      "path": "/t/vulnerable-app",
+      "has_npm": true,
+      "npm_files": [
+        "/t/vulnerable-app/package.json",
+        "/t/vulnerable-app/package-lock.json"
+      ],
+      "read_files": [
+        "/t/vulnerable-app/package-lock.json"
+      ],
+      "unreadable_files": [
+        "/t/vulnerable-app/package.json"
+      ],
+      "lockfiles": [
+        "/t/vulnerable-app/package-lock.json"
+      ],
+      "counts": {
+        "manifests_discovered": 1,
+        "lockfiles_discovered": 1,
+        "files_read": 1,
+        "files_unreadable": 1,
+        "lockfiles_unreadable": 0
+      },
+      "present_versions": {
+        "keyv": [
+          "6.0.0"
+        ]
+      },
+      "range_only": {},
+      "poisoned_versions": {
+        "keyv": [
+          "6.0.0"
+        ]
+      },
+      "poisoned_ranges": {},
+      "payload_files": [
+        "/t/vulnerable-app/scripts/bun_environment.js"
+      ],
+      "osv_checked": true,
+      "osv_malicious": {
+        "keyv": [
+          "6.0.0"
+        ]
+      },
+      "osv_advisory_ids": {
+        "keyv@6.0.0": [
+          "MAL-2026-11524"
+        ]
+      },
+      "trivy_confirmed": {},
+      "coverage": {
+        "osv": {
+          "state": "completed",
+          "reason_codes": [],
+          "discovered": 1,
+          "readable": 1,
+          "submitted": 1,
+          "resolved": 1,
+          "failed": 0
+        },
+        "trivy": {
+          "state": "not_requested",
+          "reason_codes": [],
+          "flagged_lockfiles": 1,
+          "submitted": 0,
+          "failed": 0,
+          "confirmed_packages": 0
+        }
+      },
       "package_present": true,
       "vulnerable": true
+    }
+  ],
+  "findings": [
+    {
+      "id": "6b2403aadba12815",
+      "kind": "malicious_resolved",
+      "ecosystem": "npm",
+      "package": "keyv",
+      "version": "6.0.0",
+      "range": null,
+      "repository": "vulnerable-app",
+      "repository_path": "/t/vulnerable-app",
+      "source_files": [
+        "package-lock.json"
+      ],
+      "advisories": [
+        "MAL-2026-11524"
+      ],
+      "detection_layers": [
+        "offline_table",
+        "osv"
+      ],
+      "campaign": "shai-hulud",
+      "trivy_confirmed": []
+    },
+    {
+      "id": "ce57ae73ed1c2a65",
+      "kind": "payload_artifact",
+      "ecosystem": "npm",
+      "package": null,
+      "version": null,
+      "range": null,
+      "artifact": "bun_environment.js",
+      "repository": "vulnerable-app",
+      "repository_path": "/t/vulnerable-app",
+      "source_files": [
+        "scripts/bun_environment.js"
+      ],
+      "advisories": [],
+      "detection_layers": [
+        "offline_table"
+      ],
+      "campaign": "shai-hulud",
+      "trivy_confirmed": []
+    }
+  ],
+  "errors": [
+    {
+      "code": "manifest_unreadable",
+      "scope": "file",
+      "repository": "vulnerable-app",
+      "file": "/t/vulnerable-app/package.json",
+      "retryable": false,
+      "message": "found but could not be read or parsed"
     }
   ]
 }

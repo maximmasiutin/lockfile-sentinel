@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/master/lockfile-sentinel-report.schema.json",
   "title": "lockfile-sentinel-report",
-  "description": "Scan report written by lockfile-sentinel --json. Fields may be added within schema version 1 without notice; a consumer rejects a schema name or version it does not know rather than guessing, and must not treat unknown fields as an error.",
+  "description": "Scan report written by lockfile-sentinel --json. Fields may be added within schema version 1 without notice; a consumer rejects a schema name or version it does not know rather than guessing, and must not treat unknown fields as an error. A consumer that meets an unknown applicable coverage or layer state fails loudly rather than reading an unfamiliar condition as clean.",
   "type": "object",
-  "required": ["schema", "tool", "invocation", "repositories"],
+  "required": ["schema", "tool", "invocation", "layers", "inputs", "totals", "repositories", "findings", "errors"],
   "properties": {
     "schema": {
       "type": "object",
@@ -39,7 +39,7 @@
         "finished_utc": { "type": ["string", "null"], "format": "date-time" },
         "complete": {
           "type": "boolean",
-          "description": "False on the snapshot writes an interrupted run leaves behind; true only on the final write. A consumer treats a report with complete false as evidence of an unfinished scan, never as a final result."
+          "description": "True only when the run finished AND every requested layer completed over every input. A snapshot an interrupted run leaves behind has complete false and finished_utc null; a finished run with a coverage gap has complete false and finished_utc set, and exits 2. A consumer treats complete false as a scan whose absence of findings proves nothing."
         },
         "roots": { "type": "array", "items": { "type": "string" } },
         "include_node_modules": { "type": "boolean" },
@@ -50,9 +50,52 @@
         }
       }
     },
+    "layers": {
+      "type": "object",
+      "required": ["builtin", "overlay", "osv", "trivy"],
+      "description": "One state object per detection layer. Exit codes 0 and 1 both assert that every requested layer completed; anything short of that exits 2, findings or not.",
+      "properties": {
+        "builtin": { "$ref": "#/$defs/layer" },
+        "overlay": { "$ref": "#/$defs/layer" },
+        "osv": { "$ref": "#/$defs/layer" },
+        "trivy": { "$ref": "#/$defs/layer" }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": [
+        "manifests_discovered",
+        "lockfiles_discovered",
+        "lockfiles_submitted",
+        "lockfiles_resolved",
+        "lockfiles_failed",
+        "files_read",
+        "files_unreadable"
+      ],
+      "additionalProperties": { "type": "integer" }
+    },
+    "totals": {
+      "type": "object",
+      "required": [
+        "repositories",
+        "with_npm_tooling",
+        "with_watched_packages",
+        "vulnerable",
+        "findings"
+      ],
+      "additionalProperties": { "type": "integer" }
+    },
     "repositories": {
       "type": "array",
       "items": { "$ref": "#/$defs/repository" }
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/error" }
     }
   },
   "$defs": {
@@ -61,6 +104,22 @@
       "additionalProperties": {
         "type": "array",
         "items": { "type": "string" }
+      }
+    },
+    "layer_state": {
+      "enum": ["completed", "partial", "not_requested", "unavailable", "failed"]
+    },
+    "coverage_state": {
+      "enum": ["completed", "partial", "not_requested", "unavailable", "failed", "not_applicable"]
+    },
+    "layer": {
+      "type": "object",
+      "required": ["requested", "state", "reason_code", "message"],
+      "properties": {
+        "requested": { "type": "boolean" },
+        "state": { "$ref": "#/$defs/layer_state" },
+        "reason_code": { "type": ["string", "null"] },
+        "message": { "type": ["string", "null"] }
       }
     },
     "repository": {
@@ -73,6 +132,7 @@
         "read_files",
         "unreadable_files",
         "lockfiles",
+        "counts",
         "present_versions",
         "range_only",
         "poisoned_versions",
@@ -81,6 +141,8 @@
         "osv_checked",
         "osv_malicious",
         "osv_advisory_ids",
+        "trivy_confirmed",
+        "coverage",
         "package_present",
         "vulnerable"
       ],
@@ -92,6 +154,17 @@
         "read_files": { "type": "array", "items": { "type": "string" } },
         "unreadable_files": { "type": "array", "items": { "type": "string" } },
         "lockfiles": { "type": "array", "items": { "type": "string" } },
+        "counts": {
+          "type": "object",
+          "required": [
+            "manifests_discovered",
+            "lockfiles_discovered",
+            "files_read",
+            "files_unreadable",
+            "lockfiles_unreadable"
+          ],
+          "additionalProperties": { "type": "integer" }
+        },
         "present_versions": { "$ref": "#/$defs/package_versions" },
         "range_only": { "$ref": "#/$defs/package_versions" },
         "poisoned_versions": { "$ref": "#/$defs/package_versions" },
@@ -100,8 +173,91 @@
         "osv_checked": { "type": "boolean" },
         "osv_malicious": { "$ref": "#/$defs/package_versions" },
         "osv_advisory_ids": { "$ref": "#/$defs/package_versions" },
+        "trivy_confirmed": { "$ref": "#/$defs/package_versions" },
+        "coverage": {
+          "type": "object",
+          "required": ["osv", "trivy"],
+          "properties": {
+            "osv": {
+              "type": "object",
+              "required": ["state", "reason_codes", "discovered", "readable", "submitted", "resolved", "failed"],
+              "properties": {
+                "state": { "$ref": "#/$defs/coverage_state" },
+                "reason_codes": { "type": "array", "items": { "type": "string" } },
+                "discovered": { "type": "integer" },
+                "readable": { "type": "integer" },
+                "submitted": { "type": "integer" },
+                "resolved": { "type": "integer" },
+                "failed": { "type": "integer" }
+              }
+            },
+            "trivy": {
+              "type": "object",
+              "required": ["state", "reason_codes", "flagged_lockfiles", "submitted", "failed", "confirmed_packages"],
+              "properties": {
+                "state": { "$ref": "#/$defs/coverage_state" },
+                "reason_codes": { "type": "array", "items": { "type": "string" } },
+                "flagged_lockfiles": { "type": "integer" },
+                "submitted": { "type": "integer" },
+                "failed": { "type": "integer" },
+                "confirmed_packages": { "type": "integer" }
+              }
+            }
+          }
+        },
         "package_present": { "type": "boolean" },
         "vulnerable": { "type": "boolean" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "ecosystem",
+        "package",
+        "version",
+        "range",
+        "repository",
+        "repository_path",
+        "source_files",
+        "advisories",
+        "detection_layers",
+        "campaign",
+        "trivy_confirmed"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+        "kind": { "enum": ["malicious_resolved", "malicious_range", "payload_artifact"] },
+        "ecosystem": { "const": "npm" },
+        "package": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] },
+        "range": { "type": ["string", "null"] },
+        "artifact": { "type": "string" },
+        "repository": { "type": "string" },
+        "repository_path": { "type": "string" },
+        "source_files": { "type": "array", "items": { "type": "string" } },
+        "advisories": { "type": "array", "items": { "type": "string" } },
+        "detection_layers": {
+          "type": "array",
+          "items": { "enum": ["offline_table", "osv"] },
+          "minItems": 1,
+          "description": "Every layer that saw this finding. The offline table and OSV flagging the same resolved version is one finding with two layers, never two findings."
+        },
+        "campaign": { "type": ["string", "null"] },
+        "trivy_confirmed": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "scope", "repository", "file", "retryable", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "scope": { "enum": ["invocation", "layer", "repository", "file"] },
+        "repository": { "type": ["string", "null"] },
+        "file": { "type": ["string", "null"] },
+        "retryable": { "type": "boolean" },
+        "message": { "type": "string", "maxLength": 300 }
       }
     }
   }
