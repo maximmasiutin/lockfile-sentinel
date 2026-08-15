@@ -325,7 +325,6 @@ def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
         failure = kwargs.get("failure")
         if failure is not None:
             failure["cause"] = "unavailable"
-        return None
 
     monkeypatch.setattr(ls, "_run_osv_batch", timed_out)
     code = ls.diagnose_lockfiles("osv-scanner", [str(lockfile)], timeout=5)
@@ -858,6 +857,51 @@ def test_the_tool_resolver_falls_back_to_the_bare_name_not_to_path(
     (decoy / "whoami.exe").write_bytes(b"")
     monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
     assert us.resolve_system_tool("whoami.exe") == "whoami.exe"
+
+
+def test_the_scheduler_resolver_ignores_a_decoy_that_is_first_on_path(
+        tmp_path, monkeypatch) -> None:
+    """schtasks.exe registers the tasks, so its resolver must close the same
+    PATH-planting vector the updater's does. shutil.which, which this helper
+    used, passes every other test and fails this one, and the helper's own
+    docstring named PATH as the surface it closed while consulting it."""
+    system32 = tmp_path / "windows" / "System32"
+    system32.mkdir(parents=True)
+    (system32 / "schtasks.exe").write_bytes(b"")
+    decoy = tmp_path / "planted"
+    decoy.mkdir()
+    (decoy / "schtasks.exe").write_bytes(b"")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "windows"))
+    monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
+    assert st.resolve_system_tool("schtasks.exe") == str(system32 / "schtasks.exe")
+
+
+def test_the_scheduler_resolver_falls_back_to_the_bare_name_not_to_path(
+        tmp_path, monkeypatch) -> None:
+    """When System32 lacks the file the answer is the bare name, decoy and
+    all: a fallback that searched PATH would be the hijack with an extra
+    step."""
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "windows"))
+    decoy = tmp_path / "planted"
+    decoy.mkdir()
+    (decoy / "schtasks.exe").write_bytes(b"")
+    monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
+    assert st.resolve_system_tool("schtasks.exe") == "schtasks.exe"
+
+
+def test_the_scheduler_resolver_hands_crontab_to_the_os_without_reading_path(
+        tmp_path, monkeypatch) -> None:
+    """With SystemRoot unset, the Unix case, the bare name goes to exec.
+
+    A decoy first on PATH must not be the answer: resolving it here would put
+    a planted crontab in an elevated argv, and exec's own lookup is what the
+    bare name defers to."""
+    decoy = tmp_path / "planted"
+    decoy.mkdir()
+    (decoy / "crontab").write_bytes(b"")
+    monkeypatch.delenv("SystemRoot", raising=False)
+    monkeypatch.setenv("PATH", str(decoy) + os.pathsep + os.environ.get("PATH", ""))
+    assert st.resolve_system_tool("crontab") == "crontab"
 
 
 def test_an_unreadable_sid_warns_and_still_produces_a_usable_scratch(
