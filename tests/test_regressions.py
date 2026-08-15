@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1180,6 +1181,31 @@ def test_a_task_path_falls_back_to_absolute_when_the_variable_is_unset() -> None
     os.environ.pop("LS_REGRESSION_UNSET", None)
     path = str(Path("/opt/tool.py"))
     assert st.envify(path, "LS_REGRESSION_UNSET") == path
+
+
+def test_an_offsetless_trivy_stamp_is_read_as_utc_not_local_time() -> None:
+    """A naive datetime slips through astimezone() as local time, not an error.
+
+    overdue and describe_age both call astimezone(timezone.utc) on these
+    values, and on a naive one that call assumes the host's zone, shifting
+    every freshness judgement by the local UTC offset while reporting nothing.
+    The assertion is on the attached offset rather than on wall-clock fields,
+    so it fails on a host in any zone, including UTC."""
+    parsed = us.parse_stamp("2026-08-15T12:00:00")
+    assert parsed is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parsed == datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_a_non_utc_offset_is_honoured_rather_than_overwritten() -> None:
+    """The careless fix replaces tzinfo wholesale and moves the instant.
+
+    A stamp carrying +03:00 names the same moment as its UTC rendering; a fix
+    that stamped UTC onto the parsed fields would shift it by three hours."""
+    parsed = us.parse_stamp("2026-08-15T15:00:00+03:00")
+    assert parsed is not None
+    assert parsed.utcoffset() == timedelta(hours=3)
+    assert parsed == datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------------------
