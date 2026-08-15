@@ -37,9 +37,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import lockfile_sentinel as ls  # noqa: E402
-import schedule_tasks as st  # noqa: E402
-import update_scanners as us  # noqa: E402
+# The path insertion above is what makes these imports resolvable at all, so
+# they cannot precede it; the suppressions state that rather than restructure
+# the project into a package for the tests' sake.
+import lockfile_sentinel as ls  # noqa: E402  pylint: disable=wrong-import-position
+import schedule_tasks as st  # noqa: E402  pylint: disable=wrong-import-position
+import update_scanners as us  # noqa: E402  pylint: disable=wrong-import-position
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +318,10 @@ def test_a_scanner_that_never_answered_is_not_reported_as_a_bad_lockfile(
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text("{}", encoding="utf-8")
 
-    def timed_out(*_args, **kwargs):
+    # The stub stands in for a function whose None answer is the case under
+    # test, so the return is the point rather than an accident of falling
+    # off the end.
+    def timed_out(*_args, **kwargs):  # pylint: disable=useless-return
         failure = kwargs.get("failure")
         if failure is not None:
             failure["cause"] = "unavailable"
@@ -1195,6 +1201,7 @@ def test_a_failed_feed_refresh_keeps_the_existing_overlay(tmp_path: Path, monkey
     monkeypatch.setattr(us, "open_https", unreachable)
 
     class Args:
+        """The argparse namespace target_malicious_packages expects, pinned."""
         output = str(overlay)
         source_url = "https://example.invalid/iocs.csv"
         skip_scan = True
@@ -1218,6 +1225,7 @@ def test_a_non_https_feed_url_is_refused_before_any_request(tmp_path: Path, monk
     monkeypatch.setattr(us, "open_https", must_not_open)
 
     class Args:
+        """The argparse namespace target_malicious_packages expects, pinned."""
         output = str(tmp_path / "overlay.json")
         source_url = ""
         skip_scan = True
@@ -1403,6 +1411,265 @@ def test_a_symlinked_cache_keeps_pointing_where_it_was_aimed(tmp_path) -> None:
     assert (target / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
     assert not live.with_name(live.name + ".previous").exists()
     assert not target.with_name(target.name + ".previous").exists()
+
+
+def test_a_kept_database_survives_a_promotion_that_did_not_stage_it(tmp_path) -> None:
+    """A run that skipped the Java index must not delete the one the cache holds.
+
+    --skip-java-db stages only the vulnerability database, and promotion
+    replaces the whole cache directory, so without the carry the flag that says
+    skip deletes. The carried tree has to arrive byte-identical, since it was
+    never re-downloaded."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+    (live / "java-db").mkdir()
+    (live / "java-db" / "trivy-java.db").write_text("java-old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    us.promote_into(staged, live, keep=("java-db",))
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+    assert (live / "java-db" / "trivy-java.db").read_text(encoding="utf-8") == "java-old"
+    assert not live.with_name(live.name + ".previous").exists()
+
+
+def test_a_failed_cross_device_copy_leaves_the_previous_cache_live(tmp_path, monkeypatch) -> None:
+    """A copy that dies part-way must not have touched the cache Trivy reads.
+
+    When staging sits on another filesystem the move into place is a copy, and
+    the old code renamed the live cache aside before starting it, so a failure
+    left `live` absent or half written. The copy now lands in an `.incoming`
+    sibling first, so the failure happens while the live cache is still whole."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def die_mid_copy(_src, dst):
+        Path(dst).mkdir()
+        (Path(dst) / "db").mkdir()
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", die_mid_copy)
+
+    with pytest.raises(OSError):
+        us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_a_failed_final_swap_puts_the_previous_cache_back(tmp_path, monkeypatch) -> None:
+    """The one rename that can strand the cache restores it on failure.
+
+    After the live tree is renamed aside, a failure of the rename into place
+    used to leave nothing at `live` at all. The previous cache is renamed
+    straight back, so Trivy keeps reading the databases it had."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    real_replace = os.replace
+    incoming = live.with_name(live.name + ".incoming")
+
+    def refuse_the_swap_into_place(src, dst, **kwargs):
+        if Path(src) == incoming:
+            raise OSError(13, "Permission denied")
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_swap_into_place)
+
+    with pytest.raises(OSError):
+        us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+
+
+def test_an_interrupted_promotion_is_restored_before_anything_is_deleted(tmp_path, monkeypatch) -> None:
+    """A run killed between the two renames must not cost the next run the cache.
+
+    That death leaves the only good cache at .previous and nothing at live.
+    The next promotion used to clear .previous as a leftover, so a second
+    failure of the swap ended with no cache at all. The restore happens before
+    any cleanup, so even a swap that fails again leaves the old databases
+    where Trivy reads."""
+    live = tmp_path / "trivy-cache"
+    previous = live.with_name(live.name + ".previous")
+    (previous / "db").mkdir(parents=True)
+    (previous / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    real_replace = os.replace
+    incoming = live.with_name(live.name + ".incoming")
+
+    def refuse_the_swap_into_place(src, dst, **kwargs):
+        if Path(src) == incoming:
+            raise OSError(13, "Permission denied")
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_swap_into_place)
+
+    with pytest.raises(OSError):
+        us.promote_into(staged, live)
+
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not previous.exists(), "the only good cache was left renamed aside"
+
+
+def test_the_space_requirement_follows_what_is_staged(tmp_path, monkeypatch) -> None:
+    """A run that stages a tenth the bytes must not demand the full figure.
+
+    The 5 GB requirement priced every run as a full refresh, so a base with
+    ample room for a vulnerability-only download was rejected and the staging
+    fell through to the unchecked system temporary directory."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 1024 ** 3)
+
+    small_need = us.SCRATCH_NEED_BYTES["vulnerability"]
+    assert small_need < 1024 ** 3 < us.SCRATCH_MIN_FREE_BYTES
+
+    with us.scratch_dir("test", near=cache, need=small_need) as scratch:
+        assert scratch.parent == tmp_path, f"fell through to the fallback: {scratch}"
+
+
+def test_a_missing_cache_parent_is_created_rather_than_rejected(tmp_path, monkeypatch) -> None:
+    """Refusing to stage in a directory the run is about to create was absurd.
+
+    On a first run against a host with no cache yet, the availability check
+    rejected the cache parent and the download fell through to the system
+    temporary volume, the small one, in the one case the mechanism was most
+    needed. Promotion creates the parent moments later anyway."""
+    cache = tmp_path / "brand-new" / "trivy-cache"
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 100 * 1024 ** 3)
+
+    with us.scratch_dir("test", near=cache) as scratch:
+        assert scratch.parent == cache.parent, f"fell through to the fallback: {scratch}"
+        assert cache.parent.is_dir()
+
+
+def test_no_volume_with_room_refuses_before_downloading(tmp_path, monkeypatch) -> None:
+    """Deciding during the download costs a gigabyte to report the wrong symptom.
+
+    When every candidate and the last-resort system temporary directory are all
+    measurably short, the run used to proceed anyway and die inside Trivy with
+    an obscure write error. The refusal happens before a byte is spent and
+    names each base with its figure."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us.tempfile, "gettempdir", lambda: str(tmp_path / "small-temp"))
+    (tmp_path / "small-temp").mkdir()
+    monkeypatch.setattr(us, "free_bytes", lambda path: 1024)
+
+    with pytest.raises(us.ScratchUnavailableError) as refusal:
+        with us.scratch_dir("test", near=cache):
+            pytest.fail("a scratch was yielded despite no volume having room")
+    assert "GB" in str(refusal.value)
+    assert str(cache.parent) in str(refusal.value)
+
+
+def test_an_unmeasurable_last_resort_still_proceeds(tmp_path, monkeypatch) -> None:
+    """Unknown is not known-short, and refusing on it would refuse blind.
+
+    free_bytes answers None where the filesystem will not say. A refusal is a
+    claim that no volume has room, which cannot be made about a volume whose
+    room could not be read."""
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(us, "free_bytes", lambda path: None)
+
+    with us.scratch_dir("test") as scratch:
+        assert scratch.parent == tmp_path
+
+
+def test_a_cleanup_failure_reaches_the_callers_list(tmp_path, monkeypatch) -> None:
+    """The WARNING in the log is not enough for a scheduled run to turn amber.
+
+    The finally cannot raise without masking an exception already in flight,
+    so the leaked path is appended to the caller's list, which is how the exit
+    code learns the work succeeded but a gigabyte was left behind."""
+    cache = tmp_path / "trivy-cache"
+    cache.mkdir()
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "free_bytes", lambda path: 100 * 1024 ** 3)
+    real_rmtree = us.shutil.rmtree
+
+    def refuse_scratch_removal(path, *args, **kwargs):
+        if Path(str(path)).name.startswith("temp-"):
+            raise OSError(32, "held open by another process")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(us.shutil, "rmtree", refuse_scratch_removal)
+
+    leaks: list[Path] = []
+    with us.scratch_dir("test", near=cache, leaks=leaks) as scratch:
+        kept = scratch
+    assert leaks == [kept], "the failed cleanup did not reach the caller"
+
+    with pytest.raises(ValueError, match="in flight"):
+        with us.scratch_dir("test", near=cache, leaks=leaks):
+            raise ValueError("the failure already in flight")
+    assert len(leaks) == 2, "the cleanup failure went unrecorded on the failure path"
+
+
+def test_a_leaked_scratch_turns_the_exit_amber_but_not_red(tmp_path, monkeypatch) -> None:
+    """Exit 0 with a leak looks identical to a clean run, and nothing else looks.
+
+    A refresh that downloaded, gated and promoted correctly and then could not
+    remove its scratch exits 3: distinct from success, and distinct from a
+    failed refresh, so a scheduler can tell the databases are fine while the
+    disk is quietly filling."""
+    cache = tmp_path / "trivy-cache"
+    soon = datetime.now(timezone.utc) + timedelta(days=1)
+    fresh = {"vulnerability": {"updated": soon, "next_update": soon},
+             "java": {"updated": soon, "next_update": soon}}
+    monkeypatch.setattr(us, "SCRATCH_BASE", "")
+    monkeypatch.setattr(us, "resolve_trivy", lambda: "trivy")
+    monkeypatch.setattr(us, "trivy_freshness", lambda _trivy, env=None: dict(fresh))
+    monkeypatch.setattr(us, "run", lambda *args, **kwargs: (0, ""))
+    monkeypatch.setattr(us, "trivy_cache_dir_default", lambda: cache)
+    monkeypatch.setattr(us, "free_bytes", lambda path: 100 * 1024 ** 3)
+    real_rmtree = us.shutil.rmtree
+
+    def refuse_scratch_removal(path, *args, **kwargs):
+        if Path(str(path)).name.startswith("temp-"):
+            raise OSError(32, "held open by another process")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(us.shutil, "rmtree", refuse_scratch_removal)
+
+    class Args:
+        """The argparse namespace target_trivy_db expects, pinned."""
+        force = True
+        skip_java_db = False
+        skip_scan = True
+
+    assert us.target_trivy_db(Args()) == 3
+    assert cache.is_dir(), "the leak verdict displaced the promotion itself"
 
 
 def test_a_symlinked_cache_stages_on_the_volume_it_points_at(tmp_path, monkeypatch) -> None:
