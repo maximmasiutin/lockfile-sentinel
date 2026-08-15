@@ -76,6 +76,7 @@ import tempfile
 import time
 import urllib.request
 from collections.abc import Sequence
+from typing import Any
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -105,6 +106,13 @@ SCRATCH_BASE = os.environ.get("LOCKFILE_SENTINEL_SCRATCH", "")
 SCRATCH_MIN_FREE_BYTES = 5 * 1024 ** 3
 
 
+def platform_cache_base() -> str:
+    """The platform's per-user cache root, before any tool's own subdirectory."""
+    if IS_WINDOWS:
+        return os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+
+
 def cache_dir() -> Path:
     """The cache root for everything this program writes.
 
@@ -114,11 +122,7 @@ def cache_dir() -> Path:
     explicit = os.environ.get("LOCKFILE_SENTINEL_CACHE")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(base) / "lockfile-sentinel"
+    return Path(platform_cache_base()) / "lockfile-sentinel"
 
 
 LOG_DIR = cache_dir() / "logs"
@@ -412,7 +416,7 @@ def osv_version(exe: Path | None) -> str | None:
     code, out = run([str(exe), "--version"], timeout=60)
     if code == 127:
         return None
-    match = re.search(r"osv-scanner version:\s*([0-9]\S*)", out)
+    match = re.search(r"osv-scanner version:\s*(\d\S*)", out)
     return match.group(1) if match else None
 
 
@@ -455,11 +459,7 @@ def trivy_cache_dir_default() -> Path:
     explicit = os.environ.get("TRIVY_CACHE_DIR")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(base) / "trivy"
+    return Path(platform_cache_base()) / "trivy"
 
 
 def trivy_cache_dir() -> Path | None:
@@ -470,17 +470,27 @@ def trivy_cache_dir() -> Path | None:
     explicit = os.environ.get("TRIVY_CACHE_DIR")
     if explicit:
         return Path(explicit)
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    candidate = Path(base) / "trivy"
+    candidate = Path(platform_cache_base()) / "trivy"
     return candidate if candidate.exists() else None
 
 
 # --------------------------------------------------------------------------
 # Target: osv-scanner.
 # --------------------------------------------------------------------------
+
+def open_https(request: urllib.request.Request, timeout: int) -> Any:
+    """Open an HTTPS request, refusing any other scheme.
+
+    urllib follows file:// and ftp:// as readily as https://, so a URL that
+    reaches this program through configuration gets its scheme checked here
+    rather than trusted.
+    """
+    if not request.full_url.startswith("https://"):
+        raise ValueError(f"refusing non-HTTPS URL: {request.full_url}")
+    return urllib.request.urlopen(  # nosec B310  # nosemgrep
+        request, timeout=timeout
+    )
+
 
 def latest_osv_version(timeout: int = 30) -> str | None:
     """Ask the Go module proxy, then the GitHub releases API, for the latest tag.
@@ -492,12 +502,13 @@ def latest_osv_version(timeout: int = 30) -> str | None:
             request = urllib.request.Request(
                 url, headers={"User-Agent": "update-scanners", "Accept": "application/json"}
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            with open_https(request, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
             value = data.get(key)
             if value:
                 return str(value)
-        except Exception as exc:  # noqa: BLE001 - try the next source, then fail
+        except Exception as exc:  # noqa: BLE001
+            # Any failure means trying the next source, then giving up.
             log(f"{url} lookup failed ({exc})")
     return None
 
@@ -768,7 +779,7 @@ def target_malicious_packages(args) -> int:
         request = urllib.request.Request(
             args.source_url, headers={"User-Agent": "update-scanners"}
         )
-        with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310
+        with open_https(request, timeout=60) as response:
             body = response.read()
         # Stage the download beside the overlay in the cache, never in the
         # scripts directory, so a crash between the write and the gate leaves
@@ -1226,11 +1237,12 @@ def restrict_to_owner(path: Path, sid: str | None) -> None:
     # case to an account holding SeCreateSymbolicLinkPrivilege or a machine with
     # Developer Mode on — which is a developer machine, and this is a developer's
     # tool. On an ordinary directory /L changes nothing.
+    grant_replace = "/grant:r"
     code, output = run(
         ["icacls", str(path), "/L", "/inheritance:r",
-         "/grant:r", f"*{sid}:(OI)(CI)F",
-         "/grant:r", "*S-1-5-18:(OI)(CI)F",
-         "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
+         grant_replace, f"*{sid}:(OI)(CI)F",
+         grant_replace, "*S-1-5-18:(OI)(CI)F",
+         grant_replace, "*S-1-5-32-544:(OI)(CI)F"],
         timeout=60,
     )
     if code != 0:

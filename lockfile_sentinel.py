@@ -128,6 +128,16 @@ POISONED_VERSIONS: dict[str, list[str]] = {
 
 OVERLAY_NAME = "compromised-npm-packages.json"
 
+# Every stamp this program writes or parses uses the same RFC 3339 UTC form,
+# and sharing the literal is what keeps strftime and strptime agreeing on it.
+RFC3339_UTC = "%Y-%m-%dT%H:%M:%SZ"
+
+# Dispatch keys the walk and the diagnosis dump both test: bun's lockfile is
+# JSONC under this exact name, and the .json suffix is what routes a file to
+# the strict structural JSON pass.
+BUN_LOCKFILE = "bun.lock"
+JSON_SUFFIX = ".json"
+
 # PEP 695 aliases, which is one of the reasons this file requires 3.12. The walk
 # passes the same two shapes everywhere, and naming them once makes the
 # signatures below say what they carry instead of restating a nested generic.
@@ -270,7 +280,7 @@ LOCKFILE_NAMES: frozenset[str] = frozenset(
         "npm-shrinkwrap.json",
         "pnpm-lock.yaml",
         "yarn.lock",
-        "bun.lock",
+        BUN_LOCKFILE,
     }
 )
 # Derived rather than restated, so a lockfile added to the set above marks npm
@@ -697,14 +707,14 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
-    if path.name.lower() == "bun.lock":
+    if path.name.lower() == BUN_LOCKFILE:
         # JSONC admits comments, and the token patterns match raw text, so a
         # commented-out entry naming a poisoned version would otherwise be
         # recorded as a resolved pin the effective tree does not contain. A
         # comment installs nothing, so stripping it loses no real pin.
         text = _strip_jsonc_comments(text)
     before = _poison_count(status)
-    if path.name.lower().endswith(".json"):
+    if path.name.lower().endswith(JSON_SUFFIX):
         scan_npm_lockfile_json(text, status)
     for name, (tarball_re, token_re) in _VERSION_PATTERNS.items():
         for pattern in (tarball_re, token_re):
@@ -1206,7 +1216,7 @@ def refresh_overlay(overlay_file: Path, min_interval: int, timeout: int = 60) ->
     for name, versions in POISONED_VERSIONS.items():
         packages.setdefault(name, set()).update(versions)
     payload = {
-        "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_utc": datetime.now(timezone.utc).strftime(RFC3339_UTC),
         "sources": [IOC_FEED_URL],
         "package_count": len(packages),
         "version_count": sum(len(v) for v in packages.values()),
@@ -1422,7 +1432,7 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
             out = subprocess.run(  # nosec B603
                 [osv_bin, "--version"], capture_output=True, text=True, timeout=60, check=False
             )
-            match = re.search(r"osv-scanner version:\s*([0-9]\S*)", out.stdout + out.stderr)
+            match = re.search(r"osv-scanner version:\s*(\d\S*)", out.stdout + out.stderr)
             version = match.group(1) if match else "unreadable"
         except (OSError, subprocess.SubprocessError):
             version = "unreadable"
@@ -1444,7 +1454,7 @@ def report_status(overlay_file: Path, osv_bin: str | None) -> int:
         stamp = None
         if isinstance(generated, str):
             try:
-                stamp = datetime.strptime(generated, "%Y-%m-%dT%H:%M:%SZ").replace(
+                stamp = datetime.strptime(generated, RFC3339_UTC).replace(
                     tzinfo=timezone.utc).timestamp()
             except ValueError:
                 stamp = None
@@ -1761,7 +1771,7 @@ def _describe_lockfile(path: str) -> str:
         notes.append("empty, so there is nothing to extract")
     if len(path) >= 260:
         notes.append(f"path is {len(path)} characters, at or over the Windows MAX_PATH limit")
-    if size > 0 and path.lower().endswith(".json"):
+    if size > 0 and path.lower().endswith(JSON_SUFFIX):
         try:
             with open(path, encoding="utf-8-sig", errors="replace") as handle:
                 head = handle.read(400).lstrip()
@@ -1809,7 +1819,7 @@ def _verbose_lockfile_dump(path: str) -> list[str]:
 
     name = os.path.basename(path).lower()
     text = raw.decode("utf-8", errors="replace")
-    if name.endswith(".json"):
+    if name.endswith(JSON_SUFFIX):
         try:
             with open(path, encoding="utf-8-sig") as handle:
                 document = json.load(handle)
@@ -1837,7 +1847,7 @@ def _verbose_lockfile_dump(path: str) -> list[str]:
     elif name == "yarn.lock":
         lines.append("      yarn berry format (__metadata present)" if "__metadata:" in text
                      else "      yarn classic v1 format")
-    elif name == "bun.lock":
+    elif name == BUN_LOCKFILE:
         # JSONC rather than JSON: bun writes trailing commas, so failing the
         # strict parser is this format's healthy state, not a defect to report.
         match = re.search(r'"lockfileVersion"\s*:\s*(\d+)', text)
@@ -2014,7 +2024,6 @@ def run_osv_scanner(
     # when a batch is split by the isolation retry.
     tracker = WalkProgress(len(lockfile_paths), desc="osv-scanner") if lockfile_paths else None
 
-    done = 0
     for batch_num, batch in enumerate(batches, start=1):
         _progress(f"osv-scanner batch {batch_num}/{len(batches)}: {len(batch)} lockfile(s)...")
         batch_findings, batch_ok = _scan_with_isolation(
@@ -2022,7 +2031,6 @@ def run_osv_scanner(
         )
         combined.update(batch_findings)
         processed.update(batch_ok)
-        done += len(batch)
         if tracker is not None:
             tracker.advance(f"{len(combined)} lockfile(s) with findings", count=len(batch))
         if on_batch_done is not None:
@@ -2135,7 +2143,9 @@ def fetch_advisory(advisory_id: str, timeout: int = 20) -> dict:
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
             record = json.loads(response.read().decode("utf-8"))
-    except Exception:  # noqa: BLE001 - naming is an aid, never a gate
+    except Exception:  # noqa: BLE001
+        # Naming is an aid, never a gate: a fetch that fails for any reason
+        # leaves the record empty rather than failing the report.
         record = {}
 
     if record:
@@ -2554,7 +2564,7 @@ REPORT_SCHEMA_VERSION = 1
 
 def _utc_now() -> str:
     """The current moment as UTC RFC 3339, second precision, no fraction."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(RFC3339_UTC)
 
 
 def render_json(
