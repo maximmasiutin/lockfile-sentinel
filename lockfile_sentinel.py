@@ -324,8 +324,17 @@ PAYLOAD_FILENAMES: frozenset[str] = frozenset(
 # each tested in several places, and a scanner whose dispatch literals can
 # drift apart is a scanner whose passes can disagree about which file is which.
 BUN_LOCKFILE_NAME = "bun.lock"
+YARN_LOCKFILE_NAME = "yarn.lock"
+PNPM_LOCKFILE_NAME = "pnpm-lock.yaml"
 JSON_SUFFIX = ".json"
 MANIFEST_NAME = "package.json"
+
+# The formats whose comment marker is `#`. Named from the same constants the
+# lockfile set is built from, so the two cannot drift into disagreeing about
+# which file is which.
+HASH_COMMENT_LOCKFILES: frozenset[str] = frozenset(
+    {YARN_LOCKFILE_NAME, PNPM_LOCKFILE_NAME}
+)
 
 # The one timestamp shape this program writes and reads back: RFC 3339 UTC,
 # whole seconds, Z suffix. Stated once so the writer and the parsers cannot
@@ -336,8 +345,8 @@ LOCKFILE_NAMES: frozenset[str] = frozenset(
     {
         "package-lock.json",
         "npm-shrinkwrap.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
+        PNPM_LOCKFILE_NAME,
+        YARN_LOCKFILE_NAME,
         BUN_LOCKFILE_NAME,
     }
 )
@@ -802,6 +811,71 @@ def _skip_block_comment(text: str, position: int, out: list[str]) -> int:
     return position + 2
 
 
+def _strip_hash_comments(text: str) -> str:
+    """Remove `#` comments from yarn.lock and pnpm-lock.yaml text.
+
+    Two things make this narrower than deleting from `#` to end of line. A
+    `#` only opens a comment at the start of a line or after whitespace, which
+    is YAML's own rule and holds for yarn: the tarball URLs both formats carry
+    end in `#<sha>`, so a marker with a non-space character before it is part
+    of the token. And a `#` inside a quoted string is data, in either quote
+    style, since yarn quotes its descriptors and YAML admits both.
+
+    Newlines are kept, so removing a comment never joins two lines into a
+    token neither line carried."""
+    out: list[str] = []
+    position = 0
+    length = len(text)
+    previous = "\n"
+    while position < length:
+        char = text[position]
+        if char in '"\'':
+            end = _copy_quoted(text, position, out)
+            previous = text[end - 1] if end > position else char
+            position = end
+            continue
+        if char == "#" and (previous.isspace() or previous == "\n"):
+            position = text.find("\n", position)
+            if position == -1:
+                position = length
+            previous = "\n"
+            continue
+        out.append(char)
+        previous = char
+        position += 1
+    return "".join(out)
+
+
+def _copy_quoted(text: str, position: int, out: list[str]) -> int:
+    """Copy one quoted scalar, quotes included, in either quote style.
+
+    Backslash escapes are honoured inside double quotes only, which is both
+    YAML's rule and yarn's; inside single quotes YAML doubles the quote to
+    escape it, and that pair is copied as two ordinary characters, which ends
+    the scalar and immediately opens the next one. The result is the same
+    text either way, and no `#` inside it is ever read as a comment."""
+    length = len(text)
+    quote = text[position]
+    out.append(quote)
+    position += 1
+    while position < length:
+        char = text[position]
+        out.append(char)
+        if quote == '"' and char == "\\" and position + 1 < length:
+            out.append(text[position + 1])
+            position += 2
+            continue
+        position += 1
+        if char == quote:
+            break
+        # An unterminated scalar ends at the line, as both formats are
+        # line-oriented; running to the end of the file would swallow every
+        # later comment marker and, with it, this function's whole purpose.
+        if char == "\n":
+            break
+    return position
+
+
 def scan_lockfile(path: Path, status: RepoStatus) -> bool:
     """Record every watched-package version actually resolved in a lockfile.
 
@@ -835,19 +909,25 @@ def scan_lockfile(path: Path, status: RepoStatus) -> bool:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
-    if path.name.lower() == BUN_LOCKFILE_NAME:
-        # JSONC admits comments, and the token patterns match raw text, so a
-        # commented-out entry naming a poisoned version would otherwise be
-        # recorded as a resolved pin the effective tree does not contain. A
-        # comment installs nothing, so stripping it loses no real pin.
+    # The token patterns match raw text, so a commented-out entry naming a
+    # poisoned version would otherwise be recorded as a resolved pin the
+    # effective tree does not contain. A comment installs nothing, so
+    # stripping it loses no real pin and opens no evasion channel. Each
+    # format is stripped in its own dialect: JSONC for bun, `#` for the two
+    # text formats. package-lock.json and npm-shrinkwrap.json admit no
+    # comments at all and are left alone.
+    name = path.name.lower()
+    if name == BUN_LOCKFILE_NAME:
         text = _strip_jsonc_comments(text)
+    elif name in HASH_COMMENT_LOCKFILES:
+        text = _strip_hash_comments(text)
     # Matched into a probe of this file alone, then merged, so a poisoned pair
     # already known from an earlier lockfile is still attributed to this one:
     # diffing against the repository-wide state credited only the first file
     # that carried each coordinate, and the findings' evidence lists silently
     # omitted every duplicate occurrence.
     probe = RepoStatus(name=status.name, path=status.path)
-    if path.name.lower().endswith(JSON_SUFFIX):
+    if name.endswith(JSON_SUFFIX):
         scan_npm_lockfile_json(text, probe)
     _match_text_patterns(text, probe)
     for attribute in ("present_versions", "poisoned_versions"):
