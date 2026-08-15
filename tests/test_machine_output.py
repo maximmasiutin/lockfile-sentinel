@@ -786,6 +786,23 @@ def test_a_boolean_timestamp_in_a_state_file_reads_as_unknown(
     assert engine["state"] == "unknown"
 
 
+def test_a_non_finite_timestamp_in_a_state_file_reads_as_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """json.loads accepts NaN and Infinity, either of which would classify
+    the source as fresh, crash the human rendering, and serialize as tokens
+    that are not JSON at all."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    state = tmp_path / "logs" / "update-osv-scanner.state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text('{"lastCheckUnix": 1e309}', encoding="utf-8")
+    doc = ls.gather_status(tmp_path / "missing.json", osv_bin=None)
+    engine = doc["sources"]["osv_scanner"]
+    assert engine["version_checked_unix"] is None
+    assert engine["state"] == "unknown"
+    json.loads(json.dumps(doc))
+
+
 def test_status_honours_the_output_option(tmp_path: Path, monkeypatch) -> None:
     """A status pipeline that asked for a file and got stdout has silently
     lost its document, so -o writes the status there, atomically, in either

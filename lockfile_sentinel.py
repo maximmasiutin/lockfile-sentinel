@@ -96,6 +96,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1807,8 +1808,14 @@ def _as_unix_time(value: Any) -> float | None:
 
     bool is a subclass of int, so a state file corrupted to `true` would
     otherwise read as timestamp 1, compute a confidently wrong freshness and
-    emit a boolean where the published schema promises a number or null."""
+    emit a boolean where the published schema promises a number or null. A
+    non-finite float is refused for the same reason: json.loads accepts NaN
+    and Infinity, either of which would classify the source as fresh, crash
+    the human rendering in fromtimestamp, and serialize as tokens that are
+    not JSON at all."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
         return None
     return float(value)
 
