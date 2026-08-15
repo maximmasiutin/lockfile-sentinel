@@ -1654,6 +1654,71 @@ def test_a_source_swapped_during_a_cross_device_copy_is_not_promoted(
     assert not live.with_name(live.name + ".incoming").exists()
 
 
+def test_a_copy_the_scan_rejects_is_not_promoted(tmp_path, monkeypatch) -> None:
+    """The identity reads answer for a name; the scan answers for the bytes.
+
+    Neither read sees a swap reverted between them, nor one made part-way
+    through the copy, which leaves half the scanned tree and half another and
+    an identity that still matches. Scanning the copy itself is what closes
+    both, and the refusal must leave the live cache and no .incoming behind."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+    (live / "db" / "trivy.db").write_text("old", encoding="utf-8")
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("scanned", encoding="utf-8")
+    identity = us.dir_identity(staged)
+
+    real_replace = os.replace
+
+    def refuse_the_cross_device_rename(src, dst, **kwargs):
+        if Path(src) == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_replace(src, dst, **kwargs)
+
+    def copy_a_mixture(_src, dst):
+        # The source is renamed aside and restored, so both identity reads
+        # match, and the copy holds content the swap put there.
+        Path(dst).mkdir()
+        (Path(dst) / "planted.db").write_text("unscanned", encoding="utf-8")
+
+    monkeypatch.setattr(us.os, "replace", refuse_the_cross_device_rename)
+    monkeypatch.setattr(us.shutil, "copytree", copy_a_mixture)
+
+    scanned: list[Path] = []
+
+    def reject_the_copy(path: Path) -> bool:
+        scanned.append(path)
+        return False
+
+    with pytest.raises(us.ScratchSwappedError):
+        us.promote_into(staged, live, staged_identity=identity,
+                        rescan=reject_the_copy)
+
+    assert scanned == [live.with_name(live.name + ".incoming")]
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "old"
+    assert not live.with_name(live.name + ".incoming").exists()
+
+
+def test_a_same_volume_promotion_does_not_scan_twice(tmp_path) -> None:
+    """The rename path promotes the very inode the gate already read, so a
+    second scan would cost a gigabyte to learn what is known."""
+    live = tmp_path / "trivy-cache"
+    (live / "db").mkdir(parents=True)
+
+    staged = tmp_path / "temp-abc123"
+    (staged / "db").mkdir(parents=True)
+    (staged / "db" / "trivy.db").write_text("new", encoding="utf-8")
+
+    def must_not_run(_path: Path) -> bool:
+        raise AssertionError("a same-volume promotion rescanned the tree")
+
+    us.promote_into(staged, live, staged_identity=us.dir_identity(staged),
+                    rescan=must_not_run)
+    assert (live / "db" / "trivy.db").read_text(encoding="utf-8") == "new"
+
+
 def test_an_unswapped_tree_still_promotes(tmp_path) -> None:
     """The check must not refuse the ordinary case it guards."""
     live = tmp_path / "trivy-cache"

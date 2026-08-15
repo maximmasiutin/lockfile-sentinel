@@ -78,7 +78,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1236,7 +1236,8 @@ def _refuse_if_swapped(staged: Path, identity: tuple[int, int] | None,
 
 
 def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
-                 staged_identity: tuple[int, int] | None = None) -> None:
+                 staged_identity: tuple[int, int] | None = None,
+                 rescan: Callable[[Path], bool] | None = None) -> None:
     """Replace the live cache with the staged one, keeping the old copy until it lands.
 
     The order matters and is the reason this is a function rather than four lines
@@ -1278,6 +1279,16 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
     trusted by pathname alone, and a base that grants another account
     DELETE_CHILD lets that account rename the scanned tree aside and leave its
     own at the same name.
+
+    `rescan` is what makes the cross-device path safe rather than merely
+    watched. Two identity reads cannot see a swap that was reverted between
+    them, and neither sees a swap made part-way through, which leaves a copy
+    of half the scanned tree and half another. The copy is therefore scanned
+    itself before it is promoted, so the bytes that land in the cache are the
+    bytes something looked at, by construction rather than by inference. It
+    runs only where the copy runs: a same-volume promotion is a rename of the
+    tree that was already gated, and rescanning it would be scanning the same
+    inode twice.
 
     OSError propagates. The caller reports it, because it is the caller that
     knows the run this was part of. ScratchSwappedError propagates the same way.
@@ -1333,7 +1344,21 @@ def promote_into(staged: Path, live: Path, keep: tuple[str, ...] = (),
         shutil.copytree(staged, incoming)
         try:
             _refuse_if_swapped(staged, staged_identity, when="during the copy")
-        except ScratchSwappedError:
+            # The identity read above is the cheap refusal, and it is not
+            # sufficient: an account that renames the original back before it
+            # runs passes it, and a swap made part-way through the copy passes
+            # it too, with the copy holding a mixture. Scanning the copy
+            # answers both, because it asks about the bytes being promoted
+            # rather than about the name they came from.
+            if rescan is not None and not rescan(incoming):
+                # from None: the cross-device error is why this path runs, not
+                # why the scan refused, and chaining it would name the wrong
+                # cause in the traceback the operator reads.
+                raise ScratchSwappedError(
+                    f"the copy of {staged} at {incoming} did not pass the scan that "
+                    "the staged tree passed, so what would be promoted is not what "
+                    "was gated; the live cache is untouched") from None
+        except (ScratchSwappedError, OSError):
             shutil.rmtree(incoming, ignore_errors=True)
             raise
     if previous.exists():
@@ -2356,7 +2381,12 @@ def target_trivy_db(args) -> int:
             # silently dropped, which is what --skip-java-db used to do.
             promote_into(staged, live,
                          keep=("java-db",) if args.skip_java_db else (),
-                         staged_identity=staged_identity)
+                         staged_identity=staged_identity,
+                         # Only a cross-device promotion calls this, and only
+                         # after the copy, so the tree that reaches the cache
+                         # is one this run scanned rather than one it inferred.
+                         rescan=lambda copy: gate(
+                             copy, "the copied Trivy databases", args.skip_scan))
         except ScratchSwappedError as exc:
             log(f"FAIL: {exc}; the live cache is untouched")
             return 1
