@@ -101,6 +101,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -220,7 +221,7 @@ ADVISORY_NOTES: dict[str, str] = {
 # recoverable the advisory's own summary stands in, which still says what the
 # package is.
 #
-# The taxonomy is public reporting as of 2026-08-05, and the Shai-Hulud
+# The taxonomy follows the public reporting below, and the Shai-Hulud
 # generations are distinct enough to be worth separating: they differ in payload
 # and in what they steal, so the remediation differs too.
 #
@@ -2547,8 +2548,29 @@ def render_human(statuses: list[RepoStatus], osv_bin: str | None, lookup: bool =
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_json(statuses: list[RepoStatus]) -> str:
-    """Serialize the per-repo statuses to JSON."""
+REPORT_SCHEMA_NAME = "lockfile-sentinel-report"
+REPORT_SCHEMA_VERSION = 1
+
+
+def _utc_now() -> str:
+    """The current moment as UTC RFC 3339, second precision, no fraction."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def render_json(
+    statuses: list[RepoStatus], invocation: dict[str, object], complete: bool
+) -> str:
+    """Serialize the report envelope: schema, tool, invocation, repositories.
+
+    The bare array this replaced could not answer what ran: no schema or tool
+    version, no roots, no requested layers, and no way to tell a final report
+    from the snapshot a killed run leaves behind. A structured schema object
+    rather than a bare version integer, so this report and a future status
+    JSON can never be mistaken for one another; a consumer rejects a schema
+    name or version it does not know instead of guessing. `complete` is false
+    on the snapshot writes and true only on the last, which is what lets a
+    consumer refuse an interrupted report without parsing anything else.
+    """
 
     def to_dict(status: RepoStatus) -> dict[str, object]:
         return {
@@ -2574,7 +2596,21 @@ def render_json(statuses: list[RepoStatus]) -> str:
             "vulnerable": status.vulnerable(),
         }
 
-    return json.dumps([to_dict(s) for s in statuses], indent=2)
+    envelope: dict[str, object] = {
+        "schema": {"name": REPORT_SCHEMA_NAME, "version": REPORT_SCHEMA_VERSION},
+        "tool": {"name": "lockfile-sentinel", "version": __version__},
+        "invocation": {
+            "id": invocation["id"],
+            "started_utc": invocation["started_utc"],
+            "finished_utc": _utc_now() if complete else None,
+            "complete": complete,
+            "roots": invocation["roots"],
+            "include_node_modules": invocation["include_node_modules"],
+            "requested_layers": invocation["requested_layers"],
+        },
+        "repositories": [to_dict(s) for s in statuses],
+    }
+    return json.dumps(envelope, indent=2)
 
 
 def main() -> int:
@@ -2791,6 +2827,29 @@ def main() -> int:
         _progress("refusing to report on a scan that could not cover every root given")
         return 2
 
+    # Envelope provenance, fixed once before the walk so every snapshot of
+    # this run carries the same invocation identity, and a consumer holding
+    # two reports with identical findings can still tell the runs apart.
+    invocation: dict[str, object] = {
+        "id": str(uuid.uuid4()),
+        "started_utc": _utc_now(),
+        "roots": [str(r) for r in roots],
+        "include_node_modules": args.include_node_modules,
+        # A --no-* flag is a policy choice the report must preserve: a layer
+        # missing from this list was declined, not broken, and a consumer
+        # enforcing a stricter policy needs the distinction in the file.
+        "requested_layers": [
+            layer
+            for layer, wanted in (
+                ("builtin", True),
+                ("overlay", not args.no_overlay),
+                ("osv", not args.no_osv),
+                ("trivy", not args.no_trivy),
+            )
+            if wanted
+        ],
+    }
+
     # Size the walk before starting it, so the percentage and the estimate have
     # a denominator. Counting repositories rather than top-level directories is
     # what makes the number mean something on a tree where one directory holds
@@ -2822,8 +2881,8 @@ def main() -> int:
 
     osv_bin = None if args.no_osv else find_osv_scanner(args.osv_scanner_bin)
 
-    def render() -> str:
-        return (render_json(all_statuses) if args.json
+    def render(complete: bool) -> str:
+        return (render_json(all_statuses, invocation, complete) if args.json
                 else render_human(all_statuses, osv_bin, not args.no_advisory_lookup))
 
     def persist(text: str) -> None:
@@ -2833,10 +2892,12 @@ def main() -> int:
             sys.stdout.write(text if text.endswith("\n") else text + "\n")
 
     # Write the tier 1/2 report as soon as the walk is done, before OSV runs.
-    # From this point a killed run still leaves a complete per-repo report on
-    # disk; OSV batches below only upgrade it in place.
+    # From this point a killed run still leaves parseable per-repo JSON on
+    # disk; OSV batches below only upgrade it in place. These early writes are
+    # snapshots, so they carry invocation.complete false and only the final
+    # write below claims the report is done.
     if args.output:
-        persist(render())
+        persist(render(complete=False))
         _progress(f"tier 1/2 report written to {args.output}; starting OSV cross-check")
 
     if osv_bin and lockfile_index:
@@ -2845,7 +2906,7 @@ def main() -> int:
         ) -> None:
             apply_osv_results(lockfile_index, findings, processed)
             if args.output:
-                persist(render())
+                persist(render(complete=False))
 
         run_osv_scanner(
             osv_bin,
@@ -2865,7 +2926,7 @@ def main() -> int:
         else:
             _progress("trivy re-check skipped: trivy not found")
 
-    persist(render())
+    persist(render(complete=True))
 
     if args.summary_out:
         summary_text = "\n".join(

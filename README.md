@@ -68,6 +68,12 @@ python lockfile_sentinel.py --osv source -r ./app         # pass through to osv-
 
 Exit codes are 0 when nothing was found, 1 when something was, and 2 when the scan could not be performed. A check that could not run never reports health.
 
+## Machine-Readable Output
+
+`--json` writes a versioned envelope rather than a bare list. `schema` names the format, `lockfile-sentinel-report` version 1, and a consumer rejects a name or version it does not know rather than guessing; field additions within version 1 are non-breaking. `tool` names the producer and its version. `invocation` records the run's id, start and finish stamps, resolved roots, `--include-node-modules`, and the layers the caller requested, so a layer declined by a `--no-*` flag reads as policy rather than as a layer that broke. `repositories` holds the per-repository results.
+
+With `--output` set, the report is rewritten after the walk and after every OSV batch, so a killed run still leaves valid JSON. Those writes are snapshots and say so: `invocation.complete` is false and the finish stamp null until the final write, which is the one write that claims the report is done. The format is pinned by `lockfile-sentinel-report.schema.json`, with a worked example in `lockfile-sentinel-report.example.json`.
+
 ## Which Lockfiles Are Scanned
 
 Five filenames, matched exactly: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock` and `bun.lock`. Any of those five, or a `package.json`, marks a repository as having npm tooling at all, which is what separates "no npm here" from "npm, but no lockfile" in the report; a repository holding a lockfile and no manifest still counts.

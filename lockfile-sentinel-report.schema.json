@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/master/lockfile-sentinel-report.schema.json",
+  "title": "lockfile-sentinel-report",
+  "description": "Scan report written by lockfile-sentinel --json. Fields may be added within schema version 1 without notice; a consumer rejects a schema name or version it does not know rather than guessing, and must not treat unknown fields as an error.",
+  "type": "object",
+  "required": ["schema", "tool", "invocation", "repositories"],
+  "properties": {
+    "schema": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "lockfile-sentinel-report" },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "lockfile-sentinel" },
+        "version": { "type": "string" }
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "required": [
+        "id",
+        "started_utc",
+        "finished_utc",
+        "complete",
+        "roots",
+        "include_node_modules",
+        "requested_layers"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "started_utc": { "type": "string", "format": "date-time" },
+        "finished_utc": { "type": ["string", "null"], "format": "date-time" },
+        "complete": {
+          "type": "boolean",
+          "description": "False on the snapshot writes an interrupted run leaves behind; true only on the final write. A consumer treats a report with complete false as evidence of an unfinished scan, never as a final result."
+        },
+        "roots": { "type": "array", "items": { "type": "string" } },
+        "include_node_modules": { "type": "boolean" },
+        "requested_layers": {
+          "type": "array",
+          "items": { "enum": ["builtin", "overlay", "osv", "trivy"] },
+          "description": "The layers the caller asked for. A layer absent from this list was declined by a --no-* flag, which is policy, not failure."
+        }
+      }
+    },
+    "repositories": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repository" }
+    }
+  },
+  "$defs": {
+    "package_versions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "required": [
+        "name",
+        "path",
+        "has_npm",
+        "npm_files",
+        "read_files",
+        "unreadable_files",
+        "lockfiles",
+        "present_versions",
+        "range_only",
+        "poisoned_versions",
+        "poisoned_ranges",
+        "payload_files",
+        "osv_checked",
+        "osv_malicious",
+        "osv_advisory_ids",
+        "package_present",
+        "vulnerable"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "path": { "type": "string" },
+        "has_npm": { "type": "boolean" },
+        "npm_files": { "type": "array", "items": { "type": "string" } },
+        "read_files": { "type": "array", "items": { "type": "string" } },
+        "unreadable_files": { "type": "array", "items": { "type": "string" } },
+        "lockfiles": { "type": "array", "items": { "type": "string" } },
+        "present_versions": { "$ref": "#/$defs/package_versions" },
+        "range_only": { "$ref": "#/$defs/package_versions" },
+        "poisoned_versions": { "$ref": "#/$defs/package_versions" },
+        "poisoned_ranges": { "$ref": "#/$defs/package_versions" },
+        "payload_files": { "type": "array", "items": { "type": "string" } },
+        "osv_checked": { "type": "boolean" },
+        "osv_malicious": { "$ref": "#/$defs/package_versions" },
+        "osv_advisory_ids": { "$ref": "#/$defs/package_versions" },
+        "package_present": { "type": "boolean" },
+        "vulnerable": { "type": "boolean" }
+      }
+    }
+  }
+}

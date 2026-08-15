@@ -1,0 +1,40 @@
+{
+  "schema": {
+    "name": "lockfile-sentinel-report",
+    "version": 1
+  },
+  "tool": {
+    "name": "lockfile-sentinel",
+    "version": "0.1.0"
+  },
+  "invocation": {
+    "id": "3f6cbe9e-3a3f-4a3e-9a3d-2f1e0d9c8b7a",
+    "started_utc": "2026-08-15T09:12:44Z",
+    "finished_utc": "2026-08-15T09:12:47Z",
+    "complete": true,
+    "roots": ["/scans/tree"],
+    "include_node_modules": false,
+    "requested_layers": ["builtin", "overlay", "osv", "trivy"]
+  },
+  "repositories": [
+    {
+      "name": "app",
+      "path": "/scans/tree/app",
+      "has_npm": true,
+      "npm_files": ["package.json"],
+      "read_files": ["package.json", "package-lock.json"],
+      "unreadable_files": [],
+      "lockfiles": ["package-lock.json"],
+      "present_versions": { "keyv": ["6.0.0"] },
+      "range_only": {},
+      "poisoned_versions": { "keyv": ["6.0.0"] },
+      "poisoned_ranges": {},
+      "payload_files": [],
+      "osv_checked": true,
+      "osv_malicious": { "keyv": ["6.0.0"] },
+      "osv_advisory_ids": { "keyv": ["MAL-2026-00001"] },
+      "package_present": true,
+      "vulnerable": true
+    }
+  ]
+}

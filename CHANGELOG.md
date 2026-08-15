@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html), and each release is tagged so a raw file URL can be pinned to it.
 
+## Unreleased
+
+### Changed
+
+- Breaking change to `--json`: it now emits a versioned envelope object instead of a bare per-repository array. The array moved unchanged to the `repositories` field; `schema` names the format (`lockfile-sentinel-report`, version 1), `tool` names the producer and its version, and `invocation` records the run's id, start and finish stamps, resolved roots, `--include-node-modules`, and the requested layers, so a `--no-*` flag reads as policy rather than as a layer that broke. The in-progress writes made after the walk and after each OSV batch carry `invocation.complete: false` with a null finish stamp, and only the final write sets `complete: true`, so a report left by a killed run can no longer be mistaken for a final one. Field additions within schema version 1 are non-breaking; a consumer rejects a schema name or version it does not know rather than guessing.
+
+### Added
+
+- `lockfile-sentinel-report.schema.json`, a JSON Schema for the report, and `lockfile-sentinel-report.example.json`, a worked example, both pinned to the renderer by tests.
+
 ## 0.1.0
 
 First public release.
