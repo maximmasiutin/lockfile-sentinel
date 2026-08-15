@@ -2,7 +2,7 @@
 
 All notable changes are recorded here. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html), and each release is tagged so a raw file URL can be pinned to it.
 
-## Unreleased
+## 0.2.0
 
 ### Changed
 

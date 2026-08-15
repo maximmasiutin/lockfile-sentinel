@@ -65,7 +65,7 @@ Usage:
     python lockfile_sentinel.py --osv source -r /path/to/app
 """
 
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel
@@ -114,7 +114,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # The machine-readable contracts this program emits, named and versioned so a
 # consumer can refuse a document it does not understand instead of guessing.

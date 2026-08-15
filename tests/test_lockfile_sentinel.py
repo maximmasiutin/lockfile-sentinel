@@ -1,4 +1,4 @@
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 """Tests for the detection logic that a reader cannot verify by inspection.

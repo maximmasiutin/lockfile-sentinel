@@ -42,7 +42,7 @@ Usage:
     python update_scanners.py all
 """
 
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 # https://github.com/maximmasiutin/lockfile-sentinel
@@ -84,7 +84,7 @@ from pathlib import Path
 # Carried per file rather than imported, because each of these three runs on its
 # own and an imported version would tie a standalone copy back to a checkout it
 # may not have. tests/test_headers.py is what keeps the three from drifting.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 IS_WINDOWS = os.name == "nt"
 

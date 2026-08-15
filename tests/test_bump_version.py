@@ -1,4 +1,4 @@
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 Maxim Masiutin
 """The version setter, tested against a throwaway tree rather than this one.

@@ -1,4 +1,4 @@
-# Lockfile Sentinel 0.1.0
+# Lockfile Sentinel 0.2.0
 
 Copyright (c) 2026 Maxim Masiutin. Released under [GPL-3.0-only](LICENSE.txt).
 
@@ -36,7 +36,7 @@ Two optional companions keep its inputs current and are not needed to scan: `upd
 ## Quick Start
 
 ```bash
-curl -O https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/v0.1.0/lockfile_sentinel.py
+curl -O https://raw.githubusercontent.com/maximmasiutin/lockfile-sentinel/v0.2.0/lockfile_sentinel.py
 python lockfile_sentinel.py --selftest
 python lockfile_sentinel.py --root /path/to/repositories
 ```
