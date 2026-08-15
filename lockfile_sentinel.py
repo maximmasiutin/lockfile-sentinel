@@ -1847,11 +1847,23 @@ def _status_overlay(overlay_file: Path) -> dict[str, Any]:
                            generated_stale or refresh_stale)
     else:
         state = "absent"
+    # Counted from the packages map rather than read from the document's own
+    # count fields, which a corrupted or hand-edited overlay can carry as
+    # NaN, booleans or strings: those would flow straight into the status
+    # JSON, where the schema promises an integer or null and NaN is not JSON.
+    packages = overlay.get("packages") if overlay else None
+    if isinstance(packages, dict):
+        package_count: int | None = len(packages)
+        version_count: int | None = sum(
+            len(v) for v in packages.values() if isinstance(v, list))
+    else:
+        package_count = None
+        version_count = None
     return {
         "path": str(overlay_file),
         "present": bool(overlay),
-        "package_count": overlay.get("package_count") if overlay else None,
-        "version_count": overlay.get("version_count") if overlay else None,
+        "package_count": package_count,
+        "version_count": version_count,
         "generated_utc": generated if isinstance(generated, str) else None,
         "generated_unix": generated_unix,
         "last_refresh_unix": last_refresh,

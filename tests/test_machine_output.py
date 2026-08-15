@@ -718,8 +718,7 @@ def test_status_json_carries_the_facts_the_human_report_prints(
     overlay = tmp_path / "compromised-npm-packages.json"
     overlay.write_text(json.dumps({
         "generated_utc": "2026-08-15T00:00:00Z",
-        "package_count": 3, "version_count": 5,
-        "packages": {"keyv": ["6.0.0"]},
+        "packages": {"keyv": ["6.0.0"], "cacheable": ["2.5.1"], "flat-cache": ["6.1.24"]},
     }), encoding="utf-8")
     doc = ls.gather_status(overlay, osv_bin=None)
     assert doc["schema"] == {"name": "lockfile-sentinel-status", "version": 1}
@@ -820,6 +819,27 @@ def test_an_unrepresentable_timestamp_reads_as_unknown_not_fresh(
         assert engine["version_checked_unix"] is None
         assert engine["state"] == "unknown"
         assert ls.render_status_human(doc)
+
+
+def test_overlay_counts_are_recomputed_never_trusted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A corrupted overlay can carry NaN, booleans or strings in its own
+    count fields; the status counts come from the packages map itself, so the
+    document stays valid JSON and honest whatever the fields claim."""
+    monkeypatch.setenv("LOCKFILE_SENTINEL_CACHE", str(tmp_path))
+    overlay = tmp_path / "compromised-npm-packages.json"
+    overlay.write_text(
+        '{"generated_utc": "2026-08-15T00:00:00Z", "package_count": NaN, '
+        '"version_count": true, "packages": {"keyv": ["6.0.0", "6.0.1"], '
+        '"cacheable": ["2.5.1"]}}',
+        encoding="utf-8",
+    )
+    doc = ls.gather_status(overlay, osv_bin=None)
+    source = doc["sources"]["overlay"]
+    assert source["package_count"] == 2
+    assert source["version_count"] == 3
+    json.loads(json.dumps(doc))
 
 
 def test_status_honours_the_output_option(tmp_path: Path, monkeypatch) -> None:
