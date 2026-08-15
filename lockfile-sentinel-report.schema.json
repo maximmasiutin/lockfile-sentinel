@@ -47,6 +47,11 @@
           "description": "True only when the run finished AND every requested layer completed over every input. A snapshot an interrupted run leaves behind has complete false and finished_utc null; a finished run with a coverage gap has complete false and finished_utc set, and exits 2. A consumer treats complete false as a scan whose absence of findings proves nothing."
         },
         "roots": { "type": "array", "items": { "type": "string" } },
+        "source_revision": {
+          "type": ["string", "null"],
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+          "description": "Commit ID supplied by the caller for the source tree being scanned. Null means the caller supplied no revision; the scanner never guesses from ambient Git state."
+        },
         "include_node_modules": { "type": "boolean" },
         "requested_layers": {
           "type": "array",

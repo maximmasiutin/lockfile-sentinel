@@ -37,6 +37,7 @@ def _must_not_open(*_args, **_kwargs):
 INVOCATION_ID = "00000000-0000-0000-0000-000000000000"
 STARTED = "2026-08-15T00:00:00Z"
 FINISHED = "2026-08-15T00:00:05Z"
+SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 def _overlay_layer(state: str = "completed") -> dict[str, Any]:
@@ -97,6 +98,7 @@ def _report(
         started_utc=STARTED,
         finished_utc=finished,
         complete=complete,
+        source_revision=SOURCE_REVISION,
     )
 
 
@@ -168,6 +170,7 @@ def example_report() -> dict[str, Any]:
         started_utc=STARTED,
         finished_utc=FINISHED,
         complete=ls.report_is_complete(layers, statuses),
+        source_revision=SOURCE_REVISION,
     )
 
 
@@ -186,11 +189,28 @@ def test_the_json_report_is_an_envelope_not_a_bare_array() -> None:
     assert inv["complete"] is True
     assert inv["finished_utc"] == FINISHED
     assert inv["roots"] == ["/t"]
+    assert inv["source_revision"] == SOURCE_REVISION
     assert inv["include_node_modules"] is False
     assert inv["requested_layers"] == ["builtin", "overlay", "osv", "trivy"]
     assert report["repositories"][0]["name"] == "t"
     for block in ("layers", "inputs", "totals", "findings", "errors"):
         assert block in report
+
+
+def test_source_revision_accepts_sha1_and_sha256() -> None:
+    """The caller's commit is normalized rather than inferred."""
+    parser = ls._build_parser()
+    sha1 = "A" * 40
+    sha256 = "B" * 64
+    assert parser.parse_args(["--source-revision", sha1]).source_revision == sha1.lower()
+    assert parser.parse_args(["--source-revision", sha256]).source_revision == sha256.lower()
+
+
+@pytest.mark.parametrize("revision", ["", "a" * 39, "g" * 40, "a" * 65])
+def test_source_revision_rejects_invalid_commit_ids(revision: str) -> None:
+    """Invalid provenance fails before scanning."""
+    with pytest.raises(SystemExit):
+        ls._build_parser().parse_args(["--source-revision", revision])
 
 
 def test_a_snapshot_write_never_claims_to_be_final() -> None:
@@ -229,6 +249,7 @@ def test_the_published_schema_and_example_match_what_the_code_writes() -> None:
     assert example == rendered
     assert set(schema["required"]) <= set(rendered)
     assert set(schema["properties"]["invocation"]["required"]) <= set(rendered["invocation"])
+    assert "source_revision" not in schema["properties"]["invocation"]["required"]
     assert set(schema["$defs"]["repository"]["required"]) <= set(rendered["repositories"][0])
     assert set(schema["$defs"]["finding"]["required"]) <= set(rendered["findings"][0])
     assert set(schema["$defs"]["error"]["required"]) <= set(rendered["errors"][0])

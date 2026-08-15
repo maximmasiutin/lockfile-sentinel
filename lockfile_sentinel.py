@@ -4295,6 +4295,7 @@ def build_report(
     started_utc: str,
     finished_utc: str | None,
     complete: bool,
+    source_revision: str | None = None,
     advisory_lookup: bool = True,
 ) -> dict[str, Any]:
     """Assemble the versioned scan report around the per-repository statuses.
@@ -4321,6 +4322,7 @@ def build_report(
             "finished_utc": finished_utc,
             "complete": complete,
             "roots": roots,
+            "source_revision": source_revision,
             "include_node_modules": include_node_modules,
             "requested_layers": [
                 name for name in ("builtin", "overlay", "osv", "trivy")
@@ -4405,6 +4407,13 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _source_revision(value: str) -> str:
+    """Accept a Git SHA-1 or SHA-256 revision."""
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value):
+        raise argparse.ArgumentTypeError("must be a 40- or 64-character hexadecimal commit ID")
+    return value.lower()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """The whole command line, declared in one place."""
     parser = argparse.ArgumentParser(
@@ -4434,6 +4443,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     parser.add_argument("-o", "--output", help="Write output to this file instead of stdout.")
+    parser.add_argument(
+        "--source-revision",
+        type=_source_revision,
+        help="Commit ID of the source tree being scanned; recorded in JSON reports.",
+    )
     parser.add_argument(
         "--summary-out",
         help="Also write the vulnerable-repositories summary (only the vulnerable repos, "
@@ -4770,6 +4784,7 @@ def _write_root_refusal(
             layers=layers, errors=errors, osv_run=OsvRunReport(),
             invocation_id=invocation_id, started_utc=started_utc,
             finished_utc=_utc_now_iso(), complete=False,
+            source_revision=args.source_revision,
         ))
     else:
         lines = [str(e["message"]) for e in errors]
@@ -4875,6 +4890,7 @@ class _Sweep:
             started_utc=self.started_utc,
             finished_utc=finished,
             complete=complete,
+            source_revision=self.args.source_revision,
             advisory_lookup=not self.args.no_advisory_lookup,
         ))
 
