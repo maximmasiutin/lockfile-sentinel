@@ -1856,8 +1856,8 @@ def _fallback_scratch_base(real_near: Path | None, near: Path | None,
         raise ScratchUnavailableError(
             f"no volume has the {need / 1024 ** 3:.1f} GB this refresh needs: "
             f"candidates passed over: {considered}; the system temporary "
-            f"directory {system} has {describe_free(system_free)}. Free space "
-            "or set LOCKFILE_SENTINEL_SCRATCH to a volume with room."
+            f"directory {system} has {describe_free(system_free)}. Free some "
+            "space, or set LOCKFILE_SENTINEL_SCRATCH to a volume with room."
         )
     log(f"falling back to the system temporary directory {system} "
         f"({describe_free(system_free)}), which is the volume the Java index "
@@ -1970,9 +1970,13 @@ def scratch_dir(label: str, near: Path | None = None,
     # open, and one of these may belong to a run happening right now.
     leftovers = sorted(entry.name for entry in base.glob("temp-*") if entry.is_dir())
     if leftovers:
+        # A handful of names identifies the leak; hundreds of them, the very
+        # accumulation this NOTE exists to surface, would bloat the log line.
+        shown = ", ".join(leftovers[:5])
+        more = f" and {len(leftovers) - 5} more" if len(leftovers) > 5 else ""
         log(f"NOTE: {base} already holds {len(leftovers)} temp-* "
             f"director{'y' if len(leftovers) == 1 else 'ies'} "
-            f"({', '.join(leftovers)}); each is either a concurrent run's scratch "
+            f"({shown}{more}); each is either a concurrent run's scratch "
             "or a leak from a cleanup that failed, and nothing removes the latter")
     sid = current_user_sid() if IS_WINDOWS else None
     path = base / f"temp-{secrets.token_hex(8)}"
