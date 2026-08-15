@@ -253,20 +253,9 @@ PAYLOAD_FILENAMES: frozenset[str] = frozenset(
     }
 )
 
-NPM_MARKER_FILES: frozenset[str] = frozenset(
-    {
-        "package.json",
-        "package-lock.json",
-        "npm-shrinkwrap.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "bun.lock",
-    }
-)
-# The five LOCKFILE_NAMES entries below get scan_lockfile's text pass, one
-# code path for all of them, and the names ending .json get the structural
-# JSON pass on top of it; package.json above is a marker and a range source,
-# never a lockfile.
+# The five LOCKFILE_NAMES entries get scan_lockfile's text pass, one code
+# path for all of them, and the names ending .json get the structural JSON
+# pass on top of it.
 # npm-shrinkwrap.json shares package-lock.json's schema outright, so it takes
 # the same structural path; bun.lock does not end .json, so the JSON pass is
 # never dispatched to it, and extending that pass to it would need a JSONC
@@ -283,6 +272,12 @@ LOCKFILE_NAMES: frozenset[str] = frozenset(
         "bun.lock",
     }
 )
+# Derived rather than restated, so a lockfile added to the set above marks npm
+# tooling without a second edit: the original coverage gap was exactly a name
+# present in one hand-kept list and absent from the other. package.json is the
+# one member that is not a lockfile, being a marker and a range source only,
+# and it never passes through scan_lockfile.
+NPM_MARKER_FILES: frozenset[str] = LOCKFILE_NAMES | {"package.json"}
 ALWAYS_SKIP_DIRS: frozenset[str] = frozenset({".git"})
 DEPENDENCY_FIELDS: tuple[str, ...] = (
     "dependencies",

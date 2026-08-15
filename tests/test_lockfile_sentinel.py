@@ -289,6 +289,14 @@ def test_the_read_line_names_a_lockfile_the_walk_does_open(tmp_path: Path) -> No
     assert "package-lock.json" in line
 
 
+def test_every_scanned_lockfile_also_marks_npm_tooling() -> None:
+    """The original coverage gap was a name present in one hand-kept list and
+    absent from the other, so the marker set is derived from the lockfile set
+    rather than restated. This pins the derivation against a later edit that
+    reverts either side to a literal."""
+    assert ls.NPM_MARKER_FILES == ls.LOCKFILE_NAMES | {"package.json"}
+
+
 # A real bun.lock's shape: JSONC with trailing commas, resolutions as
 # "name@version" strings inside per-package tuples. The trailing commas are
 # deliberate: they keep the fixture true to what bun writes, and they pin the
