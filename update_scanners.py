@@ -329,11 +329,38 @@ def clamd_max_file_size() -> int | None:
     """Read MaxFileSize from clamd.conf, in bytes, or None when unreadable.
 
     The daemon skips any file above this and reports it clean, so the value is
-    what decides whether clamdscan can honestly be used at all.
+    what decides whether clamdscan can honestly be used at all."""
+    return _clamd_directive_size("MaxFileSize")
+
+
+def clamd_scan_size_is_unlimited() -> bool:
+    """Whether MaxScanSize is configured 0, which clamd defines as no limit.
+
+    The daemon is trusted on this ground and no other, because MaxScanSize
+    counts recursively extracted content: a file whose compressed size sits
+    under a finite ceiling can expand past it, and the daemon then stops and
+    still reports it clean. The expansion cannot be known before the scan, so
+    a finite ceiling of any size is a ceiling this program cannot prove the
+    input stays under. Unreadable reads as finite, since a limit that could
+    not be read is not a limit known to be absent."""
+    return _clamd_directive_size("MaxScanSize", zero_is_ceiling=False) == 0
+
+
+def _clamd_directive_size(name: str, zero_is_ceiling: bool = True) -> int | None:
+    """One size directive from clamd.conf, in bytes, or None when unreadable.
 
     CLAMD_CONF names the file directly. Otherwise the Unix locations are tried,
     and on Windows the configuration sits beside the daemon binary, so the one
-    found on PATH points at it."""
+    found on PATH points at it.
+
+    The first readable file answers, whether or not it carries the directive.
+    Searching on would read one ceiling from the operator's configuration and
+    the other from a stale file elsewhere on the host, and a pair of limits
+    from two different daemons describes no daemon at all.
+
+    zero_is_ceiling maps clamd's 0 to the libclamav ceiling, which is what a
+    file-size limit means. A caller that has to tell an unlimited setting from
+    a large one passes False and gets the 0 back."""
     for candidate in _clamd_conf_candidates():
         try:
             text = candidate.read_text(encoding="utf-8", errors="ignore")
@@ -341,8 +368,9 @@ def clamd_max_file_size() -> int | None:
             continue
         for line in text.splitlines():
             parts = line.split()
-            if len(parts) == 2 and parts[0] == "MaxFileSize":
-                return _parse_clamd_size(parts[1])
+            if len(parts) == 2 and parts[0] == name:
+                return _parse_clamd_size(parts[1], zero_is_ceiling)
+        return None
     return None
 
 
@@ -360,15 +388,21 @@ def _clamd_conf_candidates() -> list[Path]:
     return candidates
 
 
-def _parse_clamd_size(value: str) -> int | None:
-    """A clamd.conf size value in bytes, or None where it does not parse."""
+def _parse_clamd_size(value: str, zero_is_ceiling: bool = True) -> int | None:
+    """A clamd.conf size value in bytes, or None where it does not parse.
+
+    clamd defines 0 as no limit, which for a file-size limit is the libclamav
+    ceiling, the true upper bound whatever the configuration says. A caller
+    that must tell unlimited from merely large passes zero_is_ceiling False,
+    since collapsing the two makes a configured 2G look like no limit."""
     raw = value.upper()
     multiplier = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}.get(raw[-1:], 1)
     digits = raw[:-1] if multiplier > 1 else raw
     try:
-        return int(digits) * multiplier
+        parsed = int(digits) * multiplier
     except ValueError:
         return None
+    return CLAMSCAN_FILE_CEILING if parsed == 0 and zero_is_ceiling else parsed
 
 
 def _refuse_oversized(files: list[Path], what: str) -> bool:
@@ -391,13 +425,25 @@ def _refuse_oversized(files: list[Path], what: str) -> bool:
 
 def _scan_command(target: Path, largest: int, what: str) -> tuple[list[str], str] | None:
     """The scanner invocation the sizes allow, or None where nothing can read them."""
+    # Two ceilings, each disqualifying the daemon on its own, and each judged
+    # by what can actually be proved. MaxFileSize is a size against a size, so
+    # the largest staged file answers it. MaxScanSize counts recursively
+    # extracted content, which no on-disk size bounds, so the only setting
+    # that proves the scan completes is no limit at all; comparing it against
+    # the largest file would be comparing a lower bound with a ceiling and
+    # calling the result proof. An unreadable directive counts as a limit,
+    # since one that could not be read is not one known to be absent.
     cap = clamd_max_file_size()
+    unlimited_scan = clamd_scan_size_is_unlimited()
     clamdscan = resolve_clam("clamdscan")
-    use_daemon = bool(clamdscan) and cap is not None and largest <= cap
+    use_daemon = (bool(clamdscan) and cap is not None
+                  and largest <= cap and unlimited_scan)
     if clamdscan and not use_daemon:
-        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB against "
-            f"a clamd MaxFileSize of "
-            f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}")
+        log(f"daemon not used for {what}: largest file is {largest / 1024 / 1024:.0f} MB "
+            f"against a clamd MaxFileSize of "
+            f"{'unknown' if cap is None else f'{cap / 1024 / 1024:.0f} MB'}, "
+            f"and MaxScanSize is {'unlimited' if unlimited_scan else 'set'}, which "
+            "extracted content can exceed unnoticed")
     if use_daemon:
         return ([str(clamdscan), "--multiscan", "--infected", "--no-summary", str(target)],
                 "clamdscan")

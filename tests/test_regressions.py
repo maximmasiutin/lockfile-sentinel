@@ -485,6 +485,80 @@ def test_the_clamav_gate_refuses_a_file_no_scanner_can_read(tmp_path: Path, monk
     assert us.gate(target, "an oversized artifact", skip=False) is False
 
 
+def test_a_maxfilesize_of_zero_reads_as_unlimited_not_as_a_zero_byte_cap(
+        tmp_path: Path, monkeypatch) -> None:
+    """clamd defines MaxFileSize 0 as no limit; reading it literally made the
+    gate conclude the daemon could scan nothing and fall back or refuse."""
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 0\n", encoding="utf-8")
+    monkeypatch.setenv("CLAMD_CONF", str(conf))
+    assert us.clamd_max_file_size() == us.CLAMSCAN_FILE_CEILING
+
+    assert us._parse_clamd_size("0") == us.CLAMSCAN_FILE_CEILING
+    assert us._parse_clamd_size("0M") == us.CLAMSCAN_FILE_CEILING
+    assert us._parse_clamd_size("100M") == 100 * 1024 ** 2
+    assert us._parse_clamd_size("bogus") is None
+
+
+def test_a_finite_scan_size_keeps_the_daemon_off_the_staged_tree(
+        tmp_path: Path, monkeypatch) -> None:
+    """MaxScanSize counts extracted content, which no on-disk size bounds.
+
+    A staged file comfortably under the ceiling can expand past it, and the
+    daemon then stops and still answers clean, so a finite setting of any size
+    disqualifies it however small the input."""
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 0\nMaxScanSize 500M\n", encoding="utf-8")
+    monkeypatch.setenv("CLAMD_CONF", str(conf))
+    monkeypatch.setattr(us, "resolve_clam", lambda name: f"/usr/bin/{name}")
+
+    assert us.clamd_scan_size_is_unlimited() is False
+    command, tool = us._scan_command(tmp_path, 1024, "the databases")
+    assert tool == "clamscan", f"the daemon was chosen despite MaxScanSize: {command}"
+
+
+def test_an_unreadable_scan_size_leaves_the_daemon_untrusted(
+        tmp_path: Path, monkeypatch) -> None:
+    """A limit that could not be read is not a limit known to be absent,
+    which is the rule MaxFileSize already followed."""
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 500M\n", encoding="utf-8")
+    monkeypatch.setenv("CLAMD_CONF", str(conf))
+    monkeypatch.setattr(us, "resolve_clam", lambda name: f"/usr/bin/{name}")
+
+    assert us.clamd_scan_size_is_unlimited() is False
+    _command, tool = us._scan_command(tmp_path, 1024, "the databases")
+    assert tool == "clamscan"
+
+
+def test_an_unlimited_scan_size_under_the_file_ceiling_allows_the_daemon(
+        tmp_path: Path, monkeypatch) -> None:
+    """The negative cases prove nothing alone: a change that never chose the
+    daemon would pass them all and cost every scan the resident speed."""
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 500M\nMaxScanSize 0\n", encoding="utf-8")
+    monkeypatch.setenv("CLAMD_CONF", str(conf))
+    monkeypatch.setattr(us, "resolve_clam", lambda name: f"/usr/bin/{name}")
+
+    _command, tool = us._scan_command(tmp_path, 40 * 1024 ** 2, "the databases")
+    assert tool == "clamdscan"
+
+
+def test_a_two_gigabyte_scan_size_is_not_read_as_unlimited(
+        tmp_path: Path, monkeypatch) -> None:
+    """Mapping 0 to the libclamav ceiling is right for a file-size limit and
+    destroys the distinction this decision turns on, since it makes a
+    configured 2G indistinguishable from no limit at all."""
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 500M\nMaxScanSize 2G\n", encoding="utf-8")
+    monkeypatch.setenv("CLAMD_CONF", str(conf))
+    monkeypatch.setattr(us, "resolve_clam", lambda name: f"/usr/bin/{name}")
+
+    assert us.clamd_scan_size_is_unlimited() is False
+    _command, tool = us._scan_command(tmp_path, 1024, "the databases")
+    assert tool == "clamscan"
+
+
 def test_the_gate_still_refuses_when_there_is_nothing_to_scan(tmp_path: Path) -> None:
     """A missing target is a failure, not a pass."""
     assert us.gate(tmp_path / "absent", "a missing artifact", skip=False) is False
