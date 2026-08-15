@@ -429,6 +429,20 @@ def test_bounded_child_escalates_overflow_before_the_normal_timeout() -> None:
     assert time.monotonic() - started < 4
 
 
+def test_bounded_child_reader_failure_wakes_the_coordinator(monkeypatch) -> None:
+    """A failed reader cannot leave a pipe-blocked child until tool timeout."""
+    def fail_reader(*args):
+        args[5].set()
+
+    monkeypatch.setattr(ls, "_read_child_stream", fail_reader)
+    started = time.monotonic()
+    with pytest.raises(ls.subprocess.SubprocessError, match="complete child output"):
+        ls._run_bounded(
+            [sys.executable, "-c", "import time; time.sleep(10)"], timeout=10,
+        )
+    assert time.monotonic() - started < 2
+
+
 def test_osv_output_overflow_is_a_structured_retryable_failure(monkeypatch) -> None:
     """Oversized JSON is an outage, never a clean scanner response."""
     def overflow(*_args, **_kwargs):

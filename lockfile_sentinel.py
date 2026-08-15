@@ -238,14 +238,15 @@ def _stop_child(process: subprocess.Popen[bytes]) -> None:
 
 def _wait_for_child(
     process: subprocess.Popen[bytes], command: list[str], timeout: int,
-    overflow: threading.Event,
+    overflow: threading.Event, read_failed: threading.Event,
 ) -> None:
     """Wait until exit, timeout, or an overflow that needs immediate killing."""
     deadline = time.monotonic() + timeout
     while process.poll() is None:
-        if overflow.wait(_CHILD_READ_POLL):
+        if overflow.is_set() or read_failed.is_set():
             _stop_child(process)
             return
+        overflow.wait(_CHILD_READ_POLL)
         if time.monotonic() >= deadline:
             raise subprocess.TimeoutExpired(command, timeout)
 
@@ -295,7 +296,7 @@ def _run_bounded(
     for reader in readers:
         reader.start()
     try:
-        _wait_for_child(process, command, timeout, overflow)
+        _wait_for_child(process, command, timeout, overflow, read_failed)
     except subprocess.TimeoutExpired as exc:
         _stop_child(process)
         raise subprocess.TimeoutExpired(command, timeout) from exc
