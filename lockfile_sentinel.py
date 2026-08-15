@@ -335,6 +335,9 @@ MANIFEST_NAME = "package.json"
 HASH_COMMENT_LOCKFILES: frozenset[str] = frozenset(
     {YARN_LOCKFILE_NAME, PNPM_LOCKFILE_NAME}
 )
+# Where a quote may open a string. Anywhere else it is an apostrophe inside a
+# bare scalar, and opening a string there shields the rest of its line.
+_QUOTE_LEAD = frozenset(" \t\r\n{[,:-")
 
 # The one timestamp shape this program writes and reads back: RFC 3339 UTC,
 # whole seconds, Z suffix. Stated once so the writer and the parsers cannot
@@ -819,7 +822,11 @@ def _strip_hash_comments(text: str) -> str:
     is YAML's own rule and holds for yarn: the tarball URLs both formats carry
     end in `#<sha>`, so a marker with a non-space character before it is part
     of the token. And a `#` inside a quoted string is data, in either quote
-    style, since yarn quotes its descriptors and YAML admits both.
+    style, since yarn quotes its descriptors and YAML admits both. A quote
+    counts as opening one only where a value may start, which is YAML's rule
+    too: an apostrophe inside a bare scalar is an apostrophe, and reading it
+    as an opening quote makes the rest of its line string content, leaving a
+    real comment behind it unstripped with its pin intact.
 
     Newlines are kept, so removing a comment never joins two lines into a
     token neither line carried."""
@@ -829,7 +836,7 @@ def _strip_hash_comments(text: str) -> str:
     previous = "\n"
     while position < length:
         char = text[position]
-        if char in '"\'':
+        if char in '"\'' and previous in _QUOTE_LEAD:
             end = _copy_quoted(text, position, out)
             previous = text[end - 1] if end > position else char
             position = end
